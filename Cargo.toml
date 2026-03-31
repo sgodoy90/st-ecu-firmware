@@ -1,0 +1,13 @@
+[package]
+name = "st-ecu-firmware"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+description = "SpeedTech ST ECU firmware architecture bootstrap for STM32H743"
+
+[lib]
+name = "st_ecu_firmware"
+path = "src/lib.rs"
+
+[dependencies]
+
