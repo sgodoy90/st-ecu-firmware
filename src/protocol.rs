@@ -199,6 +199,8 @@ pub struct DecodedPageStatus {
     pub ram_crc: u32,
     pub flash_crc: u32,
     pub needs_burn: bool,
+    pub flash_generation: u32,
+    pub flash_valid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,13 +436,15 @@ pub fn decode_pin_assignments_payload(
 }
 
 pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + statuses.len() * 10);
+    let mut out = Vec::with_capacity(1 + statuses.len() * 15);
     out.push(statuses.len() as u8);
     for status in statuses {
         out.push(status.page_id);
         out.extend_from_slice(&status.ram_crc.to_be_bytes());
         out.extend_from_slice(&status.flash_crc.to_be_bytes());
         out.push(status.needs_burn as u8);
+        out.extend_from_slice(&status.flash_generation.to_be_bytes());
+        out.push(status.flash_valid as u8);
     }
     out
 }
@@ -452,10 +456,15 @@ pub fn decode_page_statuses_payload(
         return Err(ProtocolError::MalformedPayload);
     };
 
-    let expected_len = 1 + count as usize * 10;
-    if payload.len() != expected_len {
+    let legacy_len = 1 + count as usize * 10;
+    let extended_len = 1 + count as usize * 15;
+    let extended = if payload.len() == extended_len {
+        true
+    } else if payload.len() == legacy_len {
+        false
+    } else {
         return Err(ProtocolError::MalformedPayload);
-    }
+    };
 
     let mut offset = 1usize;
     let mut statuses = Vec::with_capacity(count as usize);
@@ -474,13 +483,29 @@ pub fn decode_page_statuses_payload(
             payload[offset + 8],
         ]);
         let needs_burn = payload[offset + 9] != 0;
+        let (flash_generation, flash_valid, step) = if extended {
+            (
+                u32::from_be_bytes([
+                    payload[offset + 10],
+                    payload[offset + 11],
+                    payload[offset + 12],
+                    payload[offset + 13],
+                ]),
+                payload[offset + 14] != 0,
+                15,
+            )
+        } else {
+            (0, true, 10)
+        };
         statuses.push(DecodedPageStatus {
             page_id,
             ram_crc,
             flash_crc,
             needs_burn,
+            flash_generation,
+            flash_valid,
         });
-        offset += 10;
+        offset += step;
     }
 
     Ok(statuses)
