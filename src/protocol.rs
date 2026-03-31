@@ -1,5 +1,5 @@
 use crate::board::{board_definition, PinCapability};
-use crate::config::PAGE_DIRECTORY;
+use crate::config::{ConfigPageStatus, PAGE_DIRECTORY};
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
 use crate::io::{EcuFunction, ResolvedPinAssignment};
 use crc::{Crc, CRC_16_IBM_SDLC, CRC_32_ISO_HDLC};
@@ -33,6 +33,8 @@ pub enum Cmd {
     PinDirectory = 0x29,
     GetPinAssignments = 0x2A,
     PinAssignments = 0x2B,
+    GetPageStatuses = 0x2C,
+    PageStatuses = 0x2D,
     Ack = 0xA0,
     Nack = 0xA1,
     Error = 0xFF,
@@ -63,6 +65,8 @@ impl TryFrom<u8> for Cmd {
             0x29 => Ok(Self::PinDirectory),
             0x2A => Ok(Self::GetPinAssignments),
             0x2B => Ok(Self::PinAssignments),
+            0x2C => Ok(Self::GetPageStatuses),
+            0x2D => Ok(Self::PageStatuses),
             0xA0 => Ok(Self::Ack),
             0xA1 => Ok(Self::Nack),
             0xFF => Ok(Self::Error),
@@ -171,6 +175,14 @@ pub struct DecodedPinAssignment {
     pub function: EcuFunction,
     pub pin_id: String,
     pub pin_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPageStatus {
+    pub page_id: u8,
+    pub ram_crc: u32,
+    pub flash_crc: u32,
+    pub needs_burn: bool,
 }
 
 pub fn encode_identity_payload(
@@ -368,6 +380,59 @@ pub fn decode_pin_assignments_payload(
     Ok(assignments)
 }
 
+pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + statuses.len() * 10);
+    out.push(statuses.len() as u8);
+    for status in statuses {
+        out.push(status.page_id);
+        out.extend_from_slice(&status.ram_crc.to_be_bytes());
+        out.extend_from_slice(&status.flash_crc.to_be_bytes());
+        out.push(status.needs_burn as u8);
+    }
+    out
+}
+
+pub fn decode_page_statuses_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedPageStatus>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let expected_len = 1 + count as usize * 10;
+    if payload.len() != expected_len {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let mut offset = 1usize;
+    let mut statuses = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let page_id = payload[offset];
+        let ram_crc = u32::from_be_bytes([
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+            payload[offset + 4],
+        ]);
+        let flash_crc = u32::from_be_bytes([
+            payload[offset + 5],
+            payload[offset + 6],
+            payload[offset + 7],
+            payload[offset + 8],
+        ]);
+        let needs_burn = payload[offset + 9] != 0;
+        statuses.push(DecodedPageStatus {
+            page_id,
+            ram_crc,
+            flash_crc,
+            needs_burn,
+        });
+        offset += 10;
+    }
+
+    Ok(statuses)
+}
+
 pub fn encode_page_request(page_id: u8) -> Vec<u8> {
     vec![page_id]
 }
@@ -494,17 +559,19 @@ fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolErr
 #[cfg(test)]
 mod tests {
     use crate::board::PinFunctionClass;
+    use crate::config::ConfigPageStatus;
     use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
     use crate::io::{EcuFunction, ResolvedPinAssignment};
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
         decode_nack_payload, decode_page_payload, decode_page_request,
-        decode_pin_assignments_payload, decode_pin_directory_payload, encode_ack_payload,
-        encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
-        encode_page_directory_payload, encode_page_payload, encode_page_request,
-        encode_pin_assignments_payload, encode_pin_directory_payload,
-        encode_table_directory_payload, Cmd, DecodedPinAssignment, Packet, ProtocolError,
+        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+        encode_ack_payload, encode_capabilities_payload, encode_identity_payload,
+        encode_nack_payload, encode_page_directory_payload, encode_page_payload,
+        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+        encode_pin_directory_payload, encode_table_directory_payload, Cmd, DecodedPinAssignment,
+        Packet, ProtocolError,
     };
 
     #[test]
@@ -619,5 +686,30 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].function, EcuFunction::BoostControl);
         assert_eq!(decoded[1].pin_id, "PC0");
+    }
+
+    #[test]
+    fn page_statuses_payload_roundtrip() {
+        let statuses = vec![
+            ConfigPageStatus {
+                page_id: 0,
+                ram_crc: 11,
+                flash_crc: 22,
+                needs_burn: true,
+            },
+            ConfigPageStatus {
+                page_id: 3,
+                ram_crc: 33,
+                flash_crc: 33,
+                needs_burn: false,
+            },
+        ];
+
+        let payload = encode_page_statuses_payload(&statuses);
+        let decoded = decode_page_statuses_payload(&payload).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].needs_burn);
+        assert_eq!(decoded[1].page_id, 3);
     }
 }

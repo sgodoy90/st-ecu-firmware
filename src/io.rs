@@ -2,6 +2,9 @@ use crate::board::{
     find_pin, validate_pin_assignment, BoardValidationError, PinCapability, PinFunctionClass,
 };
 
+const PIN_ASSIGNMENT_FORMAT_VERSION: u8 = 1;
+const PIN_ASSIGNMENT_MAGIC: [u8; 4] = *b"STIO";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EcuFunction {
     CrankInput,
@@ -145,6 +148,11 @@ pub struct ResolvedPinAssignment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssignmentError {
     Board(BoardValidationError),
+    InvalidPayload,
+    PayloadTooLarge {
+        encoded_len: usize,
+        page_len: usize,
+    },
     DuplicateFunction {
         function: EcuFunction,
     },
@@ -312,6 +320,72 @@ pub fn apply_assignment_overrides(
     validate_assignment_set(&merged)
 }
 
+pub fn serialize_assignments_to_page(
+    assignments: &[ResolvedPinAssignment],
+    page_len: usize,
+) -> Result<Vec<u8>, AssignmentError> {
+    let mut encoded = Vec::with_capacity(page_len);
+    encoded.extend_from_slice(&PIN_ASSIGNMENT_MAGIC);
+    encoded.push(PIN_ASSIGNMENT_FORMAT_VERSION);
+    encoded.push(assignments.len() as u8);
+
+    for assignment in assignments {
+        encoded.push(assignment.function.code());
+        encoded.push(assignment.pin_id.len() as u8);
+        encoded.extend_from_slice(assignment.pin_id.as_bytes());
+    }
+
+    if encoded.len() > page_len {
+        return Err(AssignmentError::PayloadTooLarge {
+            encoded_len: encoded.len(),
+            page_len,
+        });
+    }
+
+    encoded.resize(page_len, 0);
+    Ok(encoded)
+}
+
+pub fn deserialize_assignments_from_page(
+    payload: &[u8],
+) -> Result<Vec<ResolvedPinAssignment>, AssignmentError> {
+    if payload.len() < 6 || payload[0..4] != PIN_ASSIGNMENT_MAGIC {
+        return Err(AssignmentError::InvalidPayload);
+    }
+    if payload[4] != PIN_ASSIGNMENT_FORMAT_VERSION {
+        return Err(AssignmentError::InvalidPayload);
+    }
+
+    let count = payload[5] as usize;
+    let mut offset = 6usize;
+    let mut requests = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let function_code = *payload.get(offset).ok_or(AssignmentError::InvalidPayload)?;
+        offset += 1;
+        let pin_len = *payload.get(offset).ok_or(AssignmentError::InvalidPayload)? as usize;
+        offset += 1;
+        let end = offset + pin_len;
+        if payload.len() < end {
+            return Err(AssignmentError::InvalidPayload);
+        }
+        let pin_id = std::str::from_utf8(&payload[offset..end])
+            .map_err(|_| AssignmentError::InvalidPayload)?;
+        offset = end;
+        requests.push(PinAssignmentRequest {
+            function: EcuFunction::try_from(function_code)
+                .map_err(|_| AssignmentError::InvalidPayload)?,
+            pin_id,
+        });
+    }
+
+    if payload[offset..].iter().any(|byte| *byte != 0) {
+        return Err(AssignmentError::InvalidPayload);
+    }
+
+    validate_assignment_set(&requests)
+}
+
 fn resource_key(pin: &PinCapability, function: PinFunctionClass) -> Option<String> {
     match function {
         PinFunctionClass::AnalogInput => pin
@@ -334,8 +408,9 @@ fn resource_key(pin: &PinCapability, function: PinFunctionClass) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_assignment_overrides, default_pin_assignments, validate_assignment_set,
-        AssignmentError, EcuFunction, PinAssignmentRequest,
+        apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
+        serialize_assignments_to_page, validate_assignment_set, AssignmentError, EcuFunction,
+        PinAssignmentRequest,
     };
 
     #[test]
@@ -442,5 +517,23 @@ mod tests {
         assert!(overridden
             .iter()
             .any(|item| { item.function == EcuFunction::IdleControl && item.pin_id == "PB1" }));
+    }
+
+    #[test]
+    fn page_codec_roundtrips_assignments() {
+        let assignments = validate_assignment_set(&default_pin_assignments()).unwrap();
+        let payload = serialize_assignments_to_page(&assignments, 128).unwrap();
+        let decoded = deserialize_assignments_from_page(&payload).unwrap();
+
+        assert_eq!(decoded, assignments);
+    }
+
+    #[test]
+    fn malformed_page_payload_is_rejected() {
+        let payload = vec![0x00; 32];
+        assert_eq!(
+            deserialize_assignments_from_page(&payload),
+            Err(AssignmentError::InvalidPayload)
+        );
     }
 }

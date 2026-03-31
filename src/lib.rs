@@ -18,24 +18,26 @@ pub use board::{
     validate_pin_assignment, BoardDefinition, BoardValidationError, ElectricalClass, PinCapability,
     PinFunctionClass, ST_ECU_V1_BOARD, ST_ECU_V1_PINS,
 };
-pub use config::{ConfigPage, ConfigStore, PAGE_DIRECTORY};
+pub use config::{ConfigPage, ConfigPageStatus, ConfigStore, PAGE_DIRECTORY};
 pub use contract::{
     base_capabilities, Capability, CapabilityParseError, FirmwareCompatibility, FirmwareIdentity,
     PageDirectoryEntry, TableDirectoryEntry, PROTOCOL_VERSION, SCHEMA_VERSION, TABLE_DIRECTORY,
 };
 pub use io::{
-    apply_assignment_overrides, default_pin_assignments, validate_assignment_set, AssignmentError,
-    EcuFunction, EcuFunctionParseError, PinAssignmentRequest, ResolvedPinAssignment, RoutingPolicy,
+    apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
+    serialize_assignments_to_page, validate_assignment_set, AssignmentError, EcuFunction,
+    EcuFunctionParseError, PinAssignmentRequest, ResolvedPinAssignment, RoutingPolicy,
 };
 pub use live_data::{LiveDataFrame, LIVE_DATA_SIZE};
 pub use protocol::{
     decode_ack_payload, decode_capabilities_payload, decode_identity_payload, decode_nack_payload,
-    decode_page_payload, decode_page_request, decode_pin_assignments_payload,
-    decode_pin_directory_payload, encode_ack_payload, encode_capabilities_payload,
-    encode_identity_payload, encode_nack_payload, encode_page_directory_payload,
-    encode_page_payload, encode_page_request, encode_pin_assignments_payload,
-    encode_pin_directory_payload, encode_table_directory_payload, Cmd, DecodedIdentity,
-    DecodedPagePayload, DecodedPinAssignment, DecodedPinDirectoryEntry, Packet, ProtocolError,
+    decode_page_payload, decode_page_request, decode_page_statuses_payload,
+    decode_pin_assignments_payload, decode_pin_directory_payload, encode_ack_payload,
+    encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
+    encode_page_directory_payload, encode_page_payload, encode_page_request,
+    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    encode_table_directory_payload, Cmd, DecodedIdentity, DecodedPagePayload, DecodedPageStatus,
+    DecodedPinAssignment, DecodedPinDirectoryEntry, Packet, ProtocolError,
 };
 pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
 

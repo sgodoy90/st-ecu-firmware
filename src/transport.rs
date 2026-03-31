@@ -1,16 +1,18 @@
 use crate::config::ConfigStore;
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
 use crate::io::{
-    apply_assignment_overrides, default_pin_assignments, validate_assignment_set, AssignmentError,
-    PinAssignmentRequest, ResolvedPinAssignment,
+    apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
+    serialize_assignments_to_page, validate_assignment_set, AssignmentError, PinAssignmentRequest,
+    ResolvedPinAssignment,
 };
 use crate::live_data::LiveDataFrame;
 use crate::protocol::{
     decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
     encode_identity_payload, encode_nack_payload, encode_page_directory_payload,
-    encode_page_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-    encode_table_directory_payload, Cmd, Packet,
+    encode_page_payload, encode_page_statuses_payload, encode_pin_assignments_payload,
+    encode_pin_directory_payload, encode_table_directory_payload, Cmd, Packet,
 };
+use crate::ConfigPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
@@ -55,12 +57,24 @@ pub struct FirmwareRuntime {
 
 impl FirmwareRuntime {
     pub fn new(identity: FirmwareIdentity, simulator: bool) -> Self {
+        let mut store = ConfigStore::new_zeroed();
         let pin_assignments = validate_assignment_set(&default_pin_assignments())
             .expect("default pin assignments must be valid for board definition");
+        let page_len = store
+            .page_length(ConfigPage::PinAssignment as u8)
+            .expect("pin assignment page must exist");
+        let pin_page = serialize_assignments_to_page(&pin_assignments, page_len)
+            .expect("default pin assignments must fit pin assignment page");
+        store
+            .write_page(ConfigPage::PinAssignment as u8, &pin_page)
+            .expect("pin assignment page seed must write");
+        store
+            .burn_page(ConfigPage::PinAssignment as u8)
+            .expect("pin assignment page seed must burn");
         Self {
             identity,
             transport: TransportCapabilities::default(),
-            store: ConfigStore::new_zeroed(),
+            store,
             capabilities: base_capabilities(simulator),
             pin_assignments,
         }
@@ -79,6 +93,7 @@ impl FirmwareRuntime {
         overrides: &[PinAssignmentRequest<'_>],
     ) -> Result<(), AssignmentError> {
         self.pin_assignments = apply_assignment_overrides(&self.pin_assignments, overrides)?;
+        self.sync_pin_assignment_page()?;
         Ok(())
     }
 
@@ -89,6 +104,28 @@ impl FirmwareRuntime {
         self.pin_assignments
             .iter()
             .find(|assignment| assignment.function == function)
+    }
+
+    fn sync_pin_assignment_page(&mut self) -> Result<(), AssignmentError> {
+        let page_id = ConfigPage::PinAssignment as u8;
+        let page_len = self
+            .store
+            .page_length(page_id)
+            .ok_or(AssignmentError::InvalidPayload)?;
+        let payload = serialize_assignments_to_page(&self.pin_assignments, page_len)?;
+        self.store
+            .write_page(page_id, &payload)
+            .map_err(|_| AssignmentError::InvalidPayload)?;
+        Ok(())
+    }
+
+    fn reload_pin_assignments_from_ram_page(&mut self) -> Result<(), AssignmentError> {
+        let payload = self
+            .store
+            .read_page(ConfigPage::PinAssignment as u8)
+            .ok_or(AssignmentError::InvalidPayload)?;
+        self.pin_assignments = deserialize_assignments_from_page(payload)?;
+        Ok(())
     }
 
     pub fn handle_packet(&mut self, packet: Packet) -> Packet {
@@ -116,6 +153,10 @@ impl FirmwareRuntime {
                 Cmd::PinAssignments,
                 encode_pin_assignments_payload(&self.pin_assignments),
             ),
+            Cmd::GetPageStatuses => Packet::new(
+                Cmd::PageStatuses,
+                encode_page_statuses_payload(&self.store.all_page_statuses()),
+            ),
             Cmd::ReadPage => match decode_page_request(&packet.payload) {
                 Ok(page_id) => match self.store.read_page(page_id) {
                     Some(page) => Packet::new(Cmd::PageData, encode_page_payload(page_id, page)),
@@ -124,16 +165,41 @@ impl FirmwareRuntime {
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad read-page payload"),
             },
             Cmd::WritePage => match decode_page_payload(&packet.payload) {
-                Ok(page) => match self.store.write_page(page.page_id, &page.payload) {
-                    Ok(()) => Packet::new(
+                Ok(page) => {
+                    let previous_assignments = self.pin_assignments.clone();
+                    let write_result = self.store.write_page(page.page_id, &page.payload);
+                    if write_result.is_err() {
+                        return nack(RuntimeNackCode::StorageFailure, "page write failed");
+                    }
+
+                    if page.page_id == ConfigPage::PinAssignment as u8
+                        && self.reload_pin_assignments_from_ram_page().is_err()
+                    {
+                        let _ = self.store.write_page(
+                            ConfigPage::PinAssignment as u8,
+                            &serialize_assignments_to_page(
+                                &previous_assignments,
+                                self.store
+                                    .page_length(ConfigPage::PinAssignment as u8)
+                                    .unwrap_or(page.payload.len()),
+                            )
+                            .unwrap_or_else(|_| vec![0u8; page.payload.len()]),
+                        );
+                        self.pin_assignments = previous_assignments;
+                        return nack(
+                            RuntimeNackCode::MalformedPayload,
+                            "invalid pin-assignment page payload",
+                        );
+                    }
+
+                    Packet::new(
                         Cmd::Ack,
                         encode_ack_payload(
                             page.page_id,
                             self.store.needs_burn(page.page_id).unwrap_or(false),
                         ),
-                    ),
-                    Err(_) => nack(RuntimeNackCode::StorageFailure, "page write failed"),
-                },
+                    )
+                }
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad write-page payload"),
             },
             Cmd::BurnPage => match decode_page_request(&packet.payload) {
@@ -157,12 +223,17 @@ fn nack(code: RuntimeNackCode, reason: &str) -> Packet {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::{EcuFunction, PinAssignmentRequest};
+    use crate::io::{
+        apply_assignment_overrides, deserialize_assignments_from_page,
+        serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
+    };
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_page_payload, decode_pin_assignments_payload,
-        decode_pin_directory_payload, encode_page_payload, encode_page_request, Cmd, Packet,
+        decode_nack_payload, decode_page_payload, decode_page_statuses_payload,
+        decode_pin_assignments_payload, decode_pin_directory_payload, encode_page_payload,
+        encode_page_request, Cmd, Packet,
     };
+    use crate::ConfigPage;
 
     use super::FirmwareRuntime;
 
@@ -270,5 +341,107 @@ mod tests {
         assert!(decoded_assignments
             .iter()
             .any(|assignment| assignment.function == EcuFunction::CrankInput));
+    }
+
+    #[test]
+    fn runtime_seeds_pin_assignment_page_from_defaults() {
+        let runtime = FirmwareRuntime::new_ecu_v1();
+        let payload = runtime
+            .store
+            .read_page(ConfigPage::PinAssignment as u8)
+            .unwrap();
+        let decoded = deserialize_assignments_from_page(payload).unwrap();
+
+        assert_eq!(decoded.len(), runtime.pin_assignments.len());
+        assert_eq!(
+            runtime.store.needs_burn(ConfigPage::PinAssignment as u8),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn writing_pin_assignment_page_updates_runtime_assignments() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let page_len = runtime
+            .store
+            .page_length(ConfigPage::PinAssignment as u8)
+            .unwrap();
+        let new_assignments = apply_assignment_overrides(
+            &runtime.pin_assignments,
+            &[PinAssignmentRequest {
+                function: EcuFunction::BoostControl,
+                pin_id: "PC8",
+            }],
+        )
+        .unwrap();
+        let page = serialize_assignments_to_page(&new_assignments, page_len).unwrap();
+
+        let response = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(ConfigPage::PinAssignment as u8, &page),
+        ));
+
+        assert_eq!(response.cmd, Cmd::Ack);
+        assert_eq!(
+            runtime
+                .pin_assignment(EcuFunction::BoostControl)
+                .unwrap()
+                .pin_id,
+            "PC8"
+        );
+        assert_eq!(
+            runtime.store.needs_burn(ConfigPage::PinAssignment as u8),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn invalid_pin_assignment_page_is_rejected_and_reverted() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let page_len = runtime
+            .store
+            .page_length(ConfigPage::PinAssignment as u8)
+            .unwrap();
+        let mut invalid_page = vec![0u8; page_len];
+        invalid_page[0..4].copy_from_slice(b"STIO");
+        invalid_page[4] = 1;
+        invalid_page[5] = 1;
+        invalid_page[6] = EcuFunction::BoostControl.code();
+        invalid_page[7] = 3;
+        invalid_page[8..11].copy_from_slice(b"PA0");
+
+        let response = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(ConfigPage::PinAssignment as u8, &invalid_page),
+        ));
+
+        assert_eq!(response.cmd, Cmd::Nack);
+        assert_eq!(
+            runtime
+                .pin_assignment(EcuFunction::BoostControl)
+                .unwrap()
+                .pin_id,
+            "PB0"
+        );
+    }
+
+    #[test]
+    fn runtime_reports_page_statuses_for_software_sync() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        runtime
+            .apply_pin_assignment_overrides(&[PinAssignmentRequest {
+                function: EcuFunction::BoostControl,
+                pin_id: "PC8",
+            }])
+            .unwrap();
+
+        let response = runtime.handle_packet(Packet::new(Cmd::GetPageStatuses, vec![]));
+        let statuses = decode_page_statuses_payload(&response.payload).unwrap();
+
+        assert_eq!(response.cmd, Cmd::PageStatuses);
+        assert_eq!(statuses.len(), 10);
+        assert!(statuses
+            .iter()
+            .any(|status| status.page_id == ConfigPage::PinAssignment as u8 && status.needs_burn));
     }
 }

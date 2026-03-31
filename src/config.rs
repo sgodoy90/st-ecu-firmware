@@ -78,6 +78,14 @@ pub struct ConfigPageHeader {
     pub payload_crc: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigPageStatus {
+    pub page_id: u8,
+    pub ram_crc: u32,
+    pub flash_crc: u32,
+    pub needs_burn: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     ram_pages: Vec<Vec<u8>>,
@@ -185,6 +193,26 @@ impl ConfigStore {
         let flash = self.flash_pages.get(page_id as usize)?;
         Some(ram != flash)
     }
+
+    pub fn page_status(&self, page_id: u8) -> Option<ConfigPageStatus> {
+        let ram = self.ram_pages.get(page_id as usize)?;
+        let flash = self.flash_pages.get(page_id as usize)?;
+        let ram_crc = CRC32.checksum(ram);
+        let flash_crc = CRC32.checksum(flash);
+        Some(ConfigPageStatus {
+            page_id,
+            ram_crc,
+            flash_crc,
+            needs_burn: ram_crc != flash_crc || ram != flash,
+        })
+    }
+
+    pub fn all_page_statuses(&self) -> Vec<ConfigPageStatus> {
+        PAGE_DIRECTORY
+            .iter()
+            .filter_map(|page| self.page_status(page.id))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +284,22 @@ mod tests {
         assert_eq!(store.needs_burn(page_a), Some(false));
         assert_eq!(store.needs_burn(page_b), Some(false));
         assert_eq!(store.burn_all_dirty(), 0);
+    }
+
+    #[test]
+    fn page_status_reports_dirty_and_clean_crc_state() {
+        let mut store = ConfigStore::new_zeroed();
+        let page_id = ConfigPage::PinAssignment as u8;
+
+        let clean = store.page_status(page_id).unwrap();
+        assert!(!clean.needs_burn);
+        assert_eq!(clean.ram_crc, clean.flash_crc);
+
+        let payload = vec![0x33; store.page_length(page_id).unwrap()];
+        store.write_page(page_id, &payload).unwrap();
+
+        let dirty = store.page_status(page_id).unwrap();
+        assert!(dirty.needs_burn);
+        assert_ne!(dirty.ram_crc, dirty.flash_crc);
     }
 }
