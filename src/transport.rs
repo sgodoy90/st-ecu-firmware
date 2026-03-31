@@ -12,7 +12,7 @@ use crate::protocol::{
     encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
     encode_pin_assignments_payload, encode_pin_directory_payload, encode_table_directory_payload,
-    Cmd, Packet,
+    encode_table_metadata_payload, Cmd, Packet,
 };
 use crate::ConfigPage;
 
@@ -151,6 +151,9 @@ impl FirmwareRuntime {
             }
             Cmd::GetTableDirectory => {
                 Packet::new(Cmd::TableDirectory, encode_table_directory_payload())
+            }
+            Cmd::GetTableMetadata => {
+                Packet::new(Cmd::TableMetadata, encode_table_metadata_payload())
             }
             Cmd::GetPinDirectory => Packet::new(Cmd::PinDirectory, encode_pin_directory_payload()),
             Cmd::GetPinAssignments => Packet::new(

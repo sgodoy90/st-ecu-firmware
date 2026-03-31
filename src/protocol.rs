@@ -33,12 +33,14 @@ pub enum Cmd {
     TableDirectory = 0x27,
     GetPinDirectory = 0x28,
     PinDirectory = 0x29,
-    GetPinAssignments = 0x2A,
-    PinAssignments = 0x2B,
+    GetTableMetadata = 0x2A,
+    TableMetadata = 0x2B,
     GetPageStatuses = 0x2C,
     PageStatuses = 0x2D,
     GetNetworkProfile = 0x2E,
     NetworkProfile = 0x2F,
+    GetPinAssignments = 0x6A,
+    PinAssignments = 0x6B,
     Ack = 0xA0,
     Nack = 0xA1,
     Error = 0xFF,
@@ -67,12 +69,14 @@ impl TryFrom<u8> for Cmd {
             0x27 => Ok(Self::TableDirectory),
             0x28 => Ok(Self::GetPinDirectory),
             0x29 => Ok(Self::PinDirectory),
-            0x2A => Ok(Self::GetPinAssignments),
-            0x2B => Ok(Self::PinAssignments),
+            0x2A => Ok(Self::GetTableMetadata),
+            0x2B => Ok(Self::TableMetadata),
             0x2C => Ok(Self::GetPageStatuses),
             0x2D => Ok(Self::PageStatuses),
             0x2E => Ok(Self::GetNetworkProfile),
             0x2F => Ok(Self::NetworkProfile),
+            0x6A => Ok(Self::GetPinAssignments),
+            0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
             0xA1 => Ok(Self::Nack),
             0xFF => Ok(Self::Error),
@@ -218,6 +222,22 @@ pub struct DecodedNetworkProfile {
     pub links: Vec<DecodedNetworkLink>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedTableMetadataEntry {
+    pub id: u8,
+    pub x_scale: u16,
+    pub y_scale: u16,
+    pub value_scale: u16,
+    pub min_value_raw: i32,
+    pub max_value_raw: i32,
+    pub default_value_raw: i32,
+    pub key: String,
+    pub x_label: String,
+    pub y_label: String,
+    pub z_label: String,
+    pub unit: String,
+}
+
 pub fn encode_identity_payload(
     identity: &FirmwareIdentity,
     capabilities: &[Capability],
@@ -318,6 +338,96 @@ pub fn encode_table_directory_payload() -> Vec<u8> {
         push_string(&mut out, table.key);
     }
     out
+}
+
+pub fn encode_table_metadata_payload() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(TABLE_DIRECTORY.len() as u8);
+    for table in TABLE_DIRECTORY {
+        out.push(table.id);
+        out.extend_from_slice(&table.x_scale.to_be_bytes());
+        out.extend_from_slice(&table.y_scale.to_be_bytes());
+        out.extend_from_slice(&table.value_scale.to_be_bytes());
+        out.extend_from_slice(&table.min_value_raw.to_be_bytes());
+        out.extend_from_slice(&table.max_value_raw.to_be_bytes());
+        out.extend_from_slice(&table.default_value_raw.to_be_bytes());
+        push_string(&mut out, table.key);
+        push_string(&mut out, table.x_label);
+        push_string(&mut out, table.y_label);
+        push_string(&mut out, table.z_label);
+        push_string(&mut out, table.unit);
+    }
+    out
+}
+
+pub fn decode_table_metadata_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedTableMetadataEntry>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if payload.len() < offset + 19 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let id = payload[offset];
+        offset += 1;
+        let x_scale = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        let y_scale = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        let value_scale = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        let min_value_raw = i32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
+        offset += 4;
+        let max_value_raw = i32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
+        offset += 4;
+        let default_value_raw = i32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
+        offset += 4;
+        let key = read_string(payload, &mut offset)?;
+        let x_label = read_string(payload, &mut offset)?;
+        let y_label = read_string(payload, &mut offset)?;
+        let z_label = read_string(payload, &mut offset)?;
+        let unit = read_string(payload, &mut offset)?;
+        entries.push(DecodedTableMetadataEntry {
+            id,
+            x_scale,
+            y_scale,
+            value_scale,
+            min_value_raw,
+            max_value_raw,
+            default_value_raw,
+            key,
+            x_label,
+            y_label,
+            z_label,
+            unit,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
 }
 
 pub fn encode_pin_directory_payload() -> Vec<u8> {
@@ -723,11 +833,12 @@ mod tests {
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
         decode_nack_payload, decode_network_profile_payload, decode_page_payload,
         decode_page_request, decode_page_statuses_payload, decode_pin_assignments_payload,
-        decode_pin_directory_payload, encode_ack_payload, encode_capabilities_payload,
-        encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
-        encode_page_directory_payload, encode_page_payload, encode_page_request,
-        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-        encode_table_directory_payload, Cmd, DecodedPinAssignment, Packet, ProtocolError,
+        decode_pin_directory_payload, decode_table_metadata_payload, encode_ack_payload,
+        encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
+        encode_network_profile_payload, encode_page_directory_payload, encode_page_payload,
+        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+        encode_pin_directory_payload, encode_table_directory_payload, encode_table_metadata_payload,
+        Cmd, DecodedPinAssignment, Packet, ProtocolError,
     };
 
     #[test]
@@ -761,8 +872,25 @@ mod tests {
     fn directories_encode_entries() {
         let pages = encode_page_directory_payload();
         let tables = encode_table_directory_payload();
+        let metadata = encode_table_metadata_payload();
         assert!(pages.len() > 4);
         assert!(tables.len() > 4);
+        assert!(metadata.len() > tables.len());
+    }
+
+    #[test]
+    fn table_metadata_roundtrip() {
+        let payload = encode_table_metadata_payload();
+        let entries = decode_table_metadata_payload(&payload).unwrap();
+        let ignition = entries.iter().find(|entry| entry.id == 0x01).unwrap();
+        let ve = entries.iter().find(|entry| entry.id == 0x00).unwrap();
+
+        assert_eq!(ignition.unit, "deg");
+        assert_eq!(ignition.min_value_raw, -200);
+        assert_eq!(ignition.value_scale, 10);
+        assert_eq!(ve.unit, "%");
+        assert_eq!(ve.min_value_raw, 0);
+        assert_eq!(ve.y_label, "MAP");
     }
 
     #[test]
