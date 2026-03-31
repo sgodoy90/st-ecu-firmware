@@ -21,3 +21,10 @@ Desktop defines presentation and workflow.
 - capability list
 - live-data frame with deterministic layout
 - page read/write/burn on a known board target
+
+## Bootstrap Already Landed
+- preliminary STM32H743 board definition and pin capability matrix
+- firmware identity, capability, and compatibility structs
+- page directory and table directory constants
+- RAM/flash config staging model with CRC and burn detection
+- packet framing for version, capabilities, and page payloads

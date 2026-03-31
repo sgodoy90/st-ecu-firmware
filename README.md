@@ -15,17 +15,21 @@ It exists to do three things cleanly:
 This first scaffold is intentionally architecture-first:
 
 - firmware identity and compatibility contract
+- preliminary board definition and pin capability matrix
 - page and table directory definitions
 - live-data frame contract
+- packet framing and page payload encoding
+- config RAM/flash staging with CRC and burn semantics
 - protection, reset reason, diagnostics, and transport module boundaries
 
 This is not yet MCU bring-up. The next implementation milestone is:
 
 1. board definition
 2. startup and clock bring-up
-3. config storage
-4. ping/version/live frame
-5. page read/write/burn
+3. STM32H743 board abstraction
+4. startup and clock bring-up
+5. ping/version/live frame on transport
+6. page read/write/burn backed by MCU flash
 
 ## Source Of Truth Relationship
 At the moment, shared contract docs live in:
@@ -51,7 +55,7 @@ This repository should eventually own the runtime implementation of those contra
 
 ## Immediate Next Tasks
 - add STM32H743 target and linker config
-- add board definition and pin matrix module
-- implement config page header + CRC
-- implement version/identity response
-- implement read/write page service
+- expand board definition from preliminary matrix to full production matrix
+- wire protocol packets into transport service
+- move config staging from host model into embedded flash backend
+- implement version/identity response on real target

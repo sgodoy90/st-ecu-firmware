@@ -10,4 +10,4 @@ name = "st_ecu_firmware"
 path = "src/lib.rs"
 
 [dependencies]
-
+crc = "3"
