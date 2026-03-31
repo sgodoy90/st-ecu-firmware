@@ -24,11 +24,13 @@ pub use contract::{
 };
 pub use live_data::{LiveDataFrame, LIVE_DATA_SIZE};
 pub use protocol::{
-    decode_capabilities_payload, decode_identity_payload, decode_page_payload, decode_page_request,
-    encode_capabilities_payload, encode_identity_payload, encode_page_directory_payload,
+    decode_ack_payload, decode_capabilities_payload, decode_identity_payload, decode_nack_payload,
+    decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
+    encode_identity_payload, encode_nack_payload, encode_page_directory_payload,
     encode_page_payload, encode_page_request, encode_table_directory_payload, Cmd, DecodedIdentity,
     DecodedPagePayload, Packet, ProtocolError,
 };
+pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
 
 #[cfg(test)]
 mod tests {

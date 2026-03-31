@@ -17,10 +17,16 @@ pub enum Cmd {
     VersionResponse = 0x04,
     GetCapabilities = 0x05,
     Capabilities = 0x06,
+    GetLiveData = 0x07,
+    LiveData = 0x08,
     ReadPage = 0x20,
     PageData = 0x21,
     WritePage = 0x22,
     BurnPage = 0x23,
+    GetPageDirectory = 0x24,
+    PageDirectory = 0x25,
+    GetTableDirectory = 0x26,
+    TableDirectory = 0x27,
     Ack = 0xA0,
     Nack = 0xA1,
     Error = 0xFF,
@@ -37,10 +43,16 @@ impl TryFrom<u8> for Cmd {
             0x04 => Ok(Self::VersionResponse),
             0x05 => Ok(Self::GetCapabilities),
             0x06 => Ok(Self::Capabilities),
+            0x07 => Ok(Self::GetLiveData),
+            0x08 => Ok(Self::LiveData),
             0x20 => Ok(Self::ReadPage),
             0x21 => Ok(Self::PageData),
             0x22 => Ok(Self::WritePage),
             0x23 => Ok(Self::BurnPage),
+            0x24 => Ok(Self::GetPageDirectory),
+            0x25 => Ok(Self::PageDirectory),
+            0x26 => Ok(Self::GetTableDirectory),
+            0x27 => Ok(Self::TableDirectory),
             0xA0 => Ok(Self::Ack),
             0xA1 => Ok(Self::Nack),
             0xFF => Ok(Self::Error),
@@ -254,6 +266,36 @@ pub fn encode_page_payload(page_id: u8, data: &[u8]) -> Vec<u8> {
     out
 }
 
+pub fn encode_ack_payload(page_id: u8, needs_burn: bool) -> Vec<u8> {
+    vec![page_id, needs_burn as u8]
+}
+
+pub fn decode_ack_payload(payload: &[u8]) -> Result<(u8, bool), ProtocolError> {
+    if payload.len() != 2 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    Ok((payload[0], payload[1] != 0))
+}
+
+pub fn encode_nack_payload(code: u8, reason: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(reason.len() + 2);
+    out.push(code);
+    push_string(&mut out, reason);
+    out
+}
+
+pub fn decode_nack_payload(payload: &[u8]) -> Result<(u8, String), ProtocolError> {
+    if payload.is_empty() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let mut offset = 1usize;
+    let reason = read_string(payload, &mut offset)?;
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    Ok((payload[0], reason))
+}
+
 pub fn decode_page_payload(payload: &[u8]) -> Result<DecodedPagePayload, ProtocolError> {
     if payload.len() < 7 {
         return Err(ProtocolError::MalformedPayload);
@@ -308,8 +350,9 @@ mod tests {
     use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
 
     use super::{
-        decode_capabilities_payload, decode_identity_payload, decode_page_payload,
-        decode_page_request, encode_capabilities_payload, encode_identity_payload,
+        decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
+        decode_nack_payload, decode_page_payload, decode_page_request, encode_ack_payload,
+        encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
         encode_page_directory_payload, encode_page_payload, encode_page_request,
         encode_table_directory_payload, Cmd, Packet, ProtocolError,
     };
@@ -380,5 +423,20 @@ mod tests {
             decode_page_payload(&payload),
             Err(ProtocolError::MalformedPayload)
         ));
+    }
+
+    #[test]
+    fn ack_payload_roundtrip() {
+        let payload = encode_ack_payload(4, true);
+        assert_eq!(decode_ack_payload(&payload).unwrap(), (4, true));
+    }
+
+    #[test]
+    fn nack_payload_roundtrip() {
+        let payload = encode_nack_payload(2, "bad page");
+        assert_eq!(
+            decode_nack_payload(&payload).unwrap(),
+            (2, "bad page".to_string())
+        );
     }
 }
