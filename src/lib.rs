@@ -8,7 +8,9 @@ pub mod diagnostics;
 pub mod engine;
 pub mod io;
 pub mod live_data;
+pub mod mcu;
 pub mod network;
+pub mod pinmux;
 pub mod protection;
 pub mod protocol;
 pub mod reset_reason;
@@ -17,8 +19,7 @@ pub mod transport;
 pub use board::{
     assignable_pins, board_definition, board_matches_firmware_identity, find_pin,
     validate_pin_assignment, BoardDefinition, BoardPathKind, BoardValidationError, ElectricalClass,
-    PinCapability, PinFunctionClass, PinFunctionClassParseError, PinRoute, ST_ECU_V1_BOARD,
-    ST_ECU_V1_PINS,
+    PinCapability, ST_ECU_V1_BOARD, ST_ECU_V1_PINS,
 };
 pub use config::{ConfigPage, ConfigPageStatus, ConfigStore, PAGE_DIRECTORY};
 pub use contract::{
@@ -31,12 +32,17 @@ pub use io::{
     EcuFunctionParseError, PinAssignmentRequest, ResolvedPinAssignment, RoutingPolicy,
 };
 pub use live_data::{LiveDataFrame, LIVE_DATA_SIZE};
+pub use mcu::{
+    find_mcu_pin, mcu_definition, McuDefinition, McuPackage, McuPinCapability,
+    STM32H743ZG_SELECTED_MATRIX, STM32H743ZG_SELECTED_PINS,
+};
 pub use network::{
     display_network_profile, headless_network_profile, preferred_links, supports_message,
     LinkContract, MessageClass, MessageClassParseError, NetworkNodeKind, NetworkProfile,
     ProductTrack, ProductTrackParseError, TransportLinkKind, TransportLinkParseError,
     DISPLAY_PROFILE, HEADLESS_PROFILE,
 };
+pub use pinmux::{PinFunctionClass, PinFunctionClassParseError, PinRoute};
 pub use protocol::{
     decode_ack_payload, decode_capabilities_payload, decode_identity_payload, decode_nack_payload,
     decode_network_profile_payload, decode_page_payload, decode_page_request,

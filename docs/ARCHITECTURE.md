@@ -23,6 +23,9 @@ Desktop defines presentation and workflow.
 - page read/write/burn on a known board target
 
 ## Bootstrap Already Landed
+- selected `STM32H743ZG` MCU matrix for the current pin subset, separated from
+  the board contract so firmware can validate board assumptions against real MCU
+  capabilities
 - preliminary STM32H743 board definition and pin capability matrix
 - ECU-level IO assignment validator with hardware-path and MCU-resource checks
 - board-path metadata that distinguishes conditioned trigger inputs, protected
@@ -30,6 +33,9 @@ Desktop defines presentation and workflow.
   USB, CAN transceiver pins, WiFi bridge UART, and debug access
 - per-pin mux routes that identify the logical function class, mux mode, signal
   name, and exclusive resource key used for conflict detection
+- corrected the seeded injector timing channels to independent `TIM1_CH1` and
+  `TIM1_CH2` outputs and aligned the seeded `PC3` analog route with a real ADC
+  channel
 - protocol payloads for exposing board pins and active IO assignments
 - firmware identity, capability, and compatibility structs
 - page directory and table directory constants

@@ -1,6 +1,5 @@
-use crate::board::{
-    find_pin, validate_pin_assignment, BoardValidationError, PinCapability, PinFunctionClass,
-};
+use crate::board::{find_pin, validate_pin_assignment, BoardValidationError, PinCapability};
+use crate::pinmux::PinFunctionClass;
 
 const PIN_ASSIGNMENT_FORMAT_VERSION: u8 = 1;
 const PIN_ASSIGNMENT_MAGIC: [u8; 4] = *b"STIO";
@@ -100,8 +99,8 @@ impl EcuFunction {
         match self {
             Self::CrankInput => Some("PA0"),
             Self::CamInput => Some("PA1"),
-            Self::Injector1 => Some("PE8"),
-            Self::Injector2 => Some("PE9"),
+            Self::Injector1 => Some("PE9"),
+            Self::Injector2 => Some("PE11"),
             Self::Ignition1 => Some("PF8"),
             Self::Ignition2 => Some("PF9"),
             _ => None,
@@ -215,11 +214,11 @@ pub fn default_pin_assignments() -> Vec<PinAssignmentRequest<'static>> {
         },
         PinAssignmentRequest {
             function: EcuFunction::Injector1,
-            pin_id: "PE8",
+            pin_id: "PE9",
         },
         PinAssignmentRequest {
             function: EcuFunction::Injector2,
-            pin_id: "PE9",
+            pin_id: "PE11",
         },
         PinAssignmentRequest {
             function: EcuFunction::Ignition1,

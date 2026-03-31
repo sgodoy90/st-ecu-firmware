@@ -1,8 +1,9 @@
-use crate::board::{board_definition, PinCapability, PinFunctionClass};
+use crate::board::{board_definition, PinCapability};
 use crate::config::{ConfigPageStatus, PAGE_DIRECTORY};
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
 use crate::io::{EcuFunction, ResolvedPinAssignment};
 use crate::network::{MessageClass, NetworkProfile, ProductTrack, TransportLinkKind};
+use crate::pinmux::PinFunctionClass;
 use crc::{Crc, CRC_16_IBM_SDLC, CRC_32_ISO_HDLC};
 
 static CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
@@ -687,11 +688,11 @@ fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolErr
 
 #[cfg(test)]
 mod tests {
-    use crate::board::PinFunctionClass;
     use crate::config::ConfigPageStatus;
     use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
     use crate::io::{EcuFunction, ResolvedPinAssignment};
     use crate::network::{display_network_profile, MessageClass, ProductTrack, TransportLinkKind};
+    use crate::pinmux::PinFunctionClass;
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
