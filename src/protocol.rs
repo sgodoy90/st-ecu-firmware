@@ -1,5 +1,7 @@
+use crate::board::{board_definition, PinCapability};
 use crate::config::PAGE_DIRECTORY;
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
+use crate::io::{EcuFunction, ResolvedPinAssignment};
 use crc::{Crc, CRC_16_IBM_SDLC, CRC_32_ISO_HDLC};
 
 static CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
@@ -27,6 +29,10 @@ pub enum Cmd {
     PageDirectory = 0x25,
     GetTableDirectory = 0x26,
     TableDirectory = 0x27,
+    GetPinDirectory = 0x28,
+    PinDirectory = 0x29,
+    GetPinAssignments = 0x2A,
+    PinAssignments = 0x2B,
     Ack = 0xA0,
     Nack = 0xA1,
     Error = 0xFF,
@@ -53,6 +59,10 @@ impl TryFrom<u8> for Cmd {
             0x25 => Ok(Self::PageDirectory),
             0x26 => Ok(Self::GetTableDirectory),
             0x27 => Ok(Self::TableDirectory),
+            0x28 => Ok(Self::GetPinDirectory),
+            0x29 => Ok(Self::PinDirectory),
+            0x2A => Ok(Self::GetPinAssignments),
+            0x2B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
             0xA1 => Ok(Self::Nack),
             0xFF => Ok(Self::Error),
@@ -142,6 +152,25 @@ pub struct DecodedPagePayload {
     pub page_id: u8,
     pub payload_crc: u32,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPinDirectoryEntry {
+    pub pin_id: String,
+    pub label: String,
+    pub electrical_class: String,
+    pub flags: u16,
+    pub timer_instance: String,
+    pub timer_channel: String,
+    pub adc_instance: String,
+    pub adc_channel: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPinAssignment {
+    pub function: EcuFunction,
+    pub pin_id: String,
+    pub pin_label: String,
 }
 
 pub fn encode_identity_payload(
@@ -246,6 +275,99 @@ pub fn encode_table_directory_payload() -> Vec<u8> {
     out
 }
 
+pub fn encode_pin_directory_payload() -> Vec<u8> {
+    let pins = board_definition().pins;
+    let mut out = Vec::new();
+    out.push(pins.len() as u8);
+    for pin in pins {
+        encode_pin_capability(&mut out, pin);
+    }
+    out
+}
+
+pub fn decode_pin_directory_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedPinDirectoryEntry>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let pin_id = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        let electrical_class = read_string(payload, &mut offset)?;
+        if payload.len() < offset + 2 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let flags = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        offset += 2;
+        let timer_instance = read_string(payload, &mut offset)?;
+        let timer_channel = read_string(payload, &mut offset)?;
+        let adc_instance = read_string(payload, &mut offset)?;
+        let adc_channel_raw = *payload.get(offset).ok_or(ProtocolError::MalformedPayload)?;
+        offset += 1;
+        entries.push(DecodedPinDirectoryEntry {
+            pin_id,
+            label,
+            electrical_class,
+            flags,
+            timer_instance,
+            timer_channel,
+            adc_instance,
+            adc_channel: (adc_channel_raw != u8::MAX).then_some(adc_channel_raw),
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
+pub fn encode_pin_assignments_payload(assignments: &[ResolvedPinAssignment]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(assignments.len() as u8);
+    for assignment in assignments {
+        out.push(assignment.function.code());
+        push_string(&mut out, assignment.pin_id);
+        push_string(&mut out, assignment.pin_label);
+    }
+    out
+}
+
+pub fn decode_pin_assignments_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedPinAssignment>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut assignments = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let function_code = *payload.get(offset).ok_or(ProtocolError::MalformedPayload)?;
+        offset += 1;
+        let function =
+            EcuFunction::try_from(function_code).map_err(|_| ProtocolError::MalformedPayload)?;
+        let pin_id = read_string(payload, &mut offset)?;
+        let pin_label = read_string(payload, &mut offset)?;
+        assignments.push(DecodedPinAssignment {
+            function,
+            pin_id,
+            pin_label,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(assignments)
+}
+
 pub fn encode_page_request(page_id: u8) -> Vec<u8> {
     vec![page_id]
 }
@@ -330,6 +452,30 @@ fn push_string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
+fn encode_pin_capability(out: &mut Vec<u8>, pin: &PinCapability) {
+    push_string(out, pin.pin_id);
+    push_string(out, pin.label);
+    push_string(out, pin.electrical_class.key());
+
+    let mut flags = 0u16;
+    flags |= u16::from(pin.reserved) << 0;
+    flags |= u16::from(pin.supports_adc) << 1;
+    flags |= u16::from(pin.supports_pwm) << 2;
+    flags |= u16::from(pin.supports_capture) << 3;
+    flags |= u16::from(pin.supports_gpio_in) << 4;
+    flags |= u16::from(pin.supports_gpio_out) << 5;
+    flags |= u16::from(pin.supports_can) << 6;
+    flags |= u16::from(pin.supports_uart) << 7;
+    flags |= u16::from(pin.supports_spi) << 8;
+    flags |= u16::from(pin.supports_i2c) << 9;
+    out.extend_from_slice(&flags.to_be_bytes());
+
+    push_string(out, pin.timer_instance.unwrap_or(""));
+    push_string(out, pin.timer_channel.unwrap_or(""));
+    push_string(out, pin.adc_instance.unwrap_or(""));
+    out.push(pin.adc_channel.unwrap_or(u8::MAX));
+}
+
 fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolError> {
     let len = *payload
         .get(*offset)
@@ -347,14 +493,18 @@ fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolErr
 
 #[cfg(test)]
 mod tests {
+    use crate::board::PinFunctionClass;
     use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
+    use crate::io::{EcuFunction, ResolvedPinAssignment};
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_page_payload, decode_page_request, encode_ack_payload,
+        decode_nack_payload, decode_page_payload, decode_page_request,
+        decode_pin_assignments_payload, decode_pin_directory_payload, encode_ack_payload,
         encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
         encode_page_directory_payload, encode_page_payload, encode_page_request,
-        encode_table_directory_payload, Cmd, Packet, ProtocolError,
+        encode_pin_assignments_payload, encode_pin_directory_payload,
+        encode_table_directory_payload, Cmd, DecodedPinAssignment, Packet, ProtocolError,
     };
 
     #[test]
@@ -438,5 +588,36 @@ mod tests {
             decode_nack_payload(&payload).unwrap(),
             (2, "bad page".to_string())
         );
+    }
+
+    #[test]
+    fn pin_directory_payload_roundtrip() {
+        let payload = encode_pin_directory_payload();
+        let decoded = decode_pin_directory_payload(&payload).unwrap();
+        assert!(decoded.iter().any(|pin| pin.pin_id == "PA0"));
+        assert!(decoded.iter().any(|pin| pin.pin_id == "PC8"));
+    }
+
+    #[test]
+    fn pin_assignments_payload_roundtrip() {
+        let assignments = vec![
+            ResolvedPinAssignment {
+                function: EcuFunction::BoostControl,
+                pin_id: "PB0",
+                pin_label: "BOOST_PWM",
+                required_function: PinFunctionClass::PwmOutput,
+            },
+            ResolvedPinAssignment {
+                function: EcuFunction::MapSensor,
+                pin_id: "PC0",
+                pin_label: "MAP",
+                required_function: PinFunctionClass::AnalogInput,
+            },
+        ];
+        let payload = encode_pin_assignments_payload(&assignments);
+        let decoded: Vec<DecodedPinAssignment> = decode_pin_assignments_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].function, EcuFunction::BoostControl);
+        assert_eq!(decoded[1].pin_id, "PC0");
     }
 }

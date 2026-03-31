@@ -16,6 +16,8 @@ This first scaffold is intentionally architecture-first:
 
 - firmware identity and compatibility contract
 - preliminary board definition and pin capability matrix
+- IO assignment validation with fixed-path and compatible-reroute rules
+- runtime protocol surface for pin directory and active assignments
 - page and table directory definitions
 - live-data frame contract
 - packet framing and page payload encoding

@@ -24,6 +24,8 @@ Desktop defines presentation and workflow.
 
 ## Bootstrap Already Landed
 - preliminary STM32H743 board definition and pin capability matrix
+- ECU-level IO assignment validator with hardware-path and MCU-resource checks
+- protocol payloads for exposing board pins and active IO assignments
 - firmware identity, capability, and compatibility structs
 - page directory and table directory constants
 - RAM/flash config staging model with CRC and burn detection

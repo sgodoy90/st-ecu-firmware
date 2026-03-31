@@ -13,6 +13,22 @@ pub enum ElectricalClass {
     Reserved,
 }
 
+impl ElectricalClass {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::AnalogSensor => "analog_sensor",
+            Self::DigitalInput => "digital_input",
+            Self::FrequencyInput => "frequency_input",
+            Self::LogicOutput => "logic_output",
+            Self::PwmOutput => "pwm_output",
+            Self::PowerLowSide => "power_low_side",
+            Self::PowerHighSide => "power_high_side",
+            Self::Communication => "communication",
+            Self::Reserved => "reserved",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinFunctionClass {
     AnalogInput,
@@ -92,7 +108,7 @@ const IGNITION_FUNCTIONS: &[PinFunctionClass] = &[PinFunctionClass::Ignition];
 const UART_FUNCTIONS: &[PinFunctionClass] = &[PinFunctionClass::Uart];
 const DEBUG_FUNCTIONS: &[PinFunctionClass] = &[PinFunctionClass::Debug];
 
-pub const ST_ECU_V1_PINS: [PinCapability; 19] = [
+pub const ST_ECU_V1_PINS: [PinCapability; 20] = [
     PinCapability {
         pin_id: "PA11",
         port: 'A',
@@ -391,6 +407,31 @@ pub const ST_ECU_V1_PINS: [PinCapability; 19] = [
         adc_instance: None,
         adc_channel: None,
         notes: "Idle valve or DBW fallback PWM output.",
+        valid_function_classes: PWM_FUNCTIONS,
+    },
+    PinCapability {
+        pin_id: "PC8",
+        port: 'C',
+        pin_number: 8,
+        label: "AUX_PWM_ALT1",
+        electrical_class: ElectricalClass::PwmOutput,
+        voltage_tolerance: "5V tolerant",
+        max_current_ma: 20,
+        reserved: false,
+        supports_adc: false,
+        supports_pwm: true,
+        supports_capture: false,
+        supports_gpio_in: false,
+        supports_gpio_out: true,
+        supports_can: false,
+        supports_uart: false,
+        supports_spi: false,
+        supports_i2c: false,
+        timer_instance: Some("TIM3"),
+        timer_channel: Some("CH3"),
+        adc_instance: None,
+        adc_channel: None,
+        notes: "Alternate PWM-capable output sharing TIM3 CH3 for resource-conflict validation.",
         valid_function_classes: PWM_FUNCTIONS,
     },
     PinCapability {

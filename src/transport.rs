@@ -1,10 +1,15 @@
 use crate::config::ConfigStore;
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
+use crate::io::{
+    apply_assignment_overrides, default_pin_assignments, validate_assignment_set, AssignmentError,
+    PinAssignmentRequest, ResolvedPinAssignment,
+};
 use crate::live_data::LiveDataFrame;
 use crate::protocol::{
     decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
     encode_identity_payload, encode_nack_payload, encode_page_directory_payload,
-    encode_page_payload, encode_table_directory_payload, Cmd, Packet,
+    encode_page_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    encode_table_directory_payload, Cmd, Packet,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,15 +50,19 @@ pub struct FirmwareRuntime {
     pub transport: TransportCapabilities,
     pub store: ConfigStore,
     pub capabilities: Vec<Capability>,
+    pub pin_assignments: Vec<ResolvedPinAssignment>,
 }
 
 impl FirmwareRuntime {
     pub fn new(identity: FirmwareIdentity, simulator: bool) -> Self {
+        let pin_assignments = validate_assignment_set(&default_pin_assignments())
+            .expect("default pin assignments must be valid for board definition");
         Self {
             identity,
             transport: TransportCapabilities::default(),
             store: ConfigStore::new_zeroed(),
             capabilities: base_capabilities(simulator),
+            pin_assignments,
         }
     }
 
@@ -63,6 +72,23 @@ impl FirmwareRuntime {
 
     pub fn new_simulator() -> Self {
         Self::new(FirmwareIdentity::simulator(), true)
+    }
+
+    pub fn apply_pin_assignment_overrides(
+        &mut self,
+        overrides: &[PinAssignmentRequest<'_>],
+    ) -> Result<(), AssignmentError> {
+        self.pin_assignments = apply_assignment_overrides(&self.pin_assignments, overrides)?;
+        Ok(())
+    }
+
+    pub fn pin_assignment(
+        &self,
+        function: crate::io::EcuFunction,
+    ) -> Option<&ResolvedPinAssignment> {
+        self.pin_assignments
+            .iter()
+            .find(|assignment| assignment.function == function)
     }
 
     pub fn handle_packet(&mut self, packet: Packet) -> Packet {
@@ -85,6 +111,11 @@ impl FirmwareRuntime {
             Cmd::GetTableDirectory => {
                 Packet::new(Cmd::TableDirectory, encode_table_directory_payload())
             }
+            Cmd::GetPinDirectory => Packet::new(Cmd::PinDirectory, encode_pin_directory_payload()),
+            Cmd::GetPinAssignments => Packet::new(
+                Cmd::PinAssignments,
+                encode_pin_assignments_payload(&self.pin_assignments),
+            ),
             Cmd::ReadPage => match decode_page_request(&packet.payload) {
                 Ok(page_id) => match self.store.read_page(page_id) {
                     Some(page) => Packet::new(Cmd::PageData, encode_page_payload(page_id, page)),
@@ -126,10 +157,11 @@ fn nack(code: RuntimeNackCode, reason: &str) -> Packet {
 
 #[cfg(test)]
 mod tests {
+    use crate::io::{EcuFunction, PinAssignmentRequest};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_page_payload, encode_page_payload, encode_page_request, Cmd,
-        Packet,
+        decode_nack_payload, decode_page_payload, decode_pin_assignments_payload,
+        decode_pin_directory_payload, encode_page_payload, encode_page_request, Cmd, Packet,
     };
 
     use super::FirmwareRuntime;
@@ -183,5 +215,60 @@ mod tests {
         assert_eq!(response.cmd, Cmd::Nack);
         assert_eq!(code, 3);
         assert!(reason.contains("invalid"));
+    }
+
+    #[test]
+    fn runtime_starts_with_valid_default_pinout() {
+        let runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(runtime.pin_assignments.len(), 12);
+        assert_eq!(
+            runtime
+                .pin_assignment(EcuFunction::BoostControl)
+                .unwrap()
+                .pin_id,
+            "PB0"
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_safe_pin_override_and_rejects_conflict() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        runtime
+            .apply_pin_assignment_overrides(&[PinAssignmentRequest {
+                function: EcuFunction::BoostControl,
+                pin_id: "PC8",
+            }])
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .pin_assignment(EcuFunction::BoostControl)
+                .unwrap()
+                .pin_id,
+            "PC8"
+        );
+
+        let conflict = runtime.apply_pin_assignment_overrides(&[PinAssignmentRequest {
+            function: EcuFunction::IdleControl,
+            pin_id: "PB0",
+        }]);
+        assert!(conflict.is_err());
+    }
+
+    #[test]
+    fn runtime_exposes_pin_directory_and_active_assignments() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let pins = runtime.handle_packet(Packet::new(Cmd::GetPinDirectory, vec![]));
+        let decoded_pins = decode_pin_directory_payload(&pins.payload).unwrap();
+        assert_eq!(pins.cmd, Cmd::PinDirectory);
+        assert!(decoded_pins.iter().any(|pin| pin.pin_id == "PA0"));
+
+        let assignments = runtime.handle_packet(Packet::new(Cmd::GetPinAssignments, vec![]));
+        let decoded_assignments = decode_pin_assignments_payload(&assignments.payload).unwrap();
+        assert_eq!(assignments.cmd, Cmd::PinAssignments);
+        assert!(decoded_assignments
+            .iter()
+            .any(|assignment| assignment.function == EcuFunction::CrankInput));
     }
 }
