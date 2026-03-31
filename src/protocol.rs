@@ -2,6 +2,7 @@ use crate::board::{board_definition, PinCapability};
 use crate::config::{ConfigPageStatus, PAGE_DIRECTORY};
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
 use crate::io::{EcuFunction, ResolvedPinAssignment};
+use crate::network::{MessageClass, NetworkProfile, ProductTrack, TransportLinkKind};
 use crc::{Crc, CRC_16_IBM_SDLC, CRC_32_ISO_HDLC};
 
 static CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
@@ -35,6 +36,8 @@ pub enum Cmd {
     PinAssignments = 0x2B,
     GetPageStatuses = 0x2C,
     PageStatuses = 0x2D,
+    GetNetworkProfile = 0x2E,
+    NetworkProfile = 0x2F,
     Ack = 0xA0,
     Nack = 0xA1,
     Error = 0xFF,
@@ -67,6 +70,8 @@ impl TryFrom<u8> for Cmd {
             0x2B => Ok(Self::PinAssignments),
             0x2C => Ok(Self::GetPageStatuses),
             0x2D => Ok(Self::PageStatuses),
+            0x2E => Ok(Self::GetNetworkProfile),
+            0x2F => Ok(Self::NetworkProfile),
             0xA0 => Ok(Self::Ack),
             0xA1 => Ok(Self::Nack),
             0xFF => Ok(Self::Error),
@@ -183,6 +188,21 @@ pub struct DecodedPageStatus {
     pub ram_crc: u32,
     pub flash_crc: u32,
     pub needs_burn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedNetworkLink {
+    pub kind: TransportLinkKind,
+    pub realtime_safe: bool,
+    pub firmware_update_allowed: bool,
+    pub classes: Vec<MessageClass>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedNetworkProfile {
+    pub product_track: ProductTrack,
+    pub multi_master_can: bool,
+    pub links: Vec<DecodedNetworkLink>,
 }
 
 pub fn encode_identity_payload(
@@ -433,6 +453,75 @@ pub fn decode_page_statuses_payload(
     Ok(statuses)
 }
 
+pub fn encode_network_profile_payload(profile: &NetworkProfile) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(profile.product_track.code());
+    out.push(profile.multi_master_can as u8);
+    out.push(profile.links.len() as u8);
+    for link in profile.links {
+        out.push(link.kind.code());
+        out.push(link.realtime_safe as u8);
+        out.push(link.firmware_update_allowed as u8);
+        out.push(link.classes.len() as u8);
+        for class in link.classes {
+            out.push(class.code());
+        }
+    }
+    out
+}
+
+pub fn decode_network_profile_payload(
+    payload: &[u8],
+) -> Result<DecodedNetworkProfile, ProtocolError> {
+    if payload.len() < 3 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let product_track =
+        ProductTrack::try_from(payload[0]).map_err(|_| ProtocolError::MalformedPayload)?;
+    let multi_master_can = payload[1] != 0;
+    let link_count = payload[2] as usize;
+    let mut offset = 3usize;
+    let mut links = Vec::with_capacity(link_count);
+
+    for _ in 0..link_count {
+        if payload.len() < offset + 4 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let kind = TransportLinkKind::try_from(payload[offset])
+            .map_err(|_| ProtocolError::MalformedPayload)?;
+        let realtime_safe = payload[offset + 1] != 0;
+        let firmware_update_allowed = payload[offset + 2] != 0;
+        let class_count = payload[offset + 3] as usize;
+        offset += 4;
+        if payload.len() < offset + class_count {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let mut classes = Vec::with_capacity(class_count);
+        for code in &payload[offset..offset + class_count] {
+            classes
+                .push(MessageClass::try_from(*code).map_err(|_| ProtocolError::MalformedPayload)?);
+        }
+        offset += class_count;
+        links.push(DecodedNetworkLink {
+            kind,
+            realtime_safe,
+            firmware_update_allowed,
+            classes,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(DecodedNetworkProfile {
+        product_track,
+        multi_master_can,
+        links,
+    })
+}
+
 pub fn encode_page_request(page_id: u8) -> Vec<u8> {
     vec![page_id]
 }
@@ -562,16 +651,17 @@ mod tests {
     use crate::config::ConfigPageStatus;
     use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
     use crate::io::{EcuFunction, ResolvedPinAssignment};
+    use crate::network::{display_network_profile, MessageClass, ProductTrack, TransportLinkKind};
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_page_payload, decode_page_request,
-        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-        encode_ack_payload, encode_capabilities_payload, encode_identity_payload,
-        encode_nack_payload, encode_page_directory_payload, encode_page_payload,
-        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-        encode_pin_directory_payload, encode_table_directory_payload, Cmd, DecodedPinAssignment,
-        Packet, ProtocolError,
+        decode_nack_payload, decode_network_profile_payload, decode_page_payload,
+        decode_page_request, decode_page_statuses_payload, decode_pin_assignments_payload,
+        decode_pin_directory_payload, encode_ack_payload, encode_capabilities_payload,
+        encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
+        encode_page_directory_payload, encode_page_payload, encode_page_request,
+        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+        encode_table_directory_payload, Cmd, DecodedPinAssignment, Packet, ProtocolError,
     };
 
     #[test]
@@ -711,5 +801,22 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert!(decoded[0].needs_burn);
         assert_eq!(decoded[1].page_id, 3);
+    }
+
+    #[test]
+    fn network_profile_payload_roundtrip() {
+        let payload = encode_network_profile_payload(display_network_profile());
+        let decoded = decode_network_profile_payload(&payload).unwrap();
+
+        assert_eq!(decoded.product_track, ProductTrack::DisplayIntegratedVcu);
+        assert!(decoded.multi_master_can);
+        assert!(decoded
+            .links
+            .iter()
+            .any(|link| link.kind == TransportLinkKind::LocalDisplayLink));
+        assert!(decoded.links.iter().any(|link| {
+            link.kind == TransportLinkKind::UsbSerial
+                && link.classes.contains(&MessageClass::FirmwareUpdate)
+        }));
     }
 }

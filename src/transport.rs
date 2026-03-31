@@ -6,11 +6,13 @@ use crate::io::{
     ResolvedPinAssignment,
 };
 use crate::live_data::LiveDataFrame;
+use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protocol::{
     decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
-    encode_identity_payload, encode_nack_payload, encode_page_directory_payload,
-    encode_page_payload, encode_page_statuses_payload, encode_pin_assignments_payload,
-    encode_pin_directory_payload, encode_table_directory_payload, Cmd, Packet,
+    encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
+    encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
+    encode_pin_assignments_payload, encode_pin_directory_payload, encode_table_directory_payload,
+    Cmd, Packet,
 };
 use crate::ConfigPage;
 
@@ -53,6 +55,7 @@ pub struct FirmwareRuntime {
     pub store: ConfigStore,
     pub capabilities: Vec<Capability>,
     pub pin_assignments: Vec<ResolvedPinAssignment>,
+    pub network_profile: &'static NetworkProfile,
 }
 
 impl FirmwareRuntime {
@@ -77,6 +80,7 @@ impl FirmwareRuntime {
             store,
             capabilities: base_capabilities(simulator),
             pin_assignments,
+            network_profile: headless_network_profile(),
         }
     }
 
@@ -157,6 +161,10 @@ impl FirmwareRuntime {
                 Cmd::PageStatuses,
                 encode_page_statuses_payload(&self.store.all_page_statuses()),
             ),
+            Cmd::GetNetworkProfile => Packet::new(
+                Cmd::NetworkProfile,
+                encode_network_profile_payload(self.network_profile),
+            ),
             Cmd::ReadPage => match decode_page_request(&packet.payload) {
                 Ok(page_id) => match self.store.read_page(page_id) {
                     Some(page) => Packet::new(Cmd::PageData, encode_page_payload(page_id, page)),
@@ -227,11 +235,12 @@ mod tests {
         apply_assignment_overrides, deserialize_assignments_from_page,
         serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
     };
+    use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_page_payload, decode_page_statuses_payload,
-        decode_pin_assignments_payload, decode_pin_directory_payload, encode_page_payload,
-        encode_page_request, Cmd, Packet,
+        decode_nack_payload, decode_network_profile_payload, decode_page_payload,
+        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+        encode_page_payload, encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
 
@@ -443,5 +452,19 @@ mod tests {
         assert!(statuses
             .iter()
             .any(|status| status.page_id == ConfigPage::PinAssignment as u8 && status.needs_burn));
+    }
+
+    #[test]
+    fn runtime_reports_network_profile() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let response = runtime.handle_packet(Packet::new(Cmd::GetNetworkProfile, vec![]));
+        let profile = decode_network_profile_payload(&response.payload).unwrap();
+
+        assert_eq!(response.cmd, Cmd::NetworkProfile);
+        assert_eq!(profile.product_track, ProductTrack::HeadlessEcu);
+        assert!(profile.links.iter().any(|link| {
+            link.kind == TransportLinkKind::UsbSerial
+                && link.classes.contains(&MessageClass::FirmwareUpdate)
+        }));
     }
 }

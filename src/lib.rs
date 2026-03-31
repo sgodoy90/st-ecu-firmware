@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod engine;
 pub mod io;
 pub mod live_data;
+pub mod network;
 pub mod protection;
 pub mod protocol;
 pub mod reset_reason;
@@ -29,14 +30,21 @@ pub use io::{
     EcuFunctionParseError, PinAssignmentRequest, ResolvedPinAssignment, RoutingPolicy,
 };
 pub use live_data::{LiveDataFrame, LIVE_DATA_SIZE};
+pub use network::{
+    display_network_profile, headless_network_profile, preferred_links, supports_message,
+    LinkContract, MessageClass, MessageClassParseError, NetworkNodeKind, NetworkProfile,
+    ProductTrack, ProductTrackParseError, TransportLinkKind, TransportLinkParseError,
+    DISPLAY_PROFILE, HEADLESS_PROFILE,
+};
 pub use protocol::{
     decode_ack_payload, decode_capabilities_payload, decode_identity_payload, decode_nack_payload,
-    decode_page_payload, decode_page_request, decode_page_statuses_payload,
-    decode_pin_assignments_payload, decode_pin_directory_payload, encode_ack_payload,
-    encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
-    encode_page_directory_payload, encode_page_payload, encode_page_request,
-    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-    encode_table_directory_payload, Cmd, DecodedIdentity, DecodedPagePayload, DecodedPageStatus,
+    decode_network_profile_payload, decode_page_payload, decode_page_request,
+    decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+    encode_ack_payload, encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
+    encode_network_profile_payload, encode_page_directory_payload, encode_page_payload,
+    encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+    encode_pin_directory_payload, encode_table_directory_payload, Cmd, DecodedIdentity,
+    DecodedNetworkLink, DecodedNetworkProfile, DecodedPagePayload, DecodedPageStatus,
     DecodedPinAssignment, DecodedPinDirectoryEntry, Packet, ProtocolError,
 };
 pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
