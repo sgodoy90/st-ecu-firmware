@@ -834,12 +834,16 @@ mod tests {
                 ram_crc: 11,
                 flash_crc: 22,
                 needs_burn: true,
+                flash_generation: 1,
+                flash_valid: true,
             },
             ConfigPageStatus {
                 page_id: 3,
                 ram_crc: 33,
                 flash_crc: 33,
                 needs_burn: false,
+                flash_generation: 2,
+                flash_valid: true,
             },
         ];
 

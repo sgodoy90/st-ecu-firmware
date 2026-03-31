@@ -119,6 +119,7 @@ impl TryFrom<u8> for Capability {
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const SCHEMA_VERSION: u16 = 1;
+pub const CONFIG_FORMAT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareIdentity {

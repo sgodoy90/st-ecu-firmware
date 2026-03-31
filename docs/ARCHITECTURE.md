@@ -39,5 +39,5 @@ Desktop defines presentation and workflow.
 - protocol payloads for exposing board pins and active IO assignments
 - firmware identity, capability, and compatibility structs
 - page directory and table directory constants
-- RAM/flash config staging model with CRC and burn detection
+- versioned RAM/flash config staging model with per-page image headers, CRC, generation, and burn detection
 - packet framing for version, capabilities, and page payloads

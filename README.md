@@ -25,7 +25,7 @@ This first scaffold is intentionally architecture-first:
 - page and table directory definitions
 - live-data frame contract
 - packet framing and page payload encoding
-- config RAM/flash staging with CRC and burn semantics
+- versioned config RAM/flash staging with per-page image headers, CRC, and burn semantics
 - protection, reset reason, diagnostics, and transport module boundaries
 
 This is not yet MCU bring-up. The next implementation milestone is:
@@ -66,5 +66,5 @@ This repository should eventually own the runtime implementation of those contra
 - keep reconciling board outputs against real timer/ADC channels as the harness
   and power stages are frozen
 - wire protocol packets into transport service
-- move config staging from host model into embedded flash backend
+- replace the versioned host flash-image backend with a real STM32H743 sector driver
 - implement version/identity response on real target

@@ -21,10 +21,14 @@ pub use board::{
     validate_pin_assignment, BoardDefinition, BoardPathKind, BoardValidationError, ElectricalClass,
     PinCapability, ST_ECU_V1_BOARD, ST_ECU_V1_PINS,
 };
-pub use config::{ConfigPage, ConfigPageStatus, ConfigStore, PAGE_DIRECTORY};
+pub use config::{
+    ConfigImageError, ConfigPage, ConfigPageHeader, ConfigPageStatus, ConfigStore,
+    ConfigStoreError, CONFIG_IMAGE_MAGIC, PAGE_DIRECTORY,
+};
 pub use contract::{
     base_capabilities, Capability, CapabilityParseError, FirmwareCompatibility, FirmwareIdentity,
-    PageDirectoryEntry, TableDirectoryEntry, PROTOCOL_VERSION, SCHEMA_VERSION, TABLE_DIRECTORY,
+    PageDirectoryEntry, TableDirectoryEntry, CONFIG_FORMAT_VERSION, PROTOCOL_VERSION,
+    SCHEMA_VERSION, TABLE_DIRECTORY,
 };
 pub use io::{
     apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
