@@ -1,4 +1,4 @@
-use crate::board::{board_definition, PinCapability};
+use crate::board::{board_definition, PinCapability, PinFunctionClass};
 use crate::config::{ConfigPageStatus, PAGE_DIRECTORY};
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
 use crate::io::{EcuFunction, ResolvedPinAssignment};
@@ -173,6 +173,16 @@ pub struct DecodedPinDirectoryEntry {
     pub timer_channel: String,
     pub adc_instance: String,
     pub adc_channel: Option<u8>,
+    pub board_path: String,
+    pub routes: Vec<DecodedPinRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPinRoute {
+    pub function_class: PinFunctionClass,
+    pub mux_mode: String,
+    pub signal: String,
+    pub exclusive_resource: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +350,26 @@ pub fn decode_pin_directory_payload(
         let adc_instance = read_string(payload, &mut offset)?;
         let adc_channel_raw = *payload.get(offset).ok_or(ProtocolError::MalformedPayload)?;
         offset += 1;
+        let board_path = read_string(payload, &mut offset)?;
+        let route_count = *payload.get(offset).ok_or(ProtocolError::MalformedPayload)? as usize;
+        offset += 1;
+        let mut routes = Vec::with_capacity(route_count);
+        for _ in 0..route_count {
+            let function_class = PinFunctionClass::try_from(
+                *payload.get(offset).ok_or(ProtocolError::MalformedPayload)?,
+            )
+            .map_err(|_| ProtocolError::MalformedPayload)?;
+            offset += 1;
+            let mux_mode = read_string(payload, &mut offset)?;
+            let signal = read_string(payload, &mut offset)?;
+            let exclusive_resource = read_string(payload, &mut offset)?;
+            routes.push(DecodedPinRoute {
+                function_class,
+                mux_mode,
+                signal,
+                exclusive_resource: (!exclusive_resource.is_empty()).then_some(exclusive_resource),
+            });
+        }
         entries.push(DecodedPinDirectoryEntry {
             pin_id,
             label,
@@ -349,6 +379,8 @@ pub fn decode_pin_directory_payload(
             timer_channel,
             adc_instance,
             adc_channel: (adc_channel_raw != u8::MAX).then_some(adc_channel_raw),
+            board_path,
+            routes,
         });
     }
 
@@ -628,6 +660,14 @@ fn encode_pin_capability(out: &mut Vec<u8>, pin: &PinCapability) {
     push_string(out, pin.timer_channel.unwrap_or(""));
     push_string(out, pin.adc_instance.unwrap_or(""));
     out.push(pin.adc_channel.unwrap_or(u8::MAX));
+    push_string(out, pin.board_path.key());
+    out.push(pin.routes.len() as u8);
+    for route in pin.routes {
+        out.push(route.function_class.code());
+        push_string(out, route.mux_mode);
+        push_string(out, route.signal);
+        push_string(out, route.exclusive_resource.unwrap_or(""));
+    }
 }
 
 fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolError> {
@@ -752,7 +792,14 @@ mod tests {
         let payload = encode_pin_directory_payload();
         let decoded = decode_pin_directory_payload(&payload).unwrap();
         assert!(decoded.iter().any(|pin| pin.pin_id == "PA0"));
-        assert!(decoded.iter().any(|pin| pin.pin_id == "PC8"));
+        assert!(decoded.iter().any(|pin| {
+            pin.pin_id == "PC8"
+                && pin.board_path == "solenoid_pwm_driver"
+                && pin.routes.iter().any(|route| {
+                    route.function_class == PinFunctionClass::PwmOutput
+                        && route.signal == "TIM3_CH3"
+                })
+        }));
     }
 
     #[test]

@@ -387,22 +387,9 @@ pub fn deserialize_assignments_from_page(
 }
 
 fn resource_key(pin: &PinCapability, function: PinFunctionClass) -> Option<String> {
-    match function {
-        PinFunctionClass::AnalogInput => pin
-            .adc_instance
-            .zip(pin.adc_channel)
-            .map(|(instance, channel)| format!("adc:{instance}:ch{channel}")),
-        PinFunctionClass::CaptureInput
-        | PinFunctionClass::PwmOutput
-        | PinFunctionClass::Injector
-        | PinFunctionClass::Ignition
-        | PinFunctionClass::LowSideOutput
-        | PinFunctionClass::HighSideOutput => pin
-            .timer_instance
-            .zip(pin.timer_channel)
-            .map(|(instance, channel)| format!("timer:{instance}:{channel}")),
-        _ => None,
-    }
+    pin.route_for(function)
+        .and_then(|route| route.exclusive_resource)
+        .map(str::to_string)
 }
 
 #[cfg(test)]

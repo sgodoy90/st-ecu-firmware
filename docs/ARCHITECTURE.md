@@ -25,6 +25,11 @@ Desktop defines presentation and workflow.
 ## Bootstrap Already Landed
 - preliminary STM32H743 board definition and pin capability matrix
 - ECU-level IO assignment validator with hardware-path and MCU-resource checks
+- board-path metadata that distinguishes conditioned trigger inputs, protected
+  analog inputs, solenoid drivers, injector drivers, ignition drivers, native
+  USB, CAN transceiver pins, WiFi bridge UART, and debug access
+- per-pin mux routes that identify the logical function class, mux mode, signal
+  name, and exclusive resource key used for conflict detection
 - protocol payloads for exposing board pins and active IO assignments
 - firmware identity, capability, and compatibility structs
 - page directory and table directory constants

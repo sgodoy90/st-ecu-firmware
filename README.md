@@ -16,6 +16,8 @@ This first scaffold is intentionally architecture-first:
 
 - firmware identity and compatibility contract
 - preliminary board definition and pin capability matrix
+- board-path and mux-route modeling so each exposed ECU pin declares both its
+  hardware conditioning path and the MCU signal route used to drive it
 - IO assignment validation with fixed-path and compatible-reroute rules
 - runtime protocol surface for pin directory and active assignments
 - page and table directory definitions
@@ -57,7 +59,8 @@ This repository should eventually own the runtime implementation of those contra
 
 ## Immediate Next Tasks
 - add STM32H743 target and linker config
-- expand board definition from preliminary matrix to full production matrix
+- expand board definition from seeded production routes to a broader STM32H743
+  package matrix and full harness-facing pinout
 - wire protocol packets into transport service
 - move config staging from host model into embedded flash backend
 - implement version/identity response on real target

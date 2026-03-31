@@ -16,8 +16,9 @@ pub mod transport;
 
 pub use board::{
     assignable_pins, board_definition, board_matches_firmware_identity, find_pin,
-    validate_pin_assignment, BoardDefinition, BoardValidationError, ElectricalClass, PinCapability,
-    PinFunctionClass, ST_ECU_V1_BOARD, ST_ECU_V1_PINS,
+    validate_pin_assignment, BoardDefinition, BoardPathKind, BoardValidationError, ElectricalClass,
+    PinCapability, PinFunctionClass, PinFunctionClassParseError, PinRoute, ST_ECU_V1_BOARD,
+    ST_ECU_V1_PINS,
 };
 pub use config::{ConfigPage, ConfigPageStatus, ConfigStore, PAGE_DIRECTORY};
 pub use contract::{
@@ -45,7 +46,7 @@ pub use protocol::{
     encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
     encode_pin_directory_payload, encode_table_directory_payload, Cmd, DecodedIdentity,
     DecodedNetworkLink, DecodedNetworkProfile, DecodedPagePayload, DecodedPageStatus,
-    DecodedPinAssignment, DecodedPinDirectoryEntry, Packet, ProtocolError,
+    DecodedPinAssignment, DecodedPinDirectoryEntry, DecodedPinRoute, Packet, ProtocolError,
 };
 pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
 
