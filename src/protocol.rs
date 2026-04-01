@@ -5,7 +5,7 @@ use crate::diagnostics::FreezeFrame;
 use crate::io::{EcuFunction, ResolvedPinAssignment};
 use crate::network::{MessageClass, NetworkProfile, ProductTrack, TransportLinkKind};
 use crate::pinmux::PinFunctionClass;
-use crate::trigger::{TriggerCapture, TriggerDecoderPreset};
+use crate::trigger::{TriggerCapture, TriggerDecoderPreset, TriggerToothLog};
 use crc::{Crc, CRC_16_IBM_SDLC, CRC_32_ISO_HDLC};
 
 static CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
@@ -53,6 +53,8 @@ pub enum Cmd {
     TriggerCapture = 0x4D,
     GetTriggerDecoderDirectory = 0x4E,
     TriggerDecoderDirectory = 0x4F,
+    GetTriggerToothLog = 0x70,
+    TriggerToothLog = 0x71,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
     Ack = 0xA0,
@@ -101,6 +103,8 @@ impl TryFrom<u8> for Cmd {
             0x4D => Ok(Self::TriggerCapture),
             0x4E => Ok(Self::GetTriggerDecoderDirectory),
             0x4F => Ok(Self::TriggerDecoderDirectory),
+            0x70 => Ok(Self::GetTriggerToothLog),
+            0x71 => Ok(Self::TriggerToothLog),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
@@ -327,6 +331,21 @@ pub struct DecodedTriggerCapture {
     pub secondary_edge_count: u16,
     pub primary_samples: Vec<u8>,
     pub secondary_samples: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedTriggerToothLog {
+    pub preset_key: String,
+    pub preset_label: String,
+    pub sync_state: String,
+    pub trigger_rpm: u16,
+    pub engine_cycle_deg: u16,
+    pub primary_label: String,
+    pub secondary_label: Option<String>,
+    pub reference_event_index: u16,
+    pub dominant_gap_ratio: f32,
+    pub tooth_intervals_us: Vec<u32>,
+    pub secondary_event_indexes: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -995,6 +1014,28 @@ pub fn encode_trigger_capture_payload(entry: &TriggerCapture) -> Vec<u8> {
     out
 }
 
+pub fn encode_trigger_tooth_log_payload(entry: &TriggerToothLog) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_string(&mut out, entry.preset_key);
+    push_string(&mut out, entry.preset_label);
+    push_string(&mut out, entry.sync_state);
+    out.extend_from_slice(&entry.trigger_rpm.to_be_bytes());
+    out.extend_from_slice(&entry.engine_cycle_deg.to_be_bytes());
+    push_string(&mut out, entry.primary_label);
+    push_string(&mut out, entry.secondary_label.unwrap_or(""));
+    out.extend_from_slice(&entry.reference_event_index.to_be_bytes());
+    out.extend_from_slice(&entry.dominant_gap_ratio.to_be_bytes());
+    out.extend_from_slice(&(entry.tooth_intervals_us.len() as u16).to_be_bytes());
+    for interval in &entry.tooth_intervals_us {
+        out.extend_from_slice(&interval.to_be_bytes());
+    }
+    out.extend_from_slice(&(entry.secondary_event_indexes.len() as u8).to_be_bytes());
+    for index in &entry.secondary_event_indexes {
+        out.extend_from_slice(&index.to_be_bytes());
+    }
+    out
+}
+
 pub fn decode_trigger_capture_payload(
     payload: &[u8],
 ) -> Result<DecodedTriggerCapture, ProtocolError> {
@@ -1077,6 +1118,78 @@ pub fn decode_trigger_capture_payload(
         secondary_edge_count,
         primary_samples,
         secondary_samples,
+    })
+}
+
+pub fn decode_trigger_tooth_log_payload(
+    payload: &[u8],
+) -> Result<DecodedTriggerToothLog, ProtocolError> {
+    let mut offset = 0usize;
+    let preset_key = read_string(payload, &mut offset)?;
+    let preset_label = read_string(payload, &mut offset)?;
+    let sync_state = read_string(payload, &mut offset)?;
+    if payload.len() < offset + 10 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let trigger_rpm = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let engine_cycle_deg = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let primary_label = read_string(payload, &mut offset)?;
+    let secondary_label = read_string(payload, &mut offset)?;
+    if payload.len() < offset + 8 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let reference_event_index = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let dominant_gap_ratio = f32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]);
+    offset += 4;
+    let tooth_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    if payload.len() < offset + (tooth_count * 4) + 1 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let mut tooth_intervals_us = Vec::with_capacity(tooth_count);
+    for _ in 0..tooth_count {
+        tooth_intervals_us.push(u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]));
+        offset += 4;
+    }
+    let secondary_count = payload[offset] as usize;
+    offset += 1;
+    if payload.len() < offset + (secondary_count * 2) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let mut secondary_event_indexes = Vec::with_capacity(secondary_count);
+    for _ in 0..secondary_count {
+        secondary_event_indexes.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+        offset += 2;
+    }
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(DecodedTriggerToothLog {
+        preset_key,
+        preset_label,
+        sync_state,
+        trigger_rpm,
+        engine_cycle_deg,
+        primary_label,
+        secondary_label: (!secondary_label.is_empty()).then_some(secondary_label),
+        reference_event_index,
+        dominant_gap_ratio,
+        tooth_intervals_us,
+        secondary_event_indexes,
     })
 }
 
@@ -1384,7 +1497,7 @@ mod tests {
     use crate::io::{EcuFunction, ResolvedPinAssignment};
     use crate::network::{display_network_profile, MessageClass, ProductTrack, TransportLinkKind};
     use crate::pinmux::PinFunctionClass;
-    use crate::trigger::{sample_trigger_capture, TriggerDecoderPreset};
+    use crate::trigger::{sample_trigger_capture, sample_trigger_tooth_log, TriggerDecoderPreset};
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
@@ -1393,14 +1506,15 @@ mod tests {
         decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_table_metadata_payload, decode_trigger_capture_payload,
-        decode_trigger_decoder_directory_payload, encode_ack_payload, encode_capabilities_payload,
-        encode_freeze_frames_payload, encode_identity_payload, encode_nack_payload,
-        encode_network_profile_payload, encode_output_test_directory_payload,
-        encode_page_directory_payload, encode_page_payload, encode_page_request,
-        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-        encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
-        encode_table_directory_payload, encode_table_metadata_payload,
-        encode_trigger_capture_payload, encode_trigger_decoder_directory_payload, Cmd,
+        decode_trigger_decoder_directory_payload, decode_trigger_tooth_log_payload,
+        encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
+        encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
+        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
+        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+        encode_pin_directory_payload, encode_sensor_raw_directory_payload,
+        encode_sensor_raw_payload, encode_table_directory_payload,
+        encode_table_metadata_payload, encode_trigger_capture_payload,
+        encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
         DecodedPinAssignment, OutputTestDirectoryEntry, Packet, ProtocolError,
         SensorRawDirectoryEntry,
     };
@@ -1715,6 +1829,22 @@ mod tests {
             decoded.secondary_samples.len()
         );
         assert!(decoded.primary_samples.iter().any(|sample| *sample == 1));
+    }
+
+    #[test]
+    fn trigger_tooth_log_payload_roundtrip() {
+        let payload = encode_trigger_tooth_log_payload(&sample_trigger_tooth_log());
+        let decoded = decode_trigger_tooth_log_payload(&payload).unwrap();
+
+        assert_eq!(decoded.preset_key, "honda_k20_12_1");
+        assert_eq!(decoded.sync_state, "locked");
+        assert_eq!(decoded.reference_event_index, 2);
+        assert_eq!(decoded.tooth_intervals_us.len(), 12);
+        assert_eq!(decoded.secondary_event_indexes, vec![2, 8]);
+        assert!(decoded
+            .tooth_intervals_us
+            .iter()
+            .all(|interval| *interval >= 697 && *interval <= 702));
     }
 
     #[test]

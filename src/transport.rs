@@ -16,10 +16,10 @@ use crate::protocol::{
     encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
-    encode_trigger_decoder_directory_payload, Cmd, OutputTestDirectoryEntry, Packet,
-    SensorRawDirectoryEntry,
+    encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
+    OutputTestDirectoryEntry, Packet, SensorRawDirectoryEntry,
 };
-use crate::trigger::{sample_trigger_capture, SUPPORTED_TRIGGER_DECODERS};
+use crate::trigger::{sample_trigger_capture, sample_trigger_tooth_log, SUPPORTED_TRIGGER_DECODERS};
 use crate::ConfigPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +344,10 @@ impl FirmwareRuntime {
                 Cmd::TriggerDecoderDirectory,
                 encode_trigger_decoder_directory_payload(&SUPPORTED_TRIGGER_DECODERS),
             ),
+            Cmd::GetTriggerToothLog => Packet::new(
+                Cmd::TriggerToothLog,
+                encode_trigger_tooth_log_payload(&sample_trigger_tooth_log()),
+            ),
             Cmd::GetPageDirectory => {
                 Packet::new(Cmd::PageDirectory, encode_page_directory_payload())
             }
@@ -452,7 +456,7 @@ mod tests {
         decode_pin_assignments_payload, decode_pin_directory_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
-        encode_page_payload, encode_page_request, Cmd, Packet,
+        decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
 
@@ -627,6 +631,14 @@ mod tests {
         assert!(presets
             .iter()
             .any(|preset| preset.pattern_kind == "missing_tooth"));
+
+        let tooth_log = runtime.handle_packet(Packet::new(Cmd::GetTriggerToothLog, vec![]));
+        let decoded_tooth_log = decode_trigger_tooth_log_payload(&tooth_log.payload).unwrap();
+        assert_eq!(tooth_log.cmd, Cmd::TriggerToothLog);
+        assert_eq!(decoded_tooth_log.preset_key, "honda_k20_12_1");
+        assert_eq!(decoded_tooth_log.reference_event_index, 2);
+        assert_eq!(decoded_tooth_log.tooth_intervals_us.len(), 12);
+        assert!(decoded_tooth_log.secondary_event_indexes.contains(&8));
     }
 
     #[test]

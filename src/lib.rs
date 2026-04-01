@@ -55,22 +55,25 @@ pub use protocol::{
     decode_page_payload, decode_page_request, decode_page_statuses_payload,
     decode_pin_assignments_payload, decode_pin_directory_payload,
     decode_sensor_raw_directory_payload, decode_sensor_raw_payload, decode_table_metadata_payload,
-    decode_trigger_capture_payload, decode_trigger_decoder_directory_payload, encode_ack_payload,
-    encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
-    encode_nack_payload, encode_network_profile_payload, encode_page_directory_payload,
-    encode_page_payload, encode_page_request, encode_page_statuses_payload,
-    encode_pin_assignments_payload, encode_pin_directory_payload,
-    encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
-    encode_table_metadata_payload, encode_trigger_capture_payload,
-    encode_trigger_decoder_directory_payload, Cmd, DecodedFreezeFrame, DecodedIdentity,
+    decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
+    decode_trigger_tooth_log_payload, encode_ack_payload, encode_capabilities_payload,
+    encode_freeze_frames_payload, encode_identity_payload, encode_nack_payload,
+    encode_network_profile_payload, encode_page_directory_payload, encode_page_payload,
+    encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+    encode_pin_directory_payload, encode_sensor_raw_directory_payload,
+    encode_sensor_raw_payload, encode_table_directory_payload, encode_table_metadata_payload,
+    encode_trigger_capture_payload, encode_trigger_decoder_directory_payload,
+    encode_trigger_tooth_log_payload, Cmd, DecodedFreezeFrame, DecodedIdentity,
     DecodedNetworkLink, DecodedNetworkProfile, DecodedPagePayload, DecodedPageStatus,
     DecodedPinAssignment, DecodedPinDirectoryEntry, DecodedPinRoute, DecodedSensorRaw,
     DecodedSensorRawDirectoryEntry, DecodedTableMetadataEntry, DecodedTriggerCapture,
-    DecodedTriggerDecoderPreset, Packet, ProtocolError, SensorRawDirectoryEntry,
+    DecodedTriggerDecoderPreset, DecodedTriggerToothLog, Packet, ProtocolError,
+    SensorRawDirectoryEntry,
 };
 pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
 pub use trigger::{
-    sample_trigger_capture, TriggerCapture, TriggerDecoderPreset, SUPPORTED_TRIGGER_DECODERS,
+    sample_trigger_capture, sample_trigger_tooth_log, TriggerCapture, TriggerDecoderPreset,
+    TriggerToothLog, SUPPORTED_TRIGGER_DECODERS,
 };
 
 #[cfg(test)]

@@ -37,6 +37,21 @@ pub struct TriggerCapture {
     pub secondary_samples: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerToothLog {
+    pub preset_key: &'static str,
+    pub preset_label: &'static str,
+    pub sync_state: &'static str,
+    pub trigger_rpm: u16,
+    pub engine_cycle_deg: u16,
+    pub primary_label: &'static str,
+    pub secondary_label: Option<&'static str>,
+    pub reference_event_index: u16,
+    pub dominant_gap_ratio: f32,
+    pub tooth_intervals_us: Vec<u32>,
+    pub secondary_event_indexes: Vec<u16>,
+}
+
 pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
     TriggerDecoderPreset {
         key: "generic_60_2",
@@ -154,5 +169,21 @@ pub fn sample_trigger_capture() -> TriggerCapture {
         secondary_edge_count: 4,
         primary_samples: pulse_train(sample_count, &primary_starts, 2),
         secondary_samples: pulse_train(sample_count, &secondary_starts, 6),
+    }
+}
+
+pub fn sample_trigger_tooth_log() -> TriggerToothLog {
+    TriggerToothLog {
+        preset_key: "honda_k20_12_1",
+        preset_label: "Honda K20 / K24",
+        sync_state: "locked",
+        trigger_rpm: 862,
+        engine_cycle_deg: 720,
+        primary_label: "Crank (CKP)",
+        secondary_label: Some("Cam / TDC (CMP)"),
+        reference_event_index: 2,
+        dominant_gap_ratio: 1.0,
+        tooth_intervals_us: vec![697, 699, 701, 700, 698, 701, 699, 700, 702, 698, 700, 701],
+        secondary_event_indexes: vec![2, 8],
     }
 }

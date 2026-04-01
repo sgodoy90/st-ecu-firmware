@@ -26,6 +26,7 @@ This first scaffold is intentionally architecture-first:
 - live-data frame contract
 - packet framing and page payload encoding
 - versioned config RAM/flash staging with per-page image headers, CRC, and burn semantics
+- runtime trigger diagnostics contract including decoder directory, scope capture, and tooth logging
 - protection, reset reason, diagnostics, and transport module boundaries
 
 This is not yet MCU bring-up. The next implementation milestone is:
@@ -54,7 +55,7 @@ This repository should eventually own the runtime implementation of those contra
 - `contract`: firmware identity and capability contract
 - `diagnostics`: DTC and freeze-frame boundaries
 - `engine`: trigger, injection, ignition scheduling boundaries
-- `trigger`: OEM/generic decoder presets plus runtime trigger-capture contract, including CKP/CMP sensor expectations, sync strategy, and engine-cycle metadata
+- `trigger`: OEM/generic decoder presets plus runtime trigger-capture and tooth-log contracts, including CKP/CMP sensor expectations, sync strategy, engine-cycle metadata, and decoder-facing phase markers
 - `live_data`: frame layout contract
 - `protection`: safety and limp policy boundaries
 - `reset_reason`: reset/brownout/watchdog reason model
