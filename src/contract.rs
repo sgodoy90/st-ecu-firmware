@@ -13,6 +13,8 @@ pub enum Capability {
     SensorRaw,
     SensorRawDirectory,
     FreezeFrame,
+    TriggerCapture,
+    TriggerDecoderDirectory,
     OutputTest,
     OutputTestDirectory,
     FirmwareFlash,
@@ -49,6 +51,8 @@ impl Capability {
             Self::SensorRaw => 0x0B,
             Self::SensorRawDirectory => 0x19,
             Self::FreezeFrame => 0x1A,
+            Self::TriggerCapture => 0x1B,
+            Self::TriggerDecoderDirectory => 0x1C,
             Self::OutputTest => 0x0C,
             Self::OutputTestDirectory => 0x18,
             Self::FirmwareFlash => 0x0D,
@@ -80,6 +84,8 @@ impl Capability {
             Self::SensorRaw => "sensor_raw",
             Self::SensorRawDirectory => "sensor_raw_directory",
             Self::FreezeFrame => "freeze_frame",
+            Self::TriggerCapture => "trigger_capture",
+            Self::TriggerDecoderDirectory => "trigger_decoder_directory",
             Self::OutputTest => "output_test",
             Self::OutputTestDirectory => "output_test_directory",
             Self::FirmwareFlash => "firmware_flash",
@@ -115,6 +121,8 @@ impl TryFrom<u8> for Capability {
             0x0B => Ok(Self::SensorRaw),
             0x19 => Ok(Self::SensorRawDirectory),
             0x1A => Ok(Self::FreezeFrame),
+            0x1B => Ok(Self::TriggerCapture),
+            0x1C => Ok(Self::TriggerDecoderDirectory),
             0x0C => Ok(Self::OutputTest),
             0x18 => Ok(Self::OutputTestDirectory),
             0x0D => Ok(Self::FirmwareFlash),
@@ -365,7 +373,7 @@ pub const TABLE_DIRECTORY: [TableDirectoryEntry; 8] = [
     },
 ];
 
-const BASE_CAPABILITIES: [Capability; 23] = [
+const BASE_CAPABILITIES: [Capability; 25] = [
     Capability::LiveData,
     Capability::PageRead,
     Capability::PageWrite,
@@ -379,6 +387,8 @@ const BASE_CAPABILITIES: [Capability; 23] = [
     Capability::SensorRaw,
     Capability::SensorRawDirectory,
     Capability::FreezeFrame,
+    Capability::TriggerCapture,
+    Capability::TriggerDecoderDirectory,
     Capability::OutputTest,
     Capability::OutputTestDirectory,
     Capability::FirmwareFlash,

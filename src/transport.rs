@@ -15,8 +15,11 @@ use crate::protocol::{
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
     encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
-    encode_table_metadata_payload, Cmd, OutputTestDirectoryEntry, Packet, SensorRawDirectoryEntry,
+    encode_table_metadata_payload, encode_trigger_capture_payload,
+    encode_trigger_decoder_directory_payload, Cmd, OutputTestDirectoryEntry, Packet,
+    SensorRawDirectoryEntry,
 };
+use crate::trigger::{sample_trigger_capture, SUPPORTED_TRIGGER_DECODERS};
 use crate::ConfigPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +336,14 @@ impl FirmwareRuntime {
                 Cmd::FreezeFrames,
                 encode_freeze_frames_payload(&SAMPLE_FREEZE_FRAMES),
             ),
+            Cmd::GetTriggerCapture => Packet::new(
+                Cmd::TriggerCapture,
+                encode_trigger_capture_payload(&sample_trigger_capture()),
+            ),
+            Cmd::GetTriggerDecoderDirectory => Packet::new(
+                Cmd::TriggerDecoderDirectory,
+                encode_trigger_decoder_directory_payload(&SUPPORTED_TRIGGER_DECODERS),
+            ),
             Cmd::GetPageDirectory => {
                 Packet::new(Cmd::PageDirectory, encode_page_directory_payload())
             }
@@ -439,8 +450,9 @@ mod tests {
         decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
         decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
         decode_pin_assignments_payload, decode_pin_directory_payload,
-        decode_sensor_raw_directory_payload, decode_sensor_raw_payload, encode_page_payload,
-        encode_page_request, Cmd, Packet,
+        decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
+        decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
+        encode_page_payload, encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
 
@@ -591,6 +603,30 @@ mod tests {
         assert!(frames
             .iter()
             .any(|frame| frame.reason == "pressure_range_high"));
+    }
+
+    #[test]
+    fn runtime_exposes_trigger_capture_and_decoder_directory() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let capture = runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
+        let decoded_capture = decode_trigger_capture_payload(&capture.payload).unwrap();
+        assert_eq!(capture.cmd, Cmd::TriggerCapture);
+        assert_eq!(decoded_capture.preset_key, "honda_k20_12_1");
+        assert_eq!(decoded_capture.sync_state, "locked");
+        assert_eq!(
+            decoded_capture.primary_samples.len(),
+            decoded_capture.secondary_samples.len()
+        );
+        assert!(decoded_capture.primary_edge_count > 0);
+
+        let directory = runtime.handle_packet(Packet::new(Cmd::GetTriggerDecoderDirectory, vec![]));
+        let presets = decode_trigger_decoder_directory_payload(&directory.payload).unwrap();
+        assert_eq!(directory.cmd, Cmd::TriggerDecoderDirectory);
+        assert!(presets.iter().any(|preset| preset.key == "honda_k20_12_1"));
+        assert!(presets
+            .iter()
+            .any(|preset| preset.pattern_kind == "missing_tooth"));
     }
 
     #[test]

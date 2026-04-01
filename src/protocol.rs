@@ -5,6 +5,7 @@ use crate::diagnostics::FreezeFrame;
 use crate::io::{EcuFunction, ResolvedPinAssignment};
 use crate::network::{MessageClass, NetworkProfile, ProductTrack, TransportLinkKind};
 use crate::pinmux::PinFunctionClass;
+use crate::trigger::{TriggerCapture, TriggerDecoderPreset};
 use crc::{Crc, CRC_16_IBM_SDLC, CRC_32_ISO_HDLC};
 
 static CRC16: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
@@ -48,6 +49,10 @@ pub enum Cmd {
     SensorRawDirectory = 0x49,
     GetFreezeFrames = 0x4A,
     FreezeFrames = 0x4B,
+    GetTriggerCapture = 0x4C,
+    TriggerCapture = 0x4D,
+    GetTriggerDecoderDirectory = 0x4E,
+    TriggerDecoderDirectory = 0x4F,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
     Ack = 0xA0,
@@ -92,6 +97,10 @@ impl TryFrom<u8> for Cmd {
             0x49 => Ok(Self::SensorRawDirectory),
             0x4A => Ok(Self::GetFreezeFrames),
             0x4B => Ok(Self::FreezeFrames),
+            0x4C => Ok(Self::GetTriggerCapture),
+            0x4D => Ok(Self::TriggerCapture),
+            0x4E => Ok(Self::GetTriggerDecoderDirectory),
+            0x4F => Ok(Self::TriggerDecoderDirectory),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
@@ -279,6 +288,40 @@ pub struct DecodedFreezeFrame {
     pub lambda: f64,
     pub vbatt: f64,
     pub gear: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedTriggerDecoderPreset {
+    pub key: String,
+    pub label: String,
+    pub family: String,
+    pub decoder: String,
+    pub pattern_kind: String,
+    pub primary_input_label: String,
+    pub secondary_input_label: Option<String>,
+    pub requires_secondary: bool,
+    pub supports_sequential: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedTriggerCapture {
+    pub preset_key: String,
+    pub preset_label: String,
+    pub sync_state: String,
+    pub trigger_rpm: u16,
+    pub sync_loss_counter: u32,
+    pub synced_cycles: u32,
+    pub engine_cycle_deg: u16,
+    pub capture_window_us: u32,
+    pub sample_period_us: u16,
+    pub primary_label: String,
+    pub secondary_label: Option<String>,
+    pub tooth_count: u16,
+    pub sync_gap_tooth_count: u8,
+    pub primary_edge_count: u16,
+    pub secondary_edge_count: u16,
+    pub primary_samples: Vec<u8>,
+    pub secondary_samples: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -847,6 +890,175 @@ pub fn decode_freeze_frames_payload(
     Ok(entries)
 }
 
+pub fn encode_trigger_decoder_directory_payload(entries: &[TriggerDecoderPreset]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for entry in entries {
+        out.push(entry.requires_secondary as u8);
+        out.push(entry.supports_sequential as u8);
+        push_string(&mut out, entry.key);
+        push_string(&mut out, entry.label);
+        push_string(&mut out, entry.family);
+        push_string(&mut out, entry.decoder);
+        push_string(&mut out, entry.pattern_kind);
+        push_string(&mut out, entry.primary_input_label);
+        push_string(&mut out, entry.secondary_input_label.unwrap_or(""));
+    }
+    out
+}
+
+pub fn decode_trigger_decoder_directory_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedTriggerDecoderPreset>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if payload.len() < offset + 2 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let requires_secondary = payload[offset] != 0;
+        let supports_sequential = payload[offset + 1] != 0;
+        offset += 2;
+        let key = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        let family = read_string(payload, &mut offset)?;
+        let decoder = read_string(payload, &mut offset)?;
+        let pattern_kind = read_string(payload, &mut offset)?;
+        let primary_input_label = read_string(payload, &mut offset)?;
+        let secondary_input_label = read_string(payload, &mut offset)?;
+        entries.push(DecodedTriggerDecoderPreset {
+            key,
+            label,
+            family,
+            decoder,
+            pattern_kind,
+            primary_input_label,
+            secondary_input_label: (!secondary_input_label.is_empty())
+                .then_some(secondary_input_label),
+            requires_secondary,
+            supports_sequential,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
+pub fn encode_trigger_capture_payload(entry: &TriggerCapture) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_string(&mut out, entry.preset_key);
+    push_string(&mut out, entry.preset_label);
+    push_string(&mut out, entry.sync_state);
+    out.extend_from_slice(&entry.trigger_rpm.to_be_bytes());
+    out.extend_from_slice(&entry.sync_loss_counter.to_be_bytes());
+    out.extend_from_slice(&entry.synced_cycles.to_be_bytes());
+    out.extend_from_slice(&entry.engine_cycle_deg.to_be_bytes());
+    out.extend_from_slice(&entry.capture_window_us.to_be_bytes());
+    out.extend_from_slice(&entry.sample_period_us.to_be_bytes());
+    push_string(&mut out, entry.primary_label);
+    push_string(&mut out, entry.secondary_label.unwrap_or(""));
+    out.extend_from_slice(&entry.tooth_count.to_be_bytes());
+    out.push(entry.sync_gap_tooth_count);
+    out.extend_from_slice(&entry.primary_edge_count.to_be_bytes());
+    out.extend_from_slice(&entry.secondary_edge_count.to_be_bytes());
+    out.extend_from_slice(&(entry.primary_samples.len() as u16).to_be_bytes());
+    out.extend_from_slice(&entry.primary_samples);
+    out.extend_from_slice(&entry.secondary_samples);
+    out
+}
+
+pub fn decode_trigger_capture_payload(
+    payload: &[u8],
+) -> Result<DecodedTriggerCapture, ProtocolError> {
+    let mut offset = 0usize;
+    let preset_key = read_string(payload, &mut offset)?;
+    let preset_label = read_string(payload, &mut offset)?;
+    let sync_state = read_string(payload, &mut offset)?;
+    if payload.len() < offset + 19 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let trigger_rpm = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let sync_loss_counter = u32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]);
+    offset += 4;
+    let synced_cycles = u32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]);
+    offset += 4;
+    let engine_cycle_deg = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let capture_window_us = u32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]);
+    offset += 4;
+    let sample_period_us = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let primary_label = read_string(payload, &mut offset)?;
+    let secondary_label = read_string(payload, &mut offset)?;
+    if payload.len() < offset + 7 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let tooth_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let sync_gap_tooth_count = payload[offset];
+    offset += 1;
+    let primary_edge_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let secondary_edge_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let sample_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    if payload.len() < offset + sample_count * 2 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let primary_samples = payload[offset..offset + sample_count].to_vec();
+    offset += sample_count;
+    let secondary_samples = payload[offset..offset + sample_count].to_vec();
+    offset += sample_count;
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(DecodedTriggerCapture {
+        preset_key,
+        preset_label,
+        sync_state,
+        trigger_rpm,
+        sync_loss_counter,
+        synced_cycles,
+        engine_cycle_deg,
+        capture_window_us,
+        sample_period_us,
+        primary_label,
+        secondary_label: (!secondary_label.is_empty()).then_some(secondary_label),
+        tooth_count,
+        sync_gap_tooth_count,
+        primary_edge_count,
+        secondary_edge_count,
+        primary_samples,
+        secondary_samples,
+    })
+}
+
 pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + statuses.len() * 15);
     out.push(statuses.len() as u8);
@@ -1151,6 +1363,7 @@ mod tests {
     use crate::io::{EcuFunction, ResolvedPinAssignment};
     use crate::network::{display_network_profile, MessageClass, ProductTrack, TransportLinkKind};
     use crate::pinmux::PinFunctionClass;
+    use crate::trigger::{sample_trigger_capture, TriggerDecoderPreset};
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
@@ -1158,14 +1371,17 @@ mod tests {
         decode_output_test_directory_payload, decode_page_payload, decode_page_request,
         decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
-        decode_table_metadata_payload, encode_ack_payload, encode_capabilities_payload,
+        decode_table_metadata_payload, decode_trigger_capture_payload,
+        decode_trigger_decoder_directory_payload, encode_ack_payload, encode_capabilities_payload,
         encode_freeze_frames_payload, encode_identity_payload, encode_nack_payload,
         encode_network_profile_payload, encode_output_test_directory_payload,
         encode_page_directory_payload, encode_page_payload, encode_page_request,
         encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
         encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
-        encode_table_directory_payload, encode_table_metadata_payload, Cmd, DecodedPinAssignment,
-        OutputTestDirectoryEntry, Packet, ProtocolError, SensorRawDirectoryEntry,
+        encode_table_directory_payload, encode_table_metadata_payload,
+        encode_trigger_capture_payload, encode_trigger_decoder_directory_payload, Cmd,
+        DecodedPinAssignment, OutputTestDirectoryEntry, Packet, ProtocolError,
+        SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -1413,6 +1629,58 @@ mod tests {
         assert_eq!(decoded[0].code, "P0118");
         assert!((decoded[0].coolant_c + 31.8).abs() < 0.1);
         assert_eq!(decoded[1].gear, 4);
+    }
+
+    #[test]
+    fn trigger_decoder_directory_payload_roundtrip() {
+        let payload = encode_trigger_decoder_directory_payload(&[
+            TriggerDecoderPreset {
+                key: "generic_60_2",
+                label: "Generic 60-2 + Home",
+                family: "Universal Missing-Tooth",
+                decoder: "missing_tooth_60_2",
+                pattern_kind: "missing_tooth",
+                primary_input_label: "Crank VR/Hall",
+                secondary_input_label: Some("Cam Home"),
+                requires_secondary: true,
+                supports_sequential: true,
+            },
+            TriggerDecoderPreset {
+                key: "honda_k20_12_1",
+                label: "Honda K20 / K24",
+                family: "Honda K-Series",
+                decoder: "oem_honda_k_12_1",
+                pattern_kind: "oem_pattern",
+                primary_input_label: "Crank (CKP)",
+                secondary_input_label: Some("Cam / TDC (CMP)"),
+                requires_secondary: true,
+                supports_sequential: true,
+            },
+        ]);
+
+        let decoded = decode_trigger_decoder_directory_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].pattern_kind, "missing_tooth");
+        assert_eq!(decoded[1].key, "honda_k20_12_1");
+        assert_eq!(
+            decoded[1].secondary_input_label.as_deref(),
+            Some("Cam / TDC (CMP)")
+        );
+    }
+
+    #[test]
+    fn trigger_capture_payload_roundtrip() {
+        let payload = encode_trigger_capture_payload(&sample_trigger_capture());
+        let decoded = decode_trigger_capture_payload(&payload).unwrap();
+
+        assert_eq!(decoded.preset_key, "honda_k20_12_1");
+        assert_eq!(decoded.sync_state, "locked");
+        assert_eq!(decoded.trigger_rpm, 862);
+        assert_eq!(
+            decoded.primary_samples.len(),
+            decoded.secondary_samples.len()
+        );
+        assert!(decoded.primary_samples.iter().any(|sample| *sample == 1));
     }
 
     #[test]
