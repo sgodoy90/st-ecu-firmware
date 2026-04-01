@@ -10,9 +10,10 @@ use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protocol::{
     decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
     encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
-    encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
-    encode_pin_assignments_payload, encode_pin_directory_payload, encode_table_directory_payload,
-    encode_table_metadata_payload, Cmd, Packet,
+    encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
+    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    encode_table_directory_payload, encode_table_metadata_payload, Cmd, OutputTestDirectoryEntry,
+    Packet,
 };
 use crate::ConfigPage;
 
@@ -57,6 +58,79 @@ pub struct FirmwareRuntime {
     pub pin_assignments: Vec<ResolvedPinAssignment>,
     pub network_profile: &'static NetworkProfile,
 }
+
+const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
+    OutputTestDirectoryEntry {
+        channel: 0,
+        function: "injector_1",
+        label: "Injector 1",
+        group: "injectors",
+        default_pulse_ms: Some(5),
+    },
+    OutputTestDirectoryEntry {
+        channel: 1,
+        function: "injector_2",
+        label: "Injector 2",
+        group: "injectors",
+        default_pulse_ms: Some(5),
+    },
+    OutputTestDirectoryEntry {
+        channel: 8,
+        function: "ignition_1",
+        label: "Coil 1",
+        group: "coils",
+        default_pulse_ms: Some(3),
+    },
+    OutputTestDirectoryEntry {
+        channel: 9,
+        function: "ignition_2",
+        label: "Coil 2",
+        group: "coils",
+        default_pulse_ms: Some(3),
+    },
+    OutputTestDirectoryEntry {
+        channel: 16,
+        function: "fuel_pump",
+        label: "Fuel Pump",
+        group: "aux",
+        default_pulse_ms: None,
+    },
+    OutputTestDirectoryEntry {
+        channel: 17,
+        function: "fan_1",
+        label: "Fan 1",
+        group: "aux",
+        default_pulse_ms: None,
+    },
+    OutputTestDirectoryEntry {
+        channel: 19,
+        function: "ac_clutch",
+        label: "A/C Clutch",
+        group: "aux",
+        default_pulse_ms: None,
+    },
+    OutputTestDirectoryEntry {
+        channel: 24,
+        function: "idle_control",
+        label: "Idle Valve",
+        group: "valves",
+        default_pulse_ms: None,
+    },
+    OutputTestDirectoryEntry {
+        channel: 25,
+        function: "boost_control",
+        label: "Boost Solenoid 1",
+        group: "valves",
+        default_pulse_ms: None,
+    },
+    OutputTestDirectoryEntry {
+        channel: 27,
+        function: "vvt_b1_intake",
+        label: "VVT B1 Intake",
+        group: "valves",
+        default_pulse_ms: None,
+    },
+];
 
 impl FirmwareRuntime {
     pub fn new(identity: FirmwareIdentity, simulator: bool) -> Self {
@@ -160,6 +234,10 @@ impl FirmwareRuntime {
                 Cmd::PinAssignments,
                 encode_pin_assignments_payload(&self.pin_assignments),
             ),
+            Cmd::GetOutputTestDirectory => Packet::new(
+                Cmd::OutputTestDirectory,
+                encode_output_test_directory_payload(&OUTPUT_TEST_DIRECTORY),
+            ),
             Cmd::GetPageStatuses => Packet::new(
                 Cmd::PageStatuses,
                 encode_page_statuses_payload(&self.store.all_page_statuses()),
@@ -241,9 +319,9 @@ mod tests {
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_network_profile_payload, decode_page_payload,
-        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-        encode_page_payload, encode_page_request, Cmd, Packet,
+        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
+        decode_page_payload, decode_page_statuses_payload, decode_pin_assignments_payload,
+        decode_pin_directory_payload, encode_page_payload, encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
 
@@ -353,6 +431,17 @@ mod tests {
         assert!(decoded_assignments
             .iter()
             .any(|assignment| assignment.function == EcuFunction::CrankInput));
+    }
+
+    #[test]
+    fn runtime_exposes_output_test_directory() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let response = runtime.handle_packet(Packet::new(Cmd::GetOutputTestDirectory, vec![]));
+        let entries = decode_output_test_directory_payload(&response.payload).unwrap();
+
+        assert_eq!(response.cmd, Cmd::OutputTestDirectory);
+        assert!(entries.iter().any(|entry| entry.function == "injector_1"));
+        assert!(entries.iter().any(|entry| entry.group == "valves"));
     }
 
     #[test]

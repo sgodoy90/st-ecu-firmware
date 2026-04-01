@@ -12,6 +12,7 @@ pub enum Capability {
     Dtc,
     SensorRaw,
     OutputTest,
+    OutputTestDirectory,
     FirmwareFlash,
     Page0Config,
     PinDirectory,
@@ -45,6 +46,7 @@ impl Capability {
             Self::Dtc => 0x0A,
             Self::SensorRaw => 0x0B,
             Self::OutputTest => 0x0C,
+            Self::OutputTestDirectory => 0x18,
             Self::FirmwareFlash => 0x0D,
             Self::Page0Config => 0x0E,
             Self::PinDirectory => 0x0F,
@@ -73,6 +75,7 @@ impl Capability {
             Self::Dtc => "dtc",
             Self::SensorRaw => "sensor_raw",
             Self::OutputTest => "output_test",
+            Self::OutputTestDirectory => "output_test_directory",
             Self::FirmwareFlash => "firmware_flash",
             Self::Page0Config => "page_0_config",
             Self::PinDirectory => "pin_directory",
@@ -105,6 +108,7 @@ impl TryFrom<u8> for Capability {
             0x0A => Ok(Self::Dtc),
             0x0B => Ok(Self::SensorRaw),
             0x0C => Ok(Self::OutputTest),
+            0x18 => Ok(Self::OutputTestDirectory),
             0x0D => Ok(Self::FirmwareFlash),
             0x0E => Ok(Self::Page0Config),
             0x0F => Ok(Self::PinDirectory),
@@ -353,7 +357,7 @@ pub const TABLE_DIRECTORY: [TableDirectoryEntry; 8] = [
     },
 ];
 
-const BASE_CAPABILITIES: [Capability; 20] = [
+const BASE_CAPABILITIES: [Capability; 21] = [
     Capability::LiveData,
     Capability::PageRead,
     Capability::PageWrite,
@@ -366,6 +370,7 @@ const BASE_CAPABILITIES: [Capability; 20] = [
     Capability::Dtc,
     Capability::SensorRaw,
     Capability::OutputTest,
+    Capability::OutputTestDirectory,
     Capability::FirmwareFlash,
     Capability::Page0Config,
     Capability::PinDirectory,

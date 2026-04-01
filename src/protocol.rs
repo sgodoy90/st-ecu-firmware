@@ -39,6 +39,8 @@ pub enum Cmd {
     PageStatuses = 0x2D,
     GetNetworkProfile = 0x2E,
     NetworkProfile = 0x2F,
+    GetOutputTestDirectory = 0x46,
+    OutputTestDirectory = 0x47,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
     Ack = 0xA0,
@@ -75,6 +77,8 @@ impl TryFrom<u8> for Cmd {
             0x2D => Ok(Self::PageStatuses),
             0x2E => Ok(Self::GetNetworkProfile),
             0x2F => Ok(Self::NetworkProfile),
+            0x46 => Ok(Self::GetOutputTestDirectory),
+            0x47 => Ok(Self::OutputTestDirectory),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
@@ -195,6 +199,24 @@ pub struct DecodedPinAssignment {
     pub function: EcuFunction,
     pub pin_id: String,
     pub pin_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputTestDirectoryEntry {
+    pub channel: u8,
+    pub function: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    pub default_pulse_ms: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedOutputTestDirectoryEntry {
+    pub channel: u8,
+    pub function: String,
+    pub label: String,
+    pub group: String,
+    pub default_pulse_ms: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,6 +567,56 @@ pub fn decode_pin_assignments_payload(
     Ok(assignments)
 }
 
+pub fn encode_output_test_directory_payload(entries: &[OutputTestDirectoryEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for entry in entries {
+        out.push(entry.channel);
+        out.push(output_group_code(entry.group).unwrap_or(0));
+        out.extend_from_slice(&entry.default_pulse_ms.unwrap_or(u16::MAX).to_be_bytes());
+        push_string(&mut out, entry.function);
+        push_string(&mut out, entry.label);
+    }
+    out
+}
+
+pub fn decode_output_test_directory_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedOutputTestDirectoryEntry>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if payload.len() < offset + 4 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let channel = payload[offset];
+        let group = output_group_key(payload[offset + 1])
+            .ok_or(ProtocolError::MalformedPayload)?
+            .to_string();
+        let default_pulse_ms = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+        offset += 4;
+        let function = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        entries.push(DecodedOutputTestDirectoryEntry {
+            channel,
+            function,
+            label,
+            group,
+            default_pulse_ms: (default_pulse_ms != u16::MAX).then_some(default_pulse_ms),
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
 pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + statuses.len() * 15);
     out.push(statuses.len() as u8);
@@ -821,6 +893,26 @@ fn read_string(payload: &[u8], offset: &mut usize) -> Result<String, ProtocolErr
     Ok(value)
 }
 
+fn output_group_key(code: u8) -> Option<&'static str> {
+    match code {
+        0x01 => Some("injectors"),
+        0x02 => Some("coils"),
+        0x03 => Some("aux"),
+        0x04 => Some("valves"),
+        _ => None,
+    }
+}
+
+fn output_group_code(key: &str) -> Option<u8> {
+    match key {
+        "injectors" => Some(0x01),
+        "coils" => Some(0x02),
+        "aux" => Some(0x03),
+        "valves" => Some(0x04),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::ConfigPageStatus;
@@ -831,14 +923,16 @@ mod tests {
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_network_profile_payload, decode_page_payload,
-        decode_page_request, decode_page_statuses_payload, decode_pin_assignments_payload,
-        decode_pin_directory_payload, decode_table_metadata_payload, encode_ack_payload,
-        encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
-        encode_network_profile_payload, encode_page_directory_payload, encode_page_payload,
+        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
+        decode_page_payload, decode_page_request, decode_page_statuses_payload,
+        decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_table_metadata_payload, encode_ack_payload, encode_capabilities_payload,
+        encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
+        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
         encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-        encode_pin_directory_payload, encode_table_directory_payload, encode_table_metadata_payload,
-        Cmd, DecodedPinAssignment, Packet, ProtocolError,
+        encode_pin_directory_payload, encode_table_directory_payload,
+        encode_table_metadata_payload, Cmd, DecodedPinAssignment, OutputTestDirectoryEntry, Packet,
+        ProtocolError,
     };
 
     #[test]
@@ -977,6 +1071,32 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].function, EcuFunction::BoostControl);
         assert_eq!(decoded[1].pin_id, "PC0");
+    }
+
+    #[test]
+    fn output_test_directory_payload_roundtrip() {
+        let payload = encode_output_test_directory_payload(&[
+            OutputTestDirectoryEntry {
+                channel: 0,
+                function: "injector_1",
+                label: "Injector 1",
+                group: "injectors",
+                default_pulse_ms: Some(5),
+            },
+            OutputTestDirectoryEntry {
+                channel: 24,
+                function: "idle_control",
+                label: "Idle Valve",
+                group: "valves",
+                default_pulse_ms: None,
+            },
+        ]);
+        let decoded = decode_output_test_directory_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].group, "injectors");
+        assert_eq!(decoded[0].default_pulse_ms, Some(5));
+        assert_eq!(decoded[1].channel, 24);
+        assert_eq!(decoded[1].label, "Idle Valve");
     }
 
     #[test]
