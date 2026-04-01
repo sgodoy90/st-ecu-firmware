@@ -299,6 +299,11 @@ pub struct DecodedTriggerDecoderPreset {
     pub pattern_kind: String,
     pub primary_input_label: String,
     pub secondary_input_label: Option<String>,
+    pub primary_sensor_kind: String,
+    pub secondary_sensor_kind: Option<String>,
+    pub edge_policy: String,
+    pub sync_strategy: String,
+    pub expected_engine_cycle_deg: u16,
     pub requires_secondary: bool,
     pub supports_sequential: bool,
 }
@@ -896,6 +901,7 @@ pub fn encode_trigger_decoder_directory_payload(entries: &[TriggerDecoderPreset]
     for entry in entries {
         out.push(entry.requires_secondary as u8);
         out.push(entry.supports_sequential as u8);
+        out.extend_from_slice(&entry.expected_engine_cycle_deg.to_be_bytes());
         push_string(&mut out, entry.key);
         push_string(&mut out, entry.label);
         push_string(&mut out, entry.family);
@@ -903,6 +909,10 @@ pub fn encode_trigger_decoder_directory_payload(entries: &[TriggerDecoderPreset]
         push_string(&mut out, entry.pattern_kind);
         push_string(&mut out, entry.primary_input_label);
         push_string(&mut out, entry.secondary_input_label.unwrap_or(""));
+        push_string(&mut out, entry.primary_sensor_kind);
+        push_string(&mut out, entry.secondary_sensor_kind.unwrap_or(""));
+        push_string(&mut out, entry.edge_policy);
+        push_string(&mut out, entry.sync_strategy);
     }
     out
 }
@@ -917,12 +927,13 @@ pub fn decode_trigger_decoder_directory_payload(
     let mut offset = 1usize;
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        if payload.len() < offset + 2 {
+        if payload.len() < offset + 4 {
             return Err(ProtocolError::MalformedPayload);
         }
         let requires_secondary = payload[offset] != 0;
         let supports_sequential = payload[offset + 1] != 0;
-        offset += 2;
+        let expected_engine_cycle_deg = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+        offset += 4;
         let key = read_string(payload, &mut offset)?;
         let label = read_string(payload, &mut offset)?;
         let family = read_string(payload, &mut offset)?;
@@ -930,6 +941,10 @@ pub fn decode_trigger_decoder_directory_payload(
         let pattern_kind = read_string(payload, &mut offset)?;
         let primary_input_label = read_string(payload, &mut offset)?;
         let secondary_input_label = read_string(payload, &mut offset)?;
+        let primary_sensor_kind = read_string(payload, &mut offset)?;
+        let secondary_sensor_kind = read_string(payload, &mut offset)?;
+        let edge_policy = read_string(payload, &mut offset)?;
+        let sync_strategy = read_string(payload, &mut offset)?;
         entries.push(DecodedTriggerDecoderPreset {
             key,
             label,
@@ -939,6 +954,12 @@ pub fn decode_trigger_decoder_directory_payload(
             primary_input_label,
             secondary_input_label: (!secondary_input_label.is_empty())
                 .then_some(secondary_input_label),
+            primary_sensor_kind,
+            secondary_sensor_kind: (!secondary_sensor_kind.is_empty())
+                .then_some(secondary_sensor_kind),
+            edge_policy,
+            sync_strategy,
+            expected_engine_cycle_deg,
             requires_secondary,
             supports_sequential,
         });
@@ -1642,6 +1663,11 @@ mod tests {
                 pattern_kind: "missing_tooth",
                 primary_input_label: "Crank VR/Hall",
                 secondary_input_label: Some("Cam Home"),
+                primary_sensor_kind: "vr_or_hall",
+                secondary_sensor_kind: Some("hall_or_optical"),
+                edge_policy: "configurable",
+                sync_strategy: "missing_tooth_plus_home",
+                expected_engine_cycle_deg: 720,
                 requires_secondary: true,
                 supports_sequential: true,
             },
@@ -1653,6 +1679,11 @@ mod tests {
                 pattern_kind: "oem_pattern",
                 primary_input_label: "Crank (CKP)",
                 secondary_input_label: Some("Cam / TDC (CMP)"),
+                primary_sensor_kind: "hall",
+                secondary_sensor_kind: Some("hall"),
+                edge_policy: "decoder_defined",
+                sync_strategy: "ckp_plus_cmp_phase",
+                expected_engine_cycle_deg: 720,
                 requires_secondary: true,
                 supports_sequential: true,
             },
@@ -1662,6 +1693,9 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].pattern_kind, "missing_tooth");
         assert_eq!(decoded[1].key, "honda_k20_12_1");
+        assert_eq!(decoded[0].primary_sensor_kind, "vr_or_hall");
+        assert_eq!(decoded[0].sync_strategy, "missing_tooth_plus_home");
+        assert_eq!(decoded[1].expected_engine_cycle_deg, 720);
         assert_eq!(
             decoded[1].secondary_input_label.as_deref(),
             Some("Cam / TDC (CMP)")
