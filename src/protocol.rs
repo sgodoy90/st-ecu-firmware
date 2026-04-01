@@ -307,6 +307,9 @@ pub struct DecodedTriggerDecoderPreset {
     pub secondary_sensor_kind: Option<String>,
     pub edge_policy: String,
     pub sync_strategy: String,
+    pub primary_pattern_hint: String,
+    pub secondary_pattern_hint: Option<String>,
+    pub reference_description: String,
     pub expected_engine_cycle_deg: u16,
     pub requires_secondary: bool,
     pub supports_sequential: bool,
@@ -932,6 +935,9 @@ pub fn encode_trigger_decoder_directory_payload(entries: &[TriggerDecoderPreset]
         push_string(&mut out, entry.secondary_sensor_kind.unwrap_or(""));
         push_string(&mut out, entry.edge_policy);
         push_string(&mut out, entry.sync_strategy);
+        push_string(&mut out, entry.primary_pattern_hint);
+        push_string(&mut out, entry.secondary_pattern_hint.unwrap_or(""));
+        push_string(&mut out, entry.reference_description);
     }
     out
 }
@@ -964,6 +970,9 @@ pub fn decode_trigger_decoder_directory_payload(
         let secondary_sensor_kind = read_string(payload, &mut offset)?;
         let edge_policy = read_string(payload, &mut offset)?;
         let sync_strategy = read_string(payload, &mut offset)?;
+        let primary_pattern_hint = read_string(payload, &mut offset)?;
+        let secondary_pattern_hint = read_string(payload, &mut offset)?;
+        let reference_description = read_string(payload, &mut offset)?;
         entries.push(DecodedTriggerDecoderPreset {
             key,
             label,
@@ -978,6 +987,10 @@ pub fn decode_trigger_decoder_directory_payload(
                 .then_some(secondary_sensor_kind),
             edge_policy,
             sync_strategy,
+            primary_pattern_hint,
+            secondary_pattern_hint: (!secondary_pattern_hint.is_empty())
+                .then_some(secondary_pattern_hint),
+            reference_description,
             expected_engine_cycle_deg,
             requires_secondary,
             supports_sequential,
@@ -1781,6 +1794,9 @@ mod tests {
                 secondary_sensor_kind: Some("hall_or_optical"),
                 edge_policy: "configurable",
                 sync_strategy: "missing_tooth_plus_home",
+                primary_pattern_hint: "60-2 crank wheel on the primary input",
+                secondary_pattern_hint: Some("Single home or cam-sync event every 720 deg"),
+                reference_description: "Locks on the missing-tooth gap and confirms engine phase from the home input.",
                 expected_engine_cycle_deg: 720,
                 requires_secondary: true,
                 supports_sequential: true,
@@ -1797,6 +1813,9 @@ mod tests {
                 secondary_sensor_kind: Some("hall"),
                 edge_policy: "decoder_defined",
                 sync_strategy: "ckp_plus_cmp_phase",
+                primary_pattern_hint: "12 CKP windows on the crank pattern",
+                secondary_pattern_hint: Some("Honda K cam and TDC phase windows"),
+                reference_description: "Uses CKP window timing plus CMP phase windows to identify the full engine cycle.",
                 expected_engine_cycle_deg: 720,
                 requires_secondary: true,
                 supports_sequential: true,
@@ -1809,10 +1828,18 @@ mod tests {
         assert_eq!(decoded[1].key, "honda_k20_12_1");
         assert_eq!(decoded[0].primary_sensor_kind, "vr_or_hall");
         assert_eq!(decoded[0].sync_strategy, "missing_tooth_plus_home");
+        assert_eq!(
+            decoded[0].primary_pattern_hint,
+            "60-2 crank wheel on the primary input"
+        );
         assert_eq!(decoded[1].expected_engine_cycle_deg, 720);
         assert_eq!(
             decoded[1].secondary_input_label.as_deref(),
             Some("Cam / TDC (CMP)")
+        );
+        assert_eq!(
+            decoded[1].reference_description,
+            "Uses CKP window timing plus CMP phase windows to identify the full engine cycle."
         );
     }
 

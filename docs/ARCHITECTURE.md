@@ -37,7 +37,7 @@ Desktop defines presentation and workflow.
   `TIM1_CH2` outputs and aligned the seeded `PC3` analog route with a real ADC
   channel
 - protocol payloads for exposing board pins and active IO assignments
-- protocol payloads for exposing runtime trigger capture, tooth logging, and supported trigger decoder presets, including CKP/CMP sensor-kind expectations, edge policy, sync strategy, expected cycle metadata, reference-event tagging, and phase-event markers
+- protocol payloads for exposing runtime trigger capture, tooth logging, and supported trigger decoder presets, including CKP/CMP sensor-kind expectations, primary/secondary pattern hints, reference descriptions, edge policy, sync strategy, expected cycle metadata, reference-event tagging, and phase-event markers
 - firmware identity, capability, and compatibility structs
 - page directory and table directory constants
 - versioned RAM/flash config staging model with per-page image headers, CRC, generation, and burn detection

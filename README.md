@@ -55,7 +55,7 @@ This repository should eventually own the runtime implementation of those contra
 - `contract`: firmware identity and capability contract
 - `diagnostics`: DTC and freeze-frame boundaries
 - `engine`: trigger, injection, ignition scheduling boundaries
-- `trigger`: OEM/generic decoder presets plus runtime trigger-capture and tooth-log contracts, including CKP/CMP sensor expectations, sync strategy, engine-cycle metadata, and decoder-facing phase markers
+- `trigger`: OEM/generic decoder presets plus runtime trigger-capture and tooth-log contracts, including CKP/CMP sensor expectations, primary/secondary pattern hints, reference descriptions, sync strategy, engine-cycle metadata, and decoder-facing phase markers
 - `live_data`: frame layout contract
 - `protection`: safety and limp policy boundaries
 - `reset_reason`: reset/brownout/watchdog reason model
