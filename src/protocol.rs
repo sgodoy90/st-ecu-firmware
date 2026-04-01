@@ -1,6 +1,7 @@
 use crate::board::{board_definition, PinCapability};
 use crate::config::{ConfigPageStatus, PAGE_DIRECTORY};
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
+use crate::diagnostics::FreezeFrame;
 use crate::io::{EcuFunction, ResolvedPinAssignment};
 use crate::network::{MessageClass, NetworkProfile, ProductTrack, TransportLinkKind};
 use crate::pinmux::PinFunctionClass;
@@ -45,6 +46,8 @@ pub enum Cmd {
     OutputTestDirectory = 0x47,
     GetSensorRawDirectory = 0x48,
     SensorRawDirectory = 0x49,
+    GetFreezeFrames = 0x4A,
+    FreezeFrames = 0x4B,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
     Ack = 0xA0,
@@ -87,6 +90,8 @@ impl TryFrom<u8> for Cmd {
             0x47 => Ok(Self::OutputTestDirectory),
             0x48 => Ok(Self::GetSensorRawDirectory),
             0x49 => Ok(Self::SensorRawDirectory),
+            0x4A => Ok(Self::GetFreezeFrames),
+            0x4B => Ok(Self::FreezeFrames),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
@@ -259,6 +264,21 @@ pub struct DecodedSensorRawDirectoryEntry {
     pub expected_max_mv: u16,
     pub fault_low_mv: u16,
     pub fault_high_mv: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedFreezeFrame {
+    pub code: String,
+    pub label: String,
+    pub reason: String,
+    pub rev_counter: u32,
+    pub rpm: u16,
+    pub map_kpa: f64,
+    pub tps_pct: f64,
+    pub coolant_c: f64,
+    pub lambda: f64,
+    pub vbatt: f64,
+    pub gear: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -740,6 +760,93 @@ pub fn decode_sensor_raw_directory_payload(
     Ok(entries)
 }
 
+pub fn encode_freeze_frames_payload(entries: &[FreezeFrame]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for entry in entries {
+        push_string(&mut out, entry.code);
+        push_string(&mut out, entry.label);
+        push_string(&mut out, entry.reason);
+        out.extend_from_slice(&entry.rev_counter.to_be_bytes());
+        out.extend_from_slice(&entry.rpm.to_be_bytes());
+        out.extend_from_slice(&entry.map_kpa_x10.to_be_bytes());
+        out.extend_from_slice(&entry.tps_pct_x100.to_be_bytes());
+        out.extend_from_slice(&entry.coolant_c_x10.to_be_bytes());
+        out.extend_from_slice(&entry.lambda_x10000.to_be_bytes());
+        out.extend_from_slice(&entry.vbatt_x100.to_be_bytes());
+        out.push(entry.gear);
+    }
+    out
+}
+
+pub fn decode_freeze_frames_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedFreezeFrame>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let code = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        let reason = read_string(payload, &mut offset)?;
+        if payload.len() < offset + 17 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let rev_counter = u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
+        let rpm = u16::from_be_bytes([payload[offset + 4], payload[offset + 5]]);
+        let map_kpa = f64::from(u16::from_be_bytes([
+            payload[offset + 6],
+            payload[offset + 7],
+        ])) / 10.0;
+        let tps_pct = f64::from(u16::from_be_bytes([
+            payload[offset + 8],
+            payload[offset + 9],
+        ])) / 100.0;
+        let coolant_c = f64::from(i16::from_be_bytes([
+            payload[offset + 10],
+            payload[offset + 11],
+        ])) / 10.0;
+        let lambda = f64::from(u16::from_be_bytes([
+            payload[offset + 12],
+            payload[offset + 13],
+        ])) / 10000.0;
+        let vbatt = f64::from(u16::from_be_bytes([
+            payload[offset + 14],
+            payload[offset + 15],
+        ])) / 100.0;
+        let gear = payload[offset + 16];
+        offset += 17;
+
+        entries.push(DecodedFreezeFrame {
+            code,
+            label,
+            reason,
+            rev_counter,
+            rpm,
+            map_kpa,
+            tps_pct,
+            coolant_c,
+            lambda,
+            vbatt,
+            gear,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
 pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + statuses.len() * 15);
     out.push(statuses.len() as u8);
@@ -1040,24 +1147,25 @@ fn output_group_code(key: &str) -> Option<u8> {
 mod tests {
     use crate::config::ConfigPageStatus;
     use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
+    use crate::diagnostics::FreezeFrame;
     use crate::io::{EcuFunction, ResolvedPinAssignment};
     use crate::network::{display_network_profile, MessageClass, ProductTrack, TransportLinkKind};
     use crate::pinmux::PinFunctionClass;
 
     use super::{
-        decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
-        decode_page_payload, decode_page_request, decode_page_statuses_payload,
-        decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
+        decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
+        decode_output_test_directory_payload, decode_page_payload, decode_page_request,
+        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_table_metadata_payload, encode_ack_payload, encode_capabilities_payload,
-        encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
-        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
-        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-        encode_pin_directory_payload, encode_sensor_raw_directory_payload,
-        encode_sensor_raw_payload, encode_table_directory_payload, encode_table_metadata_payload,
-        Cmd, DecodedPinAssignment, OutputTestDirectoryEntry, Packet, ProtocolError,
-        SensorRawDirectoryEntry,
+        encode_freeze_frames_payload, encode_identity_payload, encode_nack_payload,
+        encode_network_profile_payload, encode_output_test_directory_payload,
+        encode_page_directory_payload, encode_page_payload, encode_page_request,
+        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+        encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
+        encode_table_directory_payload, encode_table_metadata_payload, Cmd, DecodedPinAssignment,
+        OutputTestDirectoryEntry, Packet, ProtocolError, SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -1267,6 +1375,44 @@ mod tests {
         assert_eq!(decoded[0].key, "clt");
         assert_eq!(decoded[1].pin_label, "VBATT");
         assert_eq!(decoded[1].fault_high_mv, 3200);
+    }
+
+    #[test]
+    fn freeze_frames_payload_roundtrip() {
+        let payload = encode_freeze_frames_payload(&[
+            FreezeFrame {
+                code: "P0118",
+                label: "Coolant Temp Sensor High",
+                reason: "sensor_plausibility",
+                rev_counter: 48_231,
+                rpm: 2_840,
+                map_kpa_x10: 572,
+                tps_pct_x100: 1460,
+                coolant_c_x10: -318,
+                lambda_x10000: 10_720,
+                vbatt_x100: 1418,
+                gear: 3,
+            },
+            FreezeFrame {
+                code: "P0193",
+                label: "Fuel Pressure Sensor High",
+                reason: "pressure_range_high",
+                rev_counter: 50_984,
+                rpm: 4_125,
+                map_kpa_x10: 1834,
+                tps_pct_x100: 6230,
+                coolant_c_x10: 862,
+                lambda_x10000: 9180,
+                vbatt_x100: 1394,
+                gear: 4,
+            },
+        ]);
+
+        let decoded = decode_freeze_frames_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].code, "P0118");
+        assert!((decoded[0].coolant_c + 31.8).abs() < 0.1);
+        assert_eq!(decoded[1].gear, 4);
     }
 
     #[test]

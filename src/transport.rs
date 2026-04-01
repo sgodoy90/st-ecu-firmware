@@ -1,5 +1,6 @@
 use crate::config::ConfigStore;
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
+use crate::diagnostics::SAMPLE_FREEZE_FRAMES;
 use crate::io::{
     apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
     serialize_assignments_to_page, validate_assignment_set, AssignmentError, PinAssignmentRequest,
@@ -9,9 +10,10 @@ use crate::live_data::LiveDataFrame;
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protocol::{
     decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
-    encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
-    encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
-    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    encode_freeze_frames_payload, encode_identity_payload, encode_nack_payload,
+    encode_network_profile_payload, encode_output_test_directory_payload,
+    encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
+    encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, Cmd, OutputTestDirectoryEntry, Packet, SensorRawDirectoryEntry,
 };
@@ -327,6 +329,10 @@ impl FirmwareRuntime {
                 let (adc, voltage) = sensor_raw_sample(channel);
                 Packet::new(Cmd::SensorRaw, encode_sensor_raw_payload(adc, voltage))
             }
+            Cmd::GetFreezeFrames => Packet::new(
+                Cmd::FreezeFrames,
+                encode_freeze_frames_payload(&SAMPLE_FREEZE_FRAMES),
+            ),
             Cmd::GetPageDirectory => {
                 Packet::new(Cmd::PageDirectory, encode_page_directory_payload())
             }
@@ -429,11 +435,12 @@ mod tests {
     };
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
-        decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
-        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
-        decode_page_payload, decode_page_statuses_payload, decode_pin_assignments_payload,
-        decode_pin_directory_payload, decode_sensor_raw_directory_payload,
-        decode_sensor_raw_payload, encode_page_payload, encode_page_request, Cmd, Packet,
+        decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
+        decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
+        decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
+        decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_sensor_raw_directory_payload, decode_sensor_raw_payload, encode_page_payload,
+        encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
 
@@ -571,6 +578,19 @@ mod tests {
         assert_eq!(sample.cmd, Cmd::SensorRaw);
         assert!(decoded_sample.adc > 0);
         assert!(decoded_sample.voltage > 0.0);
+    }
+
+    #[test]
+    fn runtime_exposes_freeze_frames() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let response = runtime.handle_packet(Packet::new(Cmd::GetFreezeFrames, vec![]));
+        let frames = decode_freeze_frames_payload(&response.payload).unwrap();
+
+        assert_eq!(response.cmd, Cmd::FreezeFrames);
+        assert!(frames.iter().any(|frame| frame.code == "P0118"));
+        assert!(frames
+            .iter()
+            .any(|frame| frame.reason == "pressure_range_high"));
     }
 
     #[test]

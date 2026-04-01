@@ -30,6 +30,7 @@ pub use contract::{
     PageDirectoryEntry, TableDirectoryEntry, CONFIG_FORMAT_VERSION, PROTOCOL_VERSION,
     SCHEMA_VERSION, TABLE_DIRECTORY,
 };
+pub use diagnostics::{DtcCode, DtcSeverity, FreezeFrame, FreezeFrameHeader, SAMPLE_FREEZE_FRAMES};
 pub use io::{
     apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
     serialize_assignments_to_page, validate_assignment_set, AssignmentError, EcuFunction,
@@ -48,19 +49,20 @@ pub use network::{
 };
 pub use pinmux::{PinFunctionClass, PinFunctionClassParseError, PinRoute};
 pub use protocol::{
-    decode_ack_payload, decode_capabilities_payload, decode_identity_payload, decode_nack_payload,
-    decode_network_profile_payload, decode_page_payload, decode_page_request,
-    decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+    decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
+    decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
+    decode_page_payload, decode_page_request, decode_page_statuses_payload,
+    decode_pin_assignments_payload, decode_pin_directory_payload,
     decode_sensor_raw_directory_payload, decode_sensor_raw_payload, decode_table_metadata_payload,
-    encode_ack_payload, encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
-    encode_network_profile_payload, encode_page_directory_payload, encode_page_payload,
-    encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-    encode_pin_directory_payload, encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
-    encode_table_directory_payload, encode_table_metadata_payload, Cmd, DecodedIdentity,
-    DecodedNetworkLink, DecodedNetworkProfile, DecodedPagePayload, DecodedPageStatus,
-    DecodedPinAssignment, DecodedPinDirectoryEntry, DecodedPinRoute, DecodedSensorRaw,
-    DecodedSensorRawDirectoryEntry, DecodedTableMetadataEntry, Packet, ProtocolError,
-    SensorRawDirectoryEntry,
+    encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
+    encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
+    encode_page_directory_payload, encode_page_payload, encode_page_request,
+    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
+    encode_table_metadata_payload, Cmd, DecodedFreezeFrame, DecodedIdentity, DecodedNetworkLink,
+    DecodedNetworkProfile, DecodedPagePayload, DecodedPageStatus, DecodedPinAssignment,
+    DecodedPinDirectoryEntry, DecodedPinRoute, DecodedSensorRaw, DecodedSensorRawDirectoryEntry,
+    DecodedTableMetadataEntry, Packet, ProtocolError, SensorRawDirectoryEntry,
 };
 pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
 
