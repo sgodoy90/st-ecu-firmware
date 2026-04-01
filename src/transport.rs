@@ -12,8 +12,8 @@ use crate::protocol::{
     encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
     encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
     encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-    encode_table_directory_payload, encode_table_metadata_payload, Cmd, OutputTestDirectoryEntry,
-    Packet,
+    encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
+    encode_table_metadata_payload, Cmd, OutputTestDirectoryEntry, Packet, SensorRawDirectoryEntry,
 };
 use crate::ConfigPage;
 
@@ -132,6 +132,108 @@ const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
     },
 ];
 
+const SENSOR_RAW_DIRECTORY: [SensorRawDirectoryEntry; 7] = [
+    SensorRawDirectoryEntry {
+        channel: 0,
+        key: "clt",
+        label: "Coolant Temp",
+        unit: "degC",
+        pin_id: "PC1",
+        pin_label: "CLT",
+        expected_min_mv: 400,
+        expected_max_mv: 2800,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 1,
+        key: "iat",
+        label: "Intake Temp",
+        unit: "degC",
+        pin_id: "PC2",
+        pin_label: "IAT",
+        expected_min_mv: 500,
+        expected_max_mv: 2800,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 2,
+        key: "tps",
+        label: "Throttle Position",
+        unit: "%",
+        pin_id: "PA3",
+        pin_label: "TPS",
+        expected_min_mv: 150,
+        expected_max_mv: 3200,
+        fault_low_mv: 50,
+        fault_high_mv: 3250,
+    },
+    SensorRawDirectoryEntry {
+        channel: 3,
+        key: "map",
+        label: "MAP Sensor",
+        unit: "kPa",
+        pin_id: "PC0",
+        pin_label: "MAP",
+        expected_min_mv: 330,
+        expected_max_mv: 3000,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 4,
+        key: "vbatt",
+        label: "Battery Sense",
+        unit: "V",
+        pin_id: "PA4",
+        pin_label: "VBATT",
+        expected_min_mv: 1800,
+        expected_max_mv: 2800,
+        fault_low_mv: 500,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 5,
+        key: "oil_pressure",
+        label: "Oil Pressure",
+        unit: "kPa",
+        pin_id: "PC3",
+        pin_label: "OILP",
+        expected_min_mv: 330,
+        expected_max_mv: 3000,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 6,
+        key: "fuel_pressure",
+        label: "Fuel Pressure",
+        unit: "kPa",
+        pin_id: "PC4",
+        pin_label: "FPR",
+        expected_min_mv: 330,
+        expected_max_mv: 3000,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+];
+
+fn sensor_raw_sample(channel: u8) -> (u16, f32) {
+    let voltage: f32 = match channel {
+        0 => 2.18,
+        1 => 1.94,
+        2 => 0.87,
+        3 => 1.42,
+        4 => 2.41,
+        5 => 1.26,
+        6 => 1.58,
+        _ => 0.0,
+    };
+    let adc = ((voltage / 3.3).clamp(0.0, 1.0) * 65535.0).round() as u16;
+    (adc, voltage)
+}
+
 impl FirmwareRuntime {
     pub fn new(identity: FirmwareIdentity, simulator: bool) -> Self {
         let mut store = ConfigStore::new_zeroed();
@@ -220,6 +322,11 @@ impl FirmwareRuntime {
             Cmd::GetLiveData => {
                 Packet::new(Cmd::LiveData, LiveDataFrame::current().encode_payload())
             }
+            Cmd::GetSensorRaw => {
+                let channel = packet.payload.first().copied().unwrap_or(0);
+                let (adc, voltage) = sensor_raw_sample(channel);
+                Packet::new(Cmd::SensorRaw, encode_sensor_raw_payload(adc, voltage))
+            }
             Cmd::GetPageDirectory => {
                 Packet::new(Cmd::PageDirectory, encode_page_directory_payload())
             }
@@ -237,6 +344,10 @@ impl FirmwareRuntime {
             Cmd::GetOutputTestDirectory => Packet::new(
                 Cmd::OutputTestDirectory,
                 encode_output_test_directory_payload(&OUTPUT_TEST_DIRECTORY),
+            ),
+            Cmd::GetSensorRawDirectory => Packet::new(
+                Cmd::SensorRawDirectory,
+                encode_sensor_raw_directory_payload(&SENSOR_RAW_DIRECTORY),
             ),
             Cmd::GetPageStatuses => Packet::new(
                 Cmd::PageStatuses,
@@ -321,7 +432,8 @@ mod tests {
         decode_ack_payload, decode_capabilities_payload, decode_identity_payload,
         decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
         decode_page_payload, decode_page_statuses_payload, decode_pin_assignments_payload,
-        decode_pin_directory_payload, encode_page_payload, encode_page_request, Cmd, Packet,
+        decode_pin_directory_payload, decode_sensor_raw_directory_payload,
+        decode_sensor_raw_payload, encode_page_payload, encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
 
@@ -442,6 +554,23 @@ mod tests {
         assert_eq!(response.cmd, Cmd::OutputTestDirectory);
         assert!(entries.iter().any(|entry| entry.function == "injector_1"));
         assert!(entries.iter().any(|entry| entry.group == "valves"));
+    }
+
+    #[test]
+    fn runtime_exposes_sensor_raw_directory_and_samples() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let directory = runtime.handle_packet(Packet::new(Cmd::GetSensorRawDirectory, vec![]));
+        let channels = decode_sensor_raw_directory_payload(&directory.payload).unwrap();
+        assert_eq!(directory.cmd, Cmd::SensorRawDirectory);
+        assert!(channels.iter().any(|entry| entry.key == "clt"));
+        assert!(channels.iter().any(|entry| entry.pin_label == "VBATT"));
+
+        let sample = runtime.handle_packet(Packet::new(Cmd::GetSensorRaw, vec![4]));
+        let decoded_sample = decode_sensor_raw_payload(&sample.payload).unwrap();
+        assert_eq!(sample.cmd, Cmd::SensorRaw);
+        assert!(decoded_sample.adc > 0);
+        assert!(decoded_sample.voltage > 0.0);
     }
 
     #[test]

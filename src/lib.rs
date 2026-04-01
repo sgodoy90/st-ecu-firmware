@@ -51,14 +51,16 @@ pub use protocol::{
     decode_ack_payload, decode_capabilities_payload, decode_identity_payload, decode_nack_payload,
     decode_network_profile_payload, decode_page_payload, decode_page_request,
     decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-    decode_table_metadata_payload, encode_ack_payload, encode_capabilities_payload,
-    encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
-    encode_page_directory_payload, encode_page_payload, encode_page_request,
-    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    decode_sensor_raw_directory_payload, decode_sensor_raw_payload, decode_table_metadata_payload,
+    encode_ack_payload, encode_capabilities_payload, encode_identity_payload, encode_nack_payload,
+    encode_network_profile_payload, encode_page_directory_payload, encode_page_payload,
+    encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+    encode_pin_directory_payload, encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
     encode_table_directory_payload, encode_table_metadata_payload, Cmd, DecodedIdentity,
     DecodedNetworkLink, DecodedNetworkProfile, DecodedPagePayload, DecodedPageStatus,
-    DecodedPinAssignment, DecodedPinDirectoryEntry, DecodedPinRoute, DecodedTableMetadataEntry,
-    Packet, ProtocolError,
+    DecodedPinAssignment, DecodedPinDirectoryEntry, DecodedPinRoute, DecodedSensorRaw,
+    DecodedSensorRawDirectoryEntry, DecodedTableMetadataEntry, Packet, ProtocolError,
+    SensorRawDirectoryEntry,
 };
 pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, TransportKind};
 

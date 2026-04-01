@@ -39,8 +39,12 @@ pub enum Cmd {
     PageStatuses = 0x2D,
     GetNetworkProfile = 0x2E,
     NetworkProfile = 0x2F,
+    GetSensorRaw = 0x43,
+    SensorRaw = 0x44,
     GetOutputTestDirectory = 0x46,
     OutputTestDirectory = 0x47,
+    GetSensorRawDirectory = 0x48,
+    SensorRawDirectory = 0x49,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
     Ack = 0xA0,
@@ -77,8 +81,12 @@ impl TryFrom<u8> for Cmd {
             0x2D => Ok(Self::PageStatuses),
             0x2E => Ok(Self::GetNetworkProfile),
             0x2F => Ok(Self::NetworkProfile),
+            0x43 => Ok(Self::GetSensorRaw),
+            0x44 => Ok(Self::SensorRaw),
             0x46 => Ok(Self::GetOutputTestDirectory),
             0x47 => Ok(Self::OutputTestDirectory),
+            0x48 => Ok(Self::GetSensorRawDirectory),
+            0x49 => Ok(Self::SensorRawDirectory),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
@@ -217,6 +225,40 @@ pub struct DecodedOutputTestDirectoryEntry {
     pub label: String,
     pub group: String,
     pub default_pulse_ms: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedSensorRaw {
+    pub adc: u16,
+    pub voltage: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensorRawDirectoryEntry {
+    pub channel: u8,
+    pub key: &'static str,
+    pub label: &'static str,
+    pub unit: &'static str,
+    pub pin_id: &'static str,
+    pub pin_label: &'static str,
+    pub expected_min_mv: u16,
+    pub expected_max_mv: u16,
+    pub fault_low_mv: u16,
+    pub fault_high_mv: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSensorRawDirectoryEntry {
+    pub channel: u8,
+    pub key: String,
+    pub label: String,
+    pub unit: String,
+    pub pin_id: String,
+    pub pin_label: String,
+    pub expected_min_mv: u16,
+    pub expected_max_mv: u16,
+    pub fault_low_mv: u16,
+    pub fault_high_mv: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -617,6 +659,87 @@ pub fn decode_output_test_directory_payload(
     Ok(entries)
 }
 
+pub fn encode_sensor_raw_payload(adc: u16, voltage: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6);
+    out.extend_from_slice(&adc.to_be_bytes());
+    out.extend_from_slice(&voltage.to_be_bytes());
+    out
+}
+
+pub fn decode_sensor_raw_payload(payload: &[u8]) -> Result<DecodedSensorRaw, ProtocolError> {
+    if payload.len() != 6 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(DecodedSensorRaw {
+        adc: u16::from_be_bytes([payload[0], payload[1]]),
+        voltage: f32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]),
+    })
+}
+
+pub fn encode_sensor_raw_directory_payload(entries: &[SensorRawDirectoryEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for entry in entries {
+        out.push(entry.channel);
+        out.extend_from_slice(&entry.expected_min_mv.to_be_bytes());
+        out.extend_from_slice(&entry.expected_max_mv.to_be_bytes());
+        out.extend_from_slice(&entry.fault_low_mv.to_be_bytes());
+        out.extend_from_slice(&entry.fault_high_mv.to_be_bytes());
+        push_string(&mut out, entry.key);
+        push_string(&mut out, entry.label);
+        push_string(&mut out, entry.unit);
+        push_string(&mut out, entry.pin_id);
+        push_string(&mut out, entry.pin_label);
+    }
+    out
+}
+
+pub fn decode_sensor_raw_directory_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedSensorRawDirectoryEntry>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if payload.len() < offset + 9 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let channel = payload[offset];
+        let expected_min_mv = u16::from_be_bytes([payload[offset + 1], payload[offset + 2]]);
+        let expected_max_mv = u16::from_be_bytes([payload[offset + 3], payload[offset + 4]]);
+        let fault_low_mv = u16::from_be_bytes([payload[offset + 5], payload[offset + 6]]);
+        let fault_high_mv = u16::from_be_bytes([payload[offset + 7], payload[offset + 8]]);
+        offset += 9;
+        let key = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        let unit = read_string(payload, &mut offset)?;
+        let pin_id = read_string(payload, &mut offset)?;
+        let pin_label = read_string(payload, &mut offset)?;
+        entries.push(DecodedSensorRawDirectoryEntry {
+            channel,
+            key,
+            label,
+            unit,
+            pin_id,
+            pin_label,
+            expected_min_mv,
+            expected_max_mv,
+            fault_low_mv,
+            fault_high_mv,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
 pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + statuses.len() * 15);
     out.push(statuses.len() as u8);
@@ -926,13 +1049,15 @@ mod tests {
         decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
         decode_page_payload, decode_page_request, decode_page_statuses_payload,
         decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_table_metadata_payload, encode_ack_payload, encode_capabilities_payload,
         encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
         encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
         encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-        encode_pin_directory_payload, encode_table_directory_payload,
-        encode_table_metadata_payload, Cmd, DecodedPinAssignment, OutputTestDirectoryEntry, Packet,
-        ProtocolError,
+        encode_pin_directory_payload, encode_sensor_raw_directory_payload,
+        encode_sensor_raw_payload, encode_table_directory_payload, encode_table_metadata_payload,
+        Cmd, DecodedPinAssignment, OutputTestDirectoryEntry, Packet, ProtocolError,
+        SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -1097,6 +1222,51 @@ mod tests {
         assert_eq!(decoded[0].default_pulse_ms, Some(5));
         assert_eq!(decoded[1].channel, 24);
         assert_eq!(decoded[1].label, "Idle Valve");
+    }
+
+    #[test]
+    fn sensor_raw_payload_roundtrip() {
+        let payload = encode_sensor_raw_payload(32123, 2.412);
+        let decoded = decode_sensor_raw_payload(&payload).unwrap();
+
+        assert_eq!(decoded.adc, 32123);
+        assert!((decoded.voltage - 2.412).abs() < 0.0001);
+    }
+
+    #[test]
+    fn sensor_raw_directory_payload_roundtrip() {
+        let payload = encode_sensor_raw_directory_payload(&[
+            SensorRawDirectoryEntry {
+                channel: 0,
+                key: "clt",
+                label: "Coolant Temp",
+                unit: "degC",
+                pin_id: "PC1",
+                pin_label: "CLT",
+                expected_min_mv: 400,
+                expected_max_mv: 2800,
+                fault_low_mv: 100,
+                fault_high_mv: 3200,
+            },
+            SensorRawDirectoryEntry {
+                channel: 4,
+                key: "vbatt",
+                label: "Battery Sense",
+                unit: "V",
+                pin_id: "PA4",
+                pin_label: "VBATT",
+                expected_min_mv: 1800,
+                expected_max_mv: 2800,
+                fault_low_mv: 500,
+                fault_high_mv: 3200,
+            },
+        ]);
+
+        let decoded = decode_sensor_raw_directory_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].key, "clt");
+        assert_eq!(decoded[1].pin_label, "VBATT");
+        assert_eq!(decoded[1].fault_high_mv, 3200);
     }
 
     #[test]
