@@ -1,5 +1,5 @@
 use crate::config::ConfigStore;
-use crate::contract::{base_capabilities, Capability, FirmwareIdentity};
+use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
 use crate::diagnostics::SAMPLE_FREEZE_FRAMES;
 use crate::io::{
     apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
@@ -9,18 +9,21 @@ use crate::io::{
 use crate::live_data::LiveDataFrame;
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protocol::{
-    decode_page_payload, decode_page_request, encode_ack_payload, encode_capabilities_payload,
-    encode_freeze_frames_payload, encode_identity_payload, encode_nack_payload,
-    encode_network_profile_payload, encode_output_test_directory_payload,
+    decode_page_payload, decode_page_request, decode_raw_table_payload, encode_ack_payload,
+    encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
+    encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
     encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
     encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
-    OutputTestDirectoryEntry, Packet, SensorRawDirectoryEntry,
+    OutputTestDirectoryEntry, Packet, RawTablePayload, SensorRawDirectoryEntry,
 };
-use crate::trigger::{sample_trigger_capture, sample_trigger_tooth_log, SUPPORTED_TRIGGER_DECODERS};
+use crate::trigger::{
+    sample_trigger_capture, sample_trigger_tooth_log, SUPPORTED_TRIGGER_DECODERS,
+};
 use crate::ConfigPage;
+use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
@@ -54,6 +57,15 @@ pub enum RuntimeNackCode {
     StorageFailure = 4,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeDtcEntry {
+    code: String,
+    description: String,
+    severity: String,
+    active: bool,
+    confirmed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct FirmwareRuntime {
     pub identity: FirmwareIdentity,
@@ -62,6 +74,11 @@ pub struct FirmwareRuntime {
     pub capabilities: Vec<Capability>,
     pub pin_assignments: Vec<ResolvedPinAssignment>,
     pub network_profile: &'static NetworkProfile,
+    pub tables: Vec<RawTablePayload>,
+    dtc_entries: Vec<RuntimeDtcEntry>,
+    flash_session_active: bool,
+    flash_next_block: u32,
+    flash_buffer: Vec<u8>,
 }
 
 const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
@@ -137,7 +154,75 @@ const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
     },
 ];
 
-const SENSOR_RAW_DIRECTORY: [SensorRawDirectoryEntry; 7] = [
+fn default_dtc_entries() -> Vec<RuntimeDtcEntry> {
+    vec![
+        RuntimeDtcEntry {
+            code: "P0113".to_string(),
+            description: "Intake Air Temperature Circuit High".to_string(),
+            severity: "warning".to_string(),
+            active: false,
+            confirmed: false,
+        },
+        RuntimeDtcEntry {
+            code: "P0335".to_string(),
+            description: "Crank Position Sensor Range".to_string(),
+            severity: "critical".to_string(),
+            active: true,
+            confirmed: true,
+        },
+    ]
+}
+
+fn axis_range(count: u8, start: u16, end: u16) -> Vec<u16> {
+    if count <= 1 {
+        return vec![start];
+    }
+    let span = (end - start) as f32;
+    (0..count)
+        .map(|index| {
+            let ratio = index as f32 / (count - 1) as f32;
+            (start as f32 + ratio * span).round() as u16
+        })
+        .collect()
+}
+
+fn default_axis_bins(label: &str, count: u8) -> Vec<u16> {
+    match label {
+        "RPM" => axis_range(count, 500, 8_000),
+        "MAP" => axis_range(count, 200, 2_500),
+        "TPS" => axis_range(count, 0, 10_000),
+        "Boost" => axis_range(count, 0, 4_000),
+        _ => axis_range(count, 0, 10_000),
+    }
+}
+
+fn encode_table_raw_value(signed: bool, raw: i32) -> u16 {
+    if signed {
+        (raw.clamp(i16::MIN as i32, i16::MAX as i32) as i16) as u16
+    } else {
+        raw.clamp(0, u16::MAX as i32) as u16
+    }
+}
+
+fn default_tables() -> Vec<RawTablePayload> {
+    TABLE_DIRECTORY
+        .iter()
+        .map(|entry| {
+            let cell_count = entry.x_count as usize * entry.y_count as usize;
+            let default = encode_table_raw_value(entry.signed, entry.default_value_raw);
+            RawTablePayload {
+                table_id: entry.id,
+                x_count: entry.x_count,
+                y_count: entry.y_count,
+                x_bins: default_axis_bins(entry.x_label, entry.x_count),
+                y_bins: default_axis_bins(entry.y_label, entry.y_count),
+                data: vec![default; cell_count],
+            }
+        })
+        .collect()
+}
+
+const SENSOR_RAW_DIRECTORY: [SensorRawDirectoryEntry; 11] = [
     SensorRawDirectoryEntry {
         channel: 0,
         key: "clt",
@@ -222,6 +307,54 @@ const SENSOR_RAW_DIRECTORY: [SensorRawDirectoryEntry; 7] = [
         fault_low_mv: 100,
         fault_high_mv: 3200,
     },
+    SensorRawDirectoryEntry {
+        channel: 7,
+        key: "baro",
+        label: "Barometric Pressure",
+        unit: "kPa",
+        pin_id: "PF8",
+        pin_label: "BARO",
+        expected_min_mv: 300,
+        expected_max_mv: 3000,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 8,
+        key: "wideband",
+        label: "Wideband Input",
+        unit: "lambda",
+        pin_id: "PF9",
+        pin_label: "WB_O2",
+        expected_min_mv: 200,
+        expected_max_mv: 3000,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 9,
+        key: "flex_fuel",
+        label: "Flex Fuel",
+        unit: "%",
+        pin_id: "PE9",
+        pin_label: "FLEX",
+        expected_min_mv: 200,
+        expected_max_mv: 3000,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
+    SensorRawDirectoryEntry {
+        channel: 10,
+        key: "oil_temp",
+        label: "Oil Temp",
+        unit: "degC",
+        pin_id: "PF10",
+        pin_label: "OILT",
+        expected_min_mv: 350,
+        expected_max_mv: 2800,
+        fault_low_mv: 100,
+        fault_high_mv: 3200,
+    },
 ];
 
 fn sensor_raw_sample(channel: u8) -> (u16, f32) {
@@ -233,6 +366,10 @@ fn sensor_raw_sample(channel: u8) -> (u16, f32) {
         4 => 2.41,
         5 => 1.26,
         6 => 1.58,
+        7 => 1.52,
+        8 => 2.07,
+        9 => 1.74,
+        10 => 1.88,
         _ => 0.0,
     };
     let adc = ((voltage / 3.3).clamp(0.0, 1.0) * 65535.0).round() as u16;
@@ -262,6 +399,11 @@ impl FirmwareRuntime {
             capabilities: base_capabilities(simulator),
             pin_assignments,
             network_profile: headless_network_profile(),
+            tables: default_tables(),
+            dtc_entries: default_dtc_entries(),
+            flash_session_active: false,
+            flash_next_block: 0,
+            flash_buffer: Vec::new(),
         }
     }
 
@@ -313,6 +455,30 @@ impl FirmwareRuntime {
         Ok(())
     }
 
+    fn table_index(&self, table_id: u8) -> Option<usize> {
+        self.tables
+            .iter()
+            .position(|table| table.table_id == table_id)
+    }
+
+    fn write_table_frame(&mut self, incoming: RawTablePayload) -> Result<(), RuntimeNackCode> {
+        let Some(index) = self.table_index(incoming.table_id) else {
+            return Err(RuntimeNackCode::MalformedPayload);
+        };
+        let current = &self.tables[index];
+        if incoming.x_count != current.x_count
+            || incoming.y_count != current.y_count
+            || incoming.x_bins.len() != current.x_bins.len()
+            || incoming.y_bins.len() != current.y_bins.len()
+            || incoming.data.len() != current.data.len()
+        {
+            return Err(RuntimeNackCode::MalformedPayload);
+        }
+
+        self.tables[index] = incoming;
+        Ok(())
+    }
+
     pub fn handle_packet(&mut self, packet: Packet) -> Packet {
         match packet.cmd {
             Cmd::Ping => Packet::new(Cmd::Pong, vec![]),
@@ -357,15 +523,75 @@ impl FirmwareRuntime {
             Cmd::GetTableMetadata => {
                 Packet::new(Cmd::TableMetadata, encode_table_metadata_payload())
             }
+            Cmd::ReadTable => {
+                let Some(&table_id) = packet.payload.first() else {
+                    return nack(RuntimeNackCode::MalformedPayload, "bad read-table payload");
+                };
+                match self.tables.iter().find(|table| table.table_id == table_id) {
+                    Some(table) => Packet::new(Cmd::TableData, table.to_payload()),
+                    None => nack(RuntimeNackCode::MalformedPayload, "invalid table id"),
+                }
+            }
+            Cmd::WriteTable => match decode_raw_table_payload(&packet.payload) {
+                Ok(table) => match self.write_table_frame(table) {
+                    Ok(()) => Packet::new(Cmd::Ack, vec![]),
+                    Err(_) => nack(RuntimeNackCode::MalformedPayload, "invalid table payload"),
+                },
+                Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad write-table payload"),
+            },
+            Cmd::WriteCell => {
+                if packet.payload.len() != 5 {
+                    return nack(RuntimeNackCode::MalformedPayload, "bad write-cell payload");
+                }
+                let table_id = packet.payload[0];
+                let x_index = packet.payload[1] as usize;
+                let y_index = packet.payload[2] as usize;
+                let value = u16::from_be_bytes([packet.payload[3], packet.payload[4]]);
+                let Some(index) = self.table_index(table_id) else {
+                    return nack(RuntimeNackCode::MalformedPayload, "invalid table id");
+                };
+                let table = &mut self.tables[index];
+                if x_index >= table.x_count as usize || y_index >= table.y_count as usize {
+                    return nack(RuntimeNackCode::MalformedPayload, "cell out of bounds");
+                }
+                let offset = y_index * table.x_count as usize + x_index;
+                table.data[offset] = value;
+                Packet::new(Cmd::Ack, vec![])
+            }
             Cmd::GetPinDirectory => Packet::new(Cmd::PinDirectory, encode_pin_directory_payload()),
             Cmd::GetPinAssignments => Packet::new(
                 Cmd::PinAssignments,
                 encode_pin_assignments_payload(&self.pin_assignments),
             ),
+            Cmd::GetDtc => {
+                let payload =
+                    serde_json::to_vec(&self.dtc_entries).unwrap_or_else(|_| b"[]".to_vec());
+                Packet::new(Cmd::DtcList, payload)
+            }
+            Cmd::ClearDtc => {
+                self.dtc_entries.clear();
+                Packet::new(Cmd::Ack, vec![])
+            }
             Cmd::GetOutputTestDirectory => Packet::new(
                 Cmd::OutputTestDirectory,
                 encode_output_test_directory_payload(&OUTPUT_TEST_DIRECTORY),
             ),
+            Cmd::RunOutputTest => {
+                if packet.payload.len() < 2 {
+                    return nack(RuntimeNackCode::MalformedPayload, "bad output-test payload");
+                }
+                let channel = packet.payload[0];
+                let known_channel = OUTPUT_TEST_DIRECTORY
+                    .iter()
+                    .any(|entry| entry.channel == channel);
+                if !known_channel {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "unknown output-test channel",
+                    );
+                }
+                Packet::new(Cmd::Ack, vec![])
+            }
             Cmd::GetSensorRawDirectory => Packet::new(
                 Cmd::SensorRawDirectory,
                 encode_sensor_raw_directory_payload(&SENSOR_RAW_DIRECTORY),
@@ -430,6 +656,55 @@ impl FirmwareRuntime {
                 },
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad burn-page payload"),
             },
+            Cmd::EnterBootloader => {
+                self.flash_session_active = true;
+                self.flash_next_block = 0;
+                self.flash_buffer.clear();
+                Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::FlashBlock => {
+                if !self.flash_session_active {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash session not started",
+                    );
+                }
+                if packet.payload.len() < 4 {
+                    return nack(RuntimeNackCode::MalformedPayload, "bad flash-block payload");
+                }
+                let block_index = u32::from_be_bytes([
+                    packet.payload[0],
+                    packet.payload[1],
+                    packet.payload[2],
+                    packet.payload[3],
+                ]);
+                if block_index != self.flash_next_block {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "unexpected flash block index",
+                    );
+                }
+                self.flash_buffer.extend_from_slice(&packet.payload[4..]);
+                self.flash_next_block = self.flash_next_block.saturating_add(1);
+                Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::FlashVerify => {
+                if !self.flash_session_active || self.flash_buffer.is_empty() {
+                    return nack(RuntimeNackCode::MalformedPayload, "nothing to verify");
+                }
+                Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::FlashComplete => {
+                if !self.flash_session_active {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash session not started",
+                    );
+                }
+                self.flash_session_active = false;
+                self.flash_next_block = 0;
+                Packet::new(Cmd::Ack, vec![])
+            }
             _ => nack(
                 RuntimeNackCode::UnsupportedCommand,
                 "command not implemented",
@@ -453,12 +728,13 @@ mod tests {
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
         decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
         decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
-        decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
         decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request, Cmd, Packet,
     };
     use crate::ConfigPage;
+    use serde_json::Value;
 
     use super::FirmwareRuntime;
 
@@ -500,6 +776,92 @@ mod tests {
         let burn = runtime.handle_packet(Packet::new(Cmd::BurnPage, encode_page_request(0)));
         assert_eq!(burn.cmd, Cmd::Ack);
         assert_eq!(decode_ack_payload(&burn.payload).unwrap(), (0, false));
+    }
+
+    #[test]
+    fn runtime_table_read_write_and_cell_update() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let baseline = runtime.handle_packet(Packet::new(Cmd::ReadTable, vec![0x03]));
+        assert_eq!(baseline.cmd, Cmd::TableData);
+        let mut decoded = decode_raw_table_payload(&baseline.payload).unwrap();
+        let original_cell = decoded.data[0];
+
+        decoded.data[0] = original_cell.wrapping_add(11);
+        let write = runtime.handle_packet(Packet::new(Cmd::WriteTable, decoded.to_payload()));
+        assert_eq!(write.cmd, Cmd::Ack);
+
+        let cell_write =
+            runtime.handle_packet(Packet::new(Cmd::WriteCell, vec![0x03, 2, 1, 0x12, 0x34]));
+        assert_eq!(cell_write.cmd, Cmd::Ack);
+
+        let after = runtime.handle_packet(Packet::new(Cmd::ReadTable, vec![0x03]));
+        let after_decoded = decode_raw_table_payload(&after.payload).unwrap();
+        assert_eq!(after_decoded.data[0], original_cell.wrapping_add(11));
+        let offset = 1 * after_decoded.x_count as usize + 2;
+        assert_eq!(after_decoded.data[offset], 0x1234);
+    }
+
+    #[test]
+    fn runtime_reports_and_clears_dtcs() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let dtc = runtime.handle_packet(Packet::new(Cmd::GetDtc, vec![]));
+        assert_eq!(dtc.cmd, Cmd::DtcList);
+        let parsed: Value = serde_json::from_slice(&dtc.payload).unwrap();
+        let dtcs = parsed.as_array().unwrap();
+        assert!(!dtcs.is_empty());
+
+        let clear = runtime.handle_packet(Packet::new(Cmd::ClearDtc, vec![]));
+        assert_eq!(clear.cmd, Cmd::Ack);
+
+        let dtc_after = runtime.handle_packet(Packet::new(Cmd::GetDtc, vec![]));
+        let parsed_after: Value = serde_json::from_slice(&dtc_after.payload).unwrap();
+        assert_eq!(parsed_after.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn runtime_output_test_validates_channel_directory() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let ok = runtime.handle_packet(Packet::new(Cmd::RunOutputTest, vec![25, 0x01, 0x00, 0x00]));
+        assert_eq!(ok.cmd, Cmd::Ack);
+
+        let bad =
+            runtime.handle_packet(Packet::new(Cmd::RunOutputTest, vec![99, 0x01, 0x00, 0x00]));
+        let (code, reason) = decode_nack_payload(&bad.payload).unwrap();
+        assert_eq!(bad.cmd, Cmd::Nack);
+        assert_eq!(code, 2);
+        assert!(reason.contains("channel"));
+    }
+
+    #[test]
+    fn runtime_flash_lifecycle_requires_ordered_blocks() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let without_session =
+            runtime.handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 0, 0xAA, 0xBB]));
+        assert_eq!(without_session.cmd, Cmd::Nack);
+
+        let start = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(start.cmd, Cmd::Ack);
+
+        let block0 = runtime.handle_packet(Packet::new(
+            Cmd::FlashBlock,
+            vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC],
+        ));
+        assert_eq!(block0.cmd, Cmd::Ack);
+
+        let out_of_order =
+            runtime.handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 2, 0x01]));
+        assert_eq!(out_of_order.cmd, Cmd::Nack);
+
+        let block1 =
+            runtime.handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 1, 0xDD, 0xEE]));
+        assert_eq!(block1.cmd, Cmd::Ack);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![]));
+        assert_eq!(verify.cmd, Cmd::Ack);
+        let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
+        assert_eq!(complete.cmd, Cmd::Ack);
     }
 
     #[test]
@@ -588,12 +950,18 @@ mod tests {
         assert_eq!(directory.cmd, Cmd::SensorRawDirectory);
         assert!(channels.iter().any(|entry| entry.key == "clt"));
         assert!(channels.iter().any(|entry| entry.pin_label == "VBATT"));
+        assert!(channels.iter().any(|entry| entry.key == "wideband"));
+        assert!(channels.iter().any(|entry| entry.key == "flex_fuel"));
 
         let sample = runtime.handle_packet(Packet::new(Cmd::GetSensorRaw, vec![4]));
         let decoded_sample = decode_sensor_raw_payload(&sample.payload).unwrap();
         assert_eq!(sample.cmd, Cmd::SensorRaw);
         assert!(decoded_sample.adc > 0);
         assert!(decoded_sample.voltage > 0.0);
+
+        let wideband_sample = runtime.handle_packet(Packet::new(Cmd::GetSensorRaw, vec![8]));
+        let decoded_wideband = decode_sensor_raw_payload(&wideband_sample.payload).unwrap();
+        assert!(decoded_wideband.voltage > 0.0);
     }
 
     #[test]
@@ -628,6 +996,8 @@ mod tests {
         let presets = decode_trigger_decoder_directory_payload(&directory.payload).unwrap();
         assert_eq!(directory.cmd, Cmd::TriggerDecoderDirectory);
         assert!(presets.iter().any(|preset| preset.key == "honda_k20_12_1"));
+        assert!(presets.iter().any(|preset| preset.key == "subaru_6_7"));
+        assert!(presets.iter().any(|preset| preset.key == "mitsubishi_4g63"));
         assert!(presets
             .iter()
             .any(|preset| preset.pattern_kind == "missing_tooth"));

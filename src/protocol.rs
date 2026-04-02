@@ -41,8 +41,19 @@ pub enum Cmd {
     PageStatuses = 0x2D,
     GetNetworkProfile = 0x2E,
     NetworkProfile = 0x2F,
+    ReadTable = 0x30,
+    TableData = 0x31,
+    WriteTable = 0x32,
+    WriteCell = 0x33,
+    ReadCurve = 0x34,
+    CurveData = 0x35,
+    WriteCurve = 0x36,
+    GetDtc = 0x40,
+    DtcList = 0x41,
+    ClearDtc = 0x42,
     GetSensorRaw = 0x43,
     SensorRaw = 0x44,
+    RunOutputTest = 0x45,
     GetOutputTestDirectory = 0x46,
     OutputTestDirectory = 0x47,
     GetSensorRawDirectory = 0x48,
@@ -53,6 +64,14 @@ pub enum Cmd {
     TriggerCapture = 0x4D,
     GetTriggerDecoderDirectory = 0x4E,
     TriggerDecoderDirectory = 0x4F,
+    EnterBootloader = 0x50,
+    FlashBlock = 0x51,
+    FlashBlockAck = 0x52,
+    FlashVerify = 0x53,
+    FlashComplete = 0x54,
+    LogStart = 0x60,
+    LogStop = 0x61,
+    LogStatus = 0x62,
     GetTriggerToothLog = 0x70,
     TriggerToothLog = 0x71,
     GetPinAssignments = 0x6A,
@@ -91,8 +110,19 @@ impl TryFrom<u8> for Cmd {
             0x2D => Ok(Self::PageStatuses),
             0x2E => Ok(Self::GetNetworkProfile),
             0x2F => Ok(Self::NetworkProfile),
+            0x30 => Ok(Self::ReadTable),
+            0x31 => Ok(Self::TableData),
+            0x32 => Ok(Self::WriteTable),
+            0x33 => Ok(Self::WriteCell),
+            0x34 => Ok(Self::ReadCurve),
+            0x35 => Ok(Self::CurveData),
+            0x36 => Ok(Self::WriteCurve),
+            0x40 => Ok(Self::GetDtc),
+            0x41 => Ok(Self::DtcList),
+            0x42 => Ok(Self::ClearDtc),
             0x43 => Ok(Self::GetSensorRaw),
             0x44 => Ok(Self::SensorRaw),
+            0x45 => Ok(Self::RunOutputTest),
             0x46 => Ok(Self::GetOutputTestDirectory),
             0x47 => Ok(Self::OutputTestDirectory),
             0x48 => Ok(Self::GetSensorRawDirectory),
@@ -103,6 +133,14 @@ impl TryFrom<u8> for Cmd {
             0x4D => Ok(Self::TriggerCapture),
             0x4E => Ok(Self::GetTriggerDecoderDirectory),
             0x4F => Ok(Self::TriggerDecoderDirectory),
+            0x50 => Ok(Self::EnterBootloader),
+            0x51 => Ok(Self::FlashBlock),
+            0x52 => Ok(Self::FlashBlockAck),
+            0x53 => Ok(Self::FlashVerify),
+            0x54 => Ok(Self::FlashComplete),
+            0x60 => Ok(Self::LogStart),
+            0x61 => Ok(Self::LogStop),
+            0x62 => Ok(Self::LogStatus),
             0x70 => Ok(Self::GetTriggerToothLog),
             0x71 => Ok(Self::TriggerToothLog),
             0x6A => Ok(Self::GetPinAssignments),
@@ -196,6 +234,37 @@ pub struct DecodedPagePayload {
     pub page_id: u8,
     pub payload_crc: u32,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTablePayload {
+    pub table_id: u8,
+    pub x_count: u8,
+    pub y_count: u8,
+    pub x_bins: Vec<u16>,
+    pub y_bins: Vec<u16>,
+    pub data: Vec<u16>,
+}
+
+impl RawTablePayload {
+    pub fn to_payload(&self) -> Vec<u8> {
+        let x_count = self.x_count as usize;
+        let y_count = self.y_count as usize;
+        let mut out = Vec::with_capacity(3 + x_count * 2 + y_count * 2 + x_count * y_count * 2);
+        out.push(self.table_id);
+        out.push(self.x_count);
+        out.push(self.y_count);
+        for value in &self.x_bins {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in &self.y_bins {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in &self.data {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -957,7 +1026,8 @@ pub fn decode_trigger_decoder_directory_payload(
         }
         let requires_secondary = payload[offset] != 0;
         let supports_sequential = payload[offset + 1] != 0;
-        let expected_engine_cycle_deg = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+        let expected_engine_cycle_deg =
+            u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
         offset += 4;
         let key = read_string(payload, &mut offset)?;
         let label = read_string(payload, &mut offset)?;
@@ -1426,6 +1496,49 @@ pub fn decode_page_payload(payload: &[u8]) -> Result<DecodedPagePayload, Protoco
     })
 }
 
+pub fn decode_raw_table_payload(payload: &[u8]) -> Result<RawTablePayload, ProtocolError> {
+    if payload.len() < 3 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let table_id = payload[0];
+    let x_count = payload[1] as usize;
+    let y_count = payload[2] as usize;
+    let expected_words = x_count + y_count + (x_count * y_count);
+    let expected_len = 3 + expected_words * 2;
+    if payload.len() != expected_len {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let mut offset = 3usize;
+    let mut x_bins = Vec::with_capacity(x_count);
+    for _ in 0..x_count {
+        x_bins.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+        offset += 2;
+    }
+
+    let mut y_bins = Vec::with_capacity(y_count);
+    for _ in 0..y_count {
+        y_bins.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+        offset += 2;
+    }
+
+    let mut data = Vec::with_capacity(x_count * y_count);
+    for _ in 0..(x_count * y_count) {
+        data.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+        offset += 2;
+    }
+
+    Ok(RawTablePayload {
+        table_id,
+        x_count: x_count as u8,
+        y_count: y_count as u8,
+        x_bins,
+        y_bins,
+        data,
+    })
+}
+
 pub fn simulator_identity_payload() -> Vec<u8> {
     encode_identity_payload(&FirmwareIdentity::simulator(), &base_capabilities(true))
 }
@@ -1517,7 +1630,7 @@ mod tests {
         decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
         decode_output_test_directory_payload, decode_page_payload, decode_page_request,
         decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-        decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
+        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_table_metadata_payload, decode_trigger_capture_payload,
         decode_trigger_decoder_directory_payload, decode_trigger_tooth_log_payload,
         encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
@@ -1525,11 +1638,10 @@ mod tests {
         encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
         encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
         encode_pin_directory_payload, encode_sensor_raw_directory_payload,
-        encode_sensor_raw_payload, encode_table_directory_payload,
-        encode_table_metadata_payload, encode_trigger_capture_payload,
-        encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
-        DecodedPinAssignment, OutputTestDirectoryEntry, Packet, ProtocolError,
-        SensorRawDirectoryEntry,
+        encode_sensor_raw_payload, encode_table_directory_payload, encode_table_metadata_payload,
+        encode_trigger_capture_payload, encode_trigger_decoder_directory_payload,
+        encode_trigger_tooth_log_payload, Cmd, DecodedPinAssignment, OutputTestDirectoryEntry,
+        Packet, ProtocolError, RawTablePayload, SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -1605,6 +1717,21 @@ mod tests {
         let decoded = decode_page_payload(&payload).unwrap();
         assert_eq!(decoded.page_id, 2);
         assert_eq!(decoded.payload, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn raw_table_payload_roundtrip() {
+        let table = RawTablePayload {
+            table_id: 0x03,
+            x_count: 4,
+            y_count: 2,
+            x_bins: vec![500, 1000, 1500, 2000],
+            y_bins: vec![200, 800],
+            data: vec![10, 20, 30, 40, 50, 60, 70, 80],
+        };
+        let payload = table.to_payload();
+        let decoded = decode_raw_table_payload(&payload).unwrap();
+        assert_eq!(decoded, table);
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub struct TriggerToothLog {
     pub secondary_event_indexes: Vec<u16>,
 }
 
-pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
+pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 9] = [
     TriggerDecoderPreset {
         key: "generic_60_2",
         label: "Generic 60-2 + Home",
@@ -70,7 +70,8 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
         sync_strategy: "missing_tooth_plus_home",
         primary_pattern_hint: "60-2 crank wheel on the primary input",
         secondary_pattern_hint: Some("Single home or cam-sync event every 720 deg"),
-        reference_description: "Locks on the missing-tooth gap and confirms engine phase from the home input.",
+        reference_description:
+            "Locks on the missing-tooth gap and confirms engine phase from the home input.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -89,7 +90,8 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
         sync_strategy: "ckp_plus_cmp_phase",
         primary_pattern_hint: "12 CKP windows on the crank pattern",
         secondary_pattern_hint: Some("Honda K cam and TDC phase windows"),
-        reference_description: "Uses CKP window timing plus CMP phase windows to identify the full engine cycle.",
+        reference_description:
+            "Uses CKP window timing plus CMP phase windows to identify the full engine cycle.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -108,7 +110,8 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
         sync_strategy: "ckp_plus_cmp_phase",
         primary_pattern_hint: "36-2-2-2 crank pattern on the NE input",
         secondary_pattern_hint: Some("Toyota G cam phase pulses"),
-        reference_description: "Uses the NE gap structure and G cam pulses to synchronize crank position and phase.",
+        reference_description:
+            "Uses the NE gap structure and G cam pulses to synchronize crank position and phase.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -127,7 +130,8 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
         sync_strategy: "ckp_plus_cmp_phase",
         primary_pattern_hint: "24x crank pattern on the primary input",
         secondary_pattern_hint: Some("Single cam-sync event per engine cycle"),
-        reference_description: "Synchronizes from the 24x crank pattern and validates engine phase from cam sync.",
+        reference_description:
+            "Synchronizes from the 24x crank pattern and validates engine phase from cam sync.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -146,7 +150,85 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 5] = [
         sync_strategy: "dual_track_cas",
         primary_pattern_hint: "360-slot outer optical track",
         secondary_pattern_hint: Some("Inner optical sync track"),
-        reference_description: "Combines outer-track position events with inner-track sync slots for full phase lock.",
+        reference_description:
+            "Combines outer-track position events with inner-track sync slots for full phase lock.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "subaru_6_7",
+        label: "Subaru 6/7",
+        family: "Subaru EJ",
+        decoder: "oem_subaru_6_7",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (6-tooth)",
+        secondary_input_label: Some("Cam (7-window)"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "ckp_plus_cmp_phase",
+        primary_pattern_hint: "Subaru 6-slot crank pattern on CKP",
+        secondary_pattern_hint: Some("Subaru 7-window cam phase pattern"),
+        reference_description: "Combines Subaru crank and cam windows for phase-accurate sync.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "mitsubishi_4g63",
+        label: "Mitsubishi 4G63",
+        family: "Mitsubishi EVO",
+        decoder: "oem_4g63_cam_crank",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (CAS primary)",
+        secondary_input_label: Some("Cam (CAS phase)"),
+        primary_sensor_kind: "optical",
+        secondary_sensor_kind: Some("optical"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "dual_track_cas",
+        primary_pattern_hint: "4G63 optical/cas primary track",
+        secondary_pattern_hint: Some("4G63 phase track for cylinder identification"),
+        reference_description:
+            "Uses the Mitsubishi CAS dual-track arrangement for full engine phase lock.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "mazda_36_2_1",
+        label: "Mazda 36-2-1",
+        family: "Mazda MZR",
+        decoder: "oem_mazda_36_2_1",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (36-2-1)",
+        secondary_input_label: Some("Cam Sync"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "ckp_plus_cmp_phase",
+        primary_pattern_hint: "Mazda 36-2-1 CKP sequence",
+        secondary_pattern_hint: Some("Single CMP phase sync event"),
+        reference_description: "Identifies missing-tooth subgrouping and validates phase with CMP.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "ford_st170",
+        label: "Ford ST170",
+        family: "Ford Zetec",
+        decoder: "oem_ford_st170",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (36-1)",
+        secondary_input_label: Some("Cam Sync"),
+        primary_sensor_kind: "vr",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "missing_tooth_plus_home",
+        primary_pattern_hint: "Ford 36-1 crank wheel",
+        secondary_pattern_hint: Some("Single cam event per cycle"),
+        reference_description: "Uses the 36-1 crank gap and cam-home event to synchronize phase.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -203,5 +285,32 @@ pub fn sample_trigger_tooth_log() -> TriggerToothLog {
         dominant_gap_ratio: 1.0,
         tooth_intervals_us: vec![697, 699, 701, 700, 698, 701, 699, 700, 702, 698, 700, 701],
         secondary_event_indexes: vec![2, 8],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SUPPORTED_TRIGGER_DECODERS;
+
+    #[test]
+    fn decoder_catalog_includes_wave1_oem_families() {
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "honda_k20_12_1"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "toyota_36_2_2_2"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "nissan_360_slot"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "gm_24x"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "subaru_6_7"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "mitsubishi_4g63"));
     }
 }
