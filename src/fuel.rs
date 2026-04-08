@@ -260,13 +260,16 @@ impl WallWettingState {
         // film_dot = x_evap * film - (1-x) * m_inj
         // Where x_evap = 1/tau
         let m_inj = base_pw_ms; // treat pw as proxy for injected mass
-        let evap = self.film_mass_mg / tau_ms * dt_ms;
-        let deposit = (1.0 - x) * m_inj;
-        let cylinder_fuel = x * m_inj + evap; // fuel that reaches cylinder
+        // SAFETY: tau_ms guaranteed ≥ 0.25 by wall_wetting_tau(). Extra clamp for direct calls.
+        let safe_tau = tau_ms.max(0.25);
+        let evap = self.film_mass_mg / safe_tau * dt_ms;
+        let deposit = (1.0 - x.clamp(0.0, 1.0)) * m_inj;
+        let cylinder_fuel = x.clamp(0.0, 1.0) * m_inj + evap; // fuel that reaches cylinder
         self.film_mass_mg = (self.film_mass_mg - evap + deposit).max(0.0);
-        // Correction factor: we want base_pw worth of fuel in cylinder
-        if cylinder_fuel > 0.001 {
-            base_pw_ms * base_pw_ms / cylinder_fuel
+        // Correction factor: clamp denominator to avoid division by near-zero or NaN
+        let denom = cylinder_fuel.max(base_pw_ms * 0.01).max(0.001);
+        if base_pw_ms > 0.001 {
+            (base_pw_ms * base_pw_ms / denom).clamp(base_pw_ms * 0.5, base_pw_ms * 3.0)
         } else {
             base_pw_ms
         }
@@ -442,7 +445,9 @@ fn wall_wetting_tau(clt_c: f32, base_tau_ms: f32) -> f32 {
     } else {
         (1.0 - (clt_c - 20.0) / 80.0).max(0.5)
     };
-    base_tau_ms * factor
+    // SAFETY: clamp tau ≥ 0.25 ms — prevents division-by-zero in WallWettingState::update()
+    // At extreme hot (>100°C) factor could theoretically reach 0; clamp ensures safe evap calc.
+    (base_tau_ms * factor).max(0.25)
 }
 
 #[cfg(test)]
@@ -512,6 +517,29 @@ mod tests {
             state.update(3.0, 80.0, 0.3, 10.0);
         }
         assert!(state.film_mass_mg > 0.0);
+    }
+
+    #[test]
+    fn wall_wetting_tau_extreme_cold_is_safe() {
+        // At -40°C, factor = 1 + (20-(-40))/20 = 4.0 → tau = 80*4 = 320ms — no issue
+        let tau = wall_wetting_tau(-40.0, 80.0);
+        assert!(tau >= 0.25, "tau should never go below 0.25ms, got {tau}");
+        assert!(tau > 100.0, "at -40°C tau should be large (>100ms), got {tau}");
+    }
+
+    #[test]
+    fn wall_wetting_tau_extreme_hot_clamped() {
+        // At 200°C (beyond engine range), factor could go very low — must be clamped
+        let tau = wall_wetting_tau(200.0, 80.0);
+        assert!(tau >= 0.25, "tau must be >= 0.25ms even at extreme temp, got {tau}");
+    }
+
+    #[test]
+    fn wall_wetting_update_no_nan_or_inf() {
+        let mut state = WallWettingState::default();
+        // Edge case: tiny base_pw
+        let result = state.update(0.0001, 0.3, 0.5, 5.0);
+        assert!(result.is_finite(), "result should be finite, got {result}");
     }
 
     #[test]

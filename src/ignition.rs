@@ -296,6 +296,20 @@ mod tests {
     }
 
     #[test]
+    fn deg_to_ns_zero_rpm_returns_zero() {
+        // rpm < 1.0 → guard returns 0 (engine stalled, no scheduling)
+        assert_eq!(IgnitionScheduler::deg_to_ns(10.0, 0.0), 0);
+        assert_eq!(IgnitionScheduler::deg_to_ns(10.0, 0.5), 0);
+    }
+
+    #[test]
+    fn deg_to_ns_reasonable_range() {
+        // At 1000 RPM, 10° BTDC ≈ 1.67ms = 1,666,667 ns
+        let ns = IgnitionScheduler::deg_to_ns(10.0, 1000.0);
+        assert!(ns > 1_000_000 && ns < 2_500_000, "1000 RPM 10° should be ~1.67ms, got {ns}ns");
+    }
+
+    #[test]
     fn cranking_mode_uses_fixed_advance() {
         let config = IgnitionConfig::default();
         let sched = IgnitionScheduler::new(config);

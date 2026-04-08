@@ -310,8 +310,8 @@ pub const TABLE_DIRECTORY: [TableDirectoryEntry; 8] = [
     TableDirectoryEntry {
         id: 0x04,
         key: "vvt_b1_intake",
-        x_count: 32,
-        y_count: 32,
+        x_count: 8,   // VvtTargetTable in vvt.rs is 8×8
+        y_count: 8,
         signed: true,
         x_scale: 1,
         y_scale: 10,
@@ -327,8 +327,8 @@ pub const TABLE_DIRECTORY: [TableDirectoryEntry; 8] = [
     TableDirectoryEntry {
         id: 0x05,
         key: "vvt_b1_exhaust",
-        x_count: 32,
-        y_count: 32,
+        x_count: 8,   // VvtTargetTable in vvt.rs is 8×8
+        y_count: 8,
         signed: true,
         x_scale: 1,
         y_scale: 10,
