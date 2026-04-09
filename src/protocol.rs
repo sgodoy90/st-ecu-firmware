@@ -2046,4 +2046,87 @@ mod tests {
                 && link.classes.contains(&MessageClass::FirmwareUpdate)
         }));
     }
+
+    #[test]
+    fn cmd_values_are_stable_for_shared_contract() {
+        assert_eq!(Cmd::Ping as u8, 0x01);
+        assert_eq!(Cmd::Pong as u8, 0x02);
+        assert_eq!(Cmd::GetVersion as u8, 0x03);
+        assert_eq!(Cmd::VersionResponse as u8, 0x04);
+        assert_eq!(Cmd::GetCapabilities as u8, 0x05);
+        assert_eq!(Cmd::Capabilities as u8, 0x06);
+        assert_eq!(Cmd::GetLiveData as u8, 0x07);
+        assert_eq!(Cmd::LiveData as u8, 0x08);
+
+        assert_eq!(Cmd::ReadPage as u8, 0x20);
+        assert_eq!(Cmd::PageData as u8, 0x21);
+        assert_eq!(Cmd::WritePage as u8, 0x22);
+        assert_eq!(Cmd::BurnPage as u8, 0x23);
+        assert_eq!(Cmd::GetPageDirectory as u8, 0x24);
+        assert_eq!(Cmd::PageDirectory as u8, 0x25);
+        assert_eq!(Cmd::GetTableDirectory as u8, 0x26);
+        assert_eq!(Cmd::TableDirectory as u8, 0x27);
+        assert_eq!(Cmd::GetPinDirectory as u8, 0x28);
+        assert_eq!(Cmd::PinDirectory as u8, 0x29);
+        assert_eq!(Cmd::GetTableMetadata as u8, 0x2A);
+        assert_eq!(Cmd::TableMetadata as u8, 0x2B);
+        assert_eq!(Cmd::GetPageStatuses as u8, 0x2C);
+        assert_eq!(Cmd::PageStatuses as u8, 0x2D);
+        assert_eq!(Cmd::GetNetworkProfile as u8, 0x2E);
+        assert_eq!(Cmd::NetworkProfile as u8, 0x2F);
+
+        assert_eq!(Cmd::ReadTable as u8, 0x30);
+        assert_eq!(Cmd::TableData as u8, 0x31);
+        assert_eq!(Cmd::WriteTable as u8, 0x32);
+        assert_eq!(Cmd::WriteCell as u8, 0x33);
+        assert_eq!(Cmd::ReadCurve as u8, 0x34);
+        assert_eq!(Cmd::CurveData as u8, 0x35);
+        assert_eq!(Cmd::WriteCurve as u8, 0x36);
+
+        assert_eq!(Cmd::GetDtc as u8, 0x40);
+        assert_eq!(Cmd::DtcList as u8, 0x41);
+        assert_eq!(Cmd::ClearDtc as u8, 0x42);
+        assert_eq!(Cmd::GetSensorRaw as u8, 0x43);
+        assert_eq!(Cmd::SensorRaw as u8, 0x44);
+        assert_eq!(Cmd::RunOutputTest as u8, 0x45);
+        assert_eq!(Cmd::GetOutputTestDirectory as u8, 0x46);
+        assert_eq!(Cmd::OutputTestDirectory as u8, 0x47);
+        assert_eq!(Cmd::GetSensorRawDirectory as u8, 0x48);
+        assert_eq!(Cmd::SensorRawDirectory as u8, 0x49);
+        assert_eq!(Cmd::GetFreezeFrames as u8, 0x4A);
+        assert_eq!(Cmd::FreezeFrames as u8, 0x4B);
+        assert_eq!(Cmd::GetTriggerCapture as u8, 0x4C);
+        assert_eq!(Cmd::TriggerCapture as u8, 0x4D);
+        assert_eq!(Cmd::GetTriggerDecoderDirectory as u8, 0x4E);
+        assert_eq!(Cmd::TriggerDecoderDirectory as u8, 0x4F);
+
+        assert_eq!(Cmd::EnterBootloader as u8, 0x50);
+        assert_eq!(Cmd::FlashBlock as u8, 0x51);
+        assert_eq!(Cmd::FlashBlockAck as u8, 0x52);
+        assert_eq!(Cmd::FlashVerify as u8, 0x53);
+        assert_eq!(Cmd::FlashComplete as u8, 0x54);
+
+        assert_eq!(Cmd::LogStart as u8, 0x60);
+        assert_eq!(Cmd::LogStop as u8, 0x61);
+        assert_eq!(Cmd::LogStatus as u8, 0x62);
+
+        assert_eq!(Cmd::GetPinAssignments as u8, 0x6A);
+        assert_eq!(Cmd::PinAssignments as u8, 0x6B);
+        assert_eq!(Cmd::GetTriggerToothLog as u8, 0x70);
+        assert_eq!(Cmd::TriggerToothLog as u8, 0x71);
+
+        assert_eq!(Cmd::Ack as u8, 0xA0);
+        assert_eq!(Cmd::Nack as u8, 0xA1);
+        assert_eq!(Cmd::Error as u8, 0xFF);
+    }
+
+    #[test]
+    fn runtime_rejects_desktop_legacy_bridge_command_ids() {
+        for code in [0x10u8, 0x11, 0x12, 0x13, 0x14, 0x63, 0x64, 0x65] {
+            assert!(matches!(
+                Cmd::try_from(code),
+                Err(ProtocolError::UnknownCmd(v)) if v == code
+            ));
+        }
+    }
 }
