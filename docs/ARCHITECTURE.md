@@ -14,6 +14,8 @@ Desktop defines presentation and workflow.
 6. `engine`
 7. `diagnostics`
 8. `protection`
+9. `tcu_bridge`
+10. `wideband_controller`
 
 ## Deliverable For First Real Embedded Milestone
 - version response
@@ -21,6 +23,20 @@ Desktop defines presentation and workflow.
 - capability list
 - live-data frame with deterministic layout
 - page read/write/burn on a known board target
+
+## New Contract Tracks (2026-04-09)
+
+### External TCU profile (TurboLamik-inspired reference)
+- firmware capability key for external TCU integration profile
+- explicit RX/TX schema with rate checks, timeout handling, and safety fallbacks
+- torque-intervention arbitration layer so transmission requests are handled deterministically
+- runtime diagnostics for stream freshness, request validity, and shift/adaptation states
+
+### Integrated wideband controller (`L9780TR`)
+- dedicated wideband-controller ownership in firmware (SPI/service lifecycle)
+- heater-state and controller-fault diagnostics surfaced into transport/diagnostics
+- mode negotiation for integrated-controller vs external-CAN wideband vs analog fallback
+- calibration schema tied to declared controller mode so desktop does not guess behavior
 
 ## Bootstrap Already Landed
 - selected `STM32H743ZG` MCU matrix for the current pin subset, separated from

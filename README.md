@@ -27,6 +27,8 @@ This first scaffold is intentionally architecture-first:
 - packet framing and page payload encoding
 - versioned config RAM/flash staging with per-page image headers, CRC, and burn semantics
 - runtime trigger diagnostics contract including decoder directory, scope capture, and tooth logging
+- external TCU bridge planning baseline (TurboLamik-inspired profile contract)
+- integrated wideband-controller planning baseline (`L9780TR`)
 - protection, reset reason, diagnostics, and transport module boundaries
 
 This is not yet MCU bring-up. The next implementation milestone is:
@@ -60,6 +62,8 @@ This repository should eventually own the runtime implementation of those contra
 - `protection`: safety and limp policy boundaries
 - `reset_reason`: reset/brownout/watchdog reason model
 - `transport`: USB/CAN protocol boundaries
+- `tcu_bridge`: external transmission-profile contract and arbitration boundaries
+- `wideband_controller`: integrated controller ownership and diagnostics boundaries
 
 ## Immediate Next Tasks
 - add STM32H743 target and linker config
@@ -70,3 +74,5 @@ This repository should eventually own the runtime implementation of those contra
 - wire protocol packets into transport service
 - replace the versioned host flash-image backend with a real STM32H743 sector driver
 - implement version/identity response on real target
+- land first external-TCU capability + profile schema handshake
+- land integrated-wideband mode/capability contract for `L9780TR` path
