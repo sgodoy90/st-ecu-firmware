@@ -74,7 +74,12 @@
 /// 112 u8   rotational_idle_active_cylinders
 /// 113 u8   rotational_idle_gate_code
 /// 114 u8   rotational_idle_sync_guard_events
-/// 115-127 reserved (zeros)
+/// 115 u8   transmission_status_flags
+/// 116 u8   transmission_requested_gear
+/// 117 u8   transmission_torque_reduction_pct
+/// 118 u16  transmission_torque_reduction_timer_cs
+/// 120 u8   transmission_shift_result_code
+/// 121-127 reserved (zeros)
 /// Total: 128
 
 pub const LIVE_DATA_SIZE: usize = 128;
@@ -177,6 +182,13 @@ pub struct LiveDataFrame {
     pub rotational_idle_active_cylinders: u8,
     pub rotational_idle_gate_code: u8,
     pub rotational_idle_sync_guard_events: u8,
+
+    // Transmission / external TCU runtime telemetry
+    pub transmission_status_flags: u8,
+    pub transmission_requested_gear: u8,
+    pub transmission_torque_reduction_pct: u8,
+    pub transmission_torque_reduction_timer_cs: u16,
+    pub transmission_shift_result_code: u8,
 }
 
 impl LiveDataFrame {
@@ -337,9 +349,19 @@ impl LiveDataFrame {
         w8u!(self.rotational_idle_gate_code);
         // 114: rotational_idle_sync_guard_events  u8
         w8u!(self.rotational_idle_sync_guard_events);
-        // 115..127: reserved zeros (already zeroed by array init)
+        // 115: transmission_status_flags  u8
+        w8u!(self.transmission_status_flags);
+        // 116: transmission_requested_gear  u8
+        w8u!(self.transmission_requested_gear);
+        // 117: transmission_torque_reduction_pct  u8
+        w8u!(self.transmission_torque_reduction_pct);
+        // 118: transmission_torque_reduction_timer_cs  u16
+        w16u!(self.transmission_torque_reduction_timer_cs);
+        // 120: transmission_shift_result_code  u8
+        w8u!(self.transmission_shift_result_code);
+        // 121..127: reserved zeros (already zeroed by array init)
 
-        debug_assert_eq!(o, 115, "live_data encode offset drift: expected 115, got {o}");
+        debug_assert_eq!(o, 121, "live_data encode offset drift: expected 121, got {o}");
         b
     }
 
@@ -419,7 +441,12 @@ impl LiveDataFrame {
         let rotational_idle_active_cylinders = r8u!();
         let rotational_idle_gate_code = r8u!();
         let rotational_idle_sync_guard_events = r8u!();
-        debug_assert_eq!(o, 115, "live_data decode offset drift: expected 115, got {o}");
+        let transmission_status_flags = r8u!();
+        let transmission_requested_gear = r8u!();
+        let transmission_torque_reduction_pct = r8u!();
+        let transmission_torque_reduction_timer_cs = r16u!();
+        let transmission_shift_result_code = r8u!();
+        debug_assert_eq!(o, 121, "live_data decode offset drift: expected 121, got {o}");
 
         Self {
             timestamp_ms,
@@ -444,6 +471,11 @@ impl LiveDataFrame {
             rotational_idle_active_cylinders,
             rotational_idle_gate_code,
             rotational_idle_sync_guard_events,
+            transmission_status_flags,
+            transmission_requested_gear,
+            transmission_torque_reduction_pct,
+            transmission_torque_reduction_timer_cs,
+            transmission_shift_result_code,
         }
     }
 }
@@ -476,6 +508,13 @@ pub mod status {
     pub const OVERREV:         u32 = 1 << 23;
     pub const ROTATIONAL_IDLE_ACTIVE: u32 = 1 << 24;
     pub const ROTATIONAL_IDLE_ARMED: u32 = 1 << 25;
+}
+
+pub mod transmission_status {
+    pub const TCU_LINK_ONLINE: u8 = 1 << 0;
+    pub const SHIFT_IN_PROGRESS: u8 = 1 << 1;
+    pub const TORQUE_INTERVENTION_ACTIVE: u8 = 1 << 2;
+    pub const TORQUE_INTERVENTION_REQUESTED: u8 = 1 << 3;
 }
 
 // ─── Protect flag bits ────────────────────────────────────────────────────────
@@ -591,10 +630,29 @@ mod tests {
     }
 
     #[test]
+    fn transmission_runtime_roundtrip() {
+        let mut frame = LiveDataFrame::default();
+        frame.transmission_status_flags = transmission_status::TCU_LINK_ONLINE
+            | transmission_status::SHIFT_IN_PROGRESS
+            | transmission_status::TORQUE_INTERVENTION_ACTIVE;
+        frame.transmission_requested_gear = 4;
+        frame.transmission_torque_reduction_pct = 28;
+        frame.transmission_torque_reduction_timer_cs = 145;
+        frame.transmission_shift_result_code = 1;
+        let enc = frame.encode();
+        let dec = LiveDataFrame::decode(&enc);
+        assert_eq!(dec.transmission_status_flags, frame.transmission_status_flags);
+        assert_eq!(dec.transmission_requested_gear, 4);
+        assert_eq!(dec.transmission_torque_reduction_pct, 28);
+        assert_eq!(dec.transmission_torque_reduction_timer_cs, 145);
+        assert_eq!(dec.transmission_shift_result_code, 1);
+    }
+
+    #[test]
     fn reserved_bytes_are_zero() {
         let frame = LiveDataFrame::default();
         let enc = frame.encode();
-        for i in 115..128 {
+        for i in 121..128 {
             assert_eq!(enc[i], 0, "reserved byte {i} is not zero");
         }
     }
