@@ -79,7 +79,12 @@
 /// 117 u8   transmission_torque_reduction_pct
 /// 118 u16  transmission_torque_reduction_timer_cs
 /// 120 u8   transmission_shift_result_code
-/// 121-127 reserved (zeros)
+/// 121 u8   transmission_shift_request_counter
+/// 122 u8   transmission_shift_timeout_counter
+/// 123 u8   transmission_shift_fault_code
+/// 124 u8   transmission_state_code
+/// 125 u16  transmission_request_age_cs
+/// 127 u8   transmission_ack_counter
 /// Total: 128
 
 pub const LIVE_DATA_SIZE: usize = 128;
@@ -189,6 +194,12 @@ pub struct LiveDataFrame {
     pub transmission_torque_reduction_pct: u8,
     pub transmission_torque_reduction_timer_cs: u16,
     pub transmission_shift_result_code: u8,
+    pub transmission_shift_request_counter: u8,
+    pub transmission_shift_timeout_counter: u8,
+    pub transmission_shift_fault_code: u8,
+    pub transmission_state_code: u8,
+    pub transmission_request_age_cs: u16,
+    pub transmission_ack_counter: u8,
 }
 
 impl LiveDataFrame {
@@ -359,9 +370,20 @@ impl LiveDataFrame {
         w16u!(self.transmission_torque_reduction_timer_cs);
         // 120: transmission_shift_result_code  u8
         w8u!(self.transmission_shift_result_code);
-        // 121..127: reserved zeros (already zeroed by array init)
+        // 121: transmission_shift_request_counter  u8
+        w8u!(self.transmission_shift_request_counter);
+        // 122: transmission_shift_timeout_counter  u8
+        w8u!(self.transmission_shift_timeout_counter);
+        // 123: transmission_shift_fault_code  u8
+        w8u!(self.transmission_shift_fault_code);
+        // 124: transmission_state_code  u8
+        w8u!(self.transmission_state_code);
+        // 125: transmission_request_age_cs  u16
+        w16u!(self.transmission_request_age_cs);
+        // 127: transmission_ack_counter  u8
+        w8u!(self.transmission_ack_counter);
 
-        debug_assert_eq!(o, 121, "live_data encode offset drift: expected 121, got {o}");
+        debug_assert_eq!(o, 128, "live_data encode offset drift: expected 128, got {o}");
         b
     }
 
@@ -446,7 +468,13 @@ impl LiveDataFrame {
         let transmission_torque_reduction_pct = r8u!();
         let transmission_torque_reduction_timer_cs = r16u!();
         let transmission_shift_result_code = r8u!();
-        debug_assert_eq!(o, 121, "live_data decode offset drift: expected 121, got {o}");
+        let transmission_shift_request_counter = r8u!();
+        let transmission_shift_timeout_counter = r8u!();
+        let transmission_shift_fault_code = r8u!();
+        let transmission_state_code = r8u!();
+        let transmission_request_age_cs = r16u!();
+        let transmission_ack_counter = r8u!();
+        debug_assert_eq!(o, 128, "live_data decode offset drift: expected 128, got {o}");
 
         Self {
             timestamp_ms,
@@ -476,6 +504,12 @@ impl LiveDataFrame {
             transmission_torque_reduction_pct,
             transmission_torque_reduction_timer_cs,
             transmission_shift_result_code,
+            transmission_shift_request_counter,
+            transmission_shift_timeout_counter,
+            transmission_shift_fault_code,
+            transmission_state_code,
+            transmission_request_age_cs,
+            transmission_ack_counter,
         }
     }
 }
@@ -639,6 +673,12 @@ mod tests {
         frame.transmission_torque_reduction_pct = 28;
         frame.transmission_torque_reduction_timer_cs = 145;
         frame.transmission_shift_result_code = 1;
+        frame.transmission_shift_request_counter = 17;
+        frame.transmission_shift_timeout_counter = 2;
+        frame.transmission_shift_fault_code = 3;
+        frame.transmission_state_code = 4;
+        frame.transmission_request_age_cs = 188;
+        frame.transmission_ack_counter = 15;
         let enc = frame.encode();
         let dec = LiveDataFrame::decode(&enc);
         assert_eq!(dec.transmission_status_flags, frame.transmission_status_flags);
@@ -646,14 +686,20 @@ mod tests {
         assert_eq!(dec.transmission_torque_reduction_pct, 28);
         assert_eq!(dec.transmission_torque_reduction_timer_cs, 145);
         assert_eq!(dec.transmission_shift_result_code, 1);
+        assert_eq!(dec.transmission_shift_request_counter, 17);
+        assert_eq!(dec.transmission_shift_timeout_counter, 2);
+        assert_eq!(dec.transmission_shift_fault_code, 3);
+        assert_eq!(dec.transmission_state_code, 4);
+        assert_eq!(dec.transmission_request_age_cs, 188);
+        assert_eq!(dec.transmission_ack_counter, 15);
     }
 
     #[test]
-    fn reserved_bytes_are_zero() {
+    fn transmission_extension_defaults_zero() {
         let frame = LiveDataFrame::default();
         let enc = frame.encode();
         for i in 121..128 {
-            assert_eq!(enc[i], 0, "reserved byte {i} is not zero");
+            assert_eq!(enc[i], 0, "transmission extension byte {i} is not zero");
         }
     }
 }
