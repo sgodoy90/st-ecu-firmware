@@ -55,7 +55,7 @@ pub struct TriggerToothLog {
     pub secondary_event_indexes: Vec<u16>,
 }
 
-pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 9] = [
+pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 15] = [
     TriggerDecoderPreset {
         key: "generic_60_2",
         label: "Generic 60-2 + Home",
@@ -233,6 +233,126 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 9] = [
         requires_secondary: true,
         supports_sequential: true,
     },
+    TriggerDecoderPreset {
+        key: "gm_58x",
+        label: "GM LS 58x",
+        family: "GM Gen IV / V LS",
+        decoder: "oem_gm_58x",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank 58x",
+        secondary_input_label: Some("Cam Sync"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "ckp_plus_cmp_phase",
+        primary_pattern_hint: "GM 58x crank pattern on CKP",
+        secondary_pattern_hint: Some("Single cam-sync event per 720 deg"),
+        reference_description:
+            "Uses the GM 58x crank wheel and cam-sync pulse to lock crank position and phase.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "toyota_2jz_vvti",
+        label: "Toyota 2JZ VVT-i",
+        family: "Toyota JZ",
+        decoder: "oem_toyota_2jz_vvti",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (36-2)",
+        secondary_input_label: Some("Cam (VVT-i)"),
+        primary_sensor_kind: "vr",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "missing_tooth_plus_home",
+        primary_pattern_hint: "2JZ 36-2 crank wheel on NE input",
+        secondary_pattern_hint: Some("Single VVT-i cam phase event per cycle"),
+        reference_description:
+            "Combines 36-2 crank tooth timing with cam phase sync for full 720 deg lock.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "bmw_m54_60_2",
+        label: "BMW M54 / S54",
+        family: "BMW M5x/S5x",
+        decoder: "oem_bmw_m54_60_2",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (60-2)",
+        secondary_input_label: Some("Dual VANOS Cam"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "missing_tooth_plus_home",
+        primary_pattern_hint: "BMW 60-2 crank pattern",
+        secondary_pattern_hint: Some("Cam phase windows from VANOS cam sensors"),
+        reference_description:
+            "Uses 60-2 crank position and cam phase windows to resolve full cycle and phase.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "ford_coyote",
+        label: "Ford Coyote 5.0",
+        family: "Ford Modular Ti-VCT",
+        decoder: "oem_ford_coyote",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (36-1)",
+        secondary_input_label: Some("Dual Cam Sync"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "missing_tooth_plus_home",
+        primary_pattern_hint: "Ford 36-1 crank trigger",
+        secondary_pattern_hint: Some("Ti-VCT cam phase windows"),
+        reference_description:
+            "Locks from the 36-1 crank gap and validates cylinder phase from cam windows.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "subaru_ej_36_2_2_2",
+        label: "Subaru EJ 36-2-2-2",
+        family: "Subaru EJ Phase 2",
+        decoder: "oem_subaru_36_2_2_2",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (36-2-2-2)",
+        secondary_input_label: Some("Cam Phase"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "ckp_plus_cmp_phase",
+        primary_pattern_hint: "Subaru phase-2 36-2-2-2 CKP wheel",
+        secondary_pattern_hint: Some("Subaru cam phase windows"),
+        reference_description:
+            "Decodes Subaru phase-2 gap pattern and cam windows for sequential phase lock.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "nissan_vq_36_2_2_2",
+        label: "Nissan VQ 36-2-2-2",
+        family: "Nissan VQ",
+        decoder: "oem_nissan_vq_36_2_2_2",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (36-2-2-2)",
+        secondary_input_label: Some("Cam Phase"),
+        primary_sensor_kind: "hall",
+        secondary_sensor_kind: Some("hall"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "ckp_plus_cmp_phase",
+        primary_pattern_hint: "VQ crank wheel with 36-2-2-2 structure",
+        secondary_pattern_hint: Some("Nissan cam phase events"),
+        reference_description:
+            "Uses VQ crank gap grouping and cam phase pulses to keep stable sync and phase.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
 ];
 
 fn pulse_train(sample_count: usize, starts: &[usize], width: usize) -> Vec<u8> {
@@ -312,5 +432,23 @@ mod tests {
         assert!(SUPPORTED_TRIGGER_DECODERS
             .iter()
             .any(|preset| preset.key == "mitsubishi_4g63"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "gm_58x"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "toyota_2jz_vvti"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "bmw_m54_60_2"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "ford_coyote"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "subaru_ej_36_2_2_2"));
+        assert!(SUPPORTED_TRIGGER_DECODERS
+            .iter()
+            .any(|preset| preset.key == "nissan_vq_36_2_2_2"));
     }
 }
