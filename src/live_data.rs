@@ -69,7 +69,12 @@
 /// 104 u16  revolution_counter
 /// 106 u16  loops_per_sec
 /// 108 u8   free_heap_pct
-/// 109-127 reserved (zeros)
+/// 109 u8   rotational_idle_cut_pct
+/// 110 u16  rotational_idle_timer_cs
+/// 112 u8   rotational_idle_active_cylinders
+/// 113 u8   rotational_idle_gate_code
+/// 114 u8   rotational_idle_sync_guard_events
+/// 115-127 reserved (zeros)
 /// Total: 128
 
 pub const LIVE_DATA_SIZE: usize = 128;
@@ -165,6 +170,13 @@ pub struct LiveDataFrame {
     pub revolution_counter: u16,
     pub loops_per_sec: u16,
     pub free_heap_pct: u8,
+
+    // Rotational idle runtime telemetry
+    pub rotational_idle_cut_pct: u8,
+    pub rotational_idle_timer_cs: u16,
+    pub rotational_idle_active_cylinders: u8,
+    pub rotational_idle_gate_code: u8,
+    pub rotational_idle_sync_guard_events: u8,
 }
 
 impl LiveDataFrame {
@@ -315,9 +327,19 @@ impl LiveDataFrame {
         w16u!(self.loops_per_sec);
         // 108: free_heap_pct  u8
         w8u!(self.free_heap_pct);
-        // 109..127: reserved zeros (already zeroed by array init)
+        // 109: rotational_idle_cut_pct  u8
+        w8u!(self.rotational_idle_cut_pct);
+        // 110: rotational_idle_timer_cs  u16
+        w16u!(self.rotational_idle_timer_cs);
+        // 112: rotational_idle_active_cylinders  u8
+        w8u!(self.rotational_idle_active_cylinders);
+        // 113: rotational_idle_gate_code  u8
+        w8u!(self.rotational_idle_gate_code);
+        // 114: rotational_idle_sync_guard_events  u8
+        w8u!(self.rotational_idle_sync_guard_events);
+        // 115..127: reserved zeros (already zeroed by array init)
 
-        debug_assert_eq!(o, 109, "live_data encode offset drift: expected 109, got {o}");
+        debug_assert_eq!(o, 115, "live_data encode offset drift: expected 115, got {o}");
         b
     }
 
@@ -392,7 +414,12 @@ impl LiveDataFrame {
         let revolution_counter  = r16u!();
         let loops_per_sec       = r16u!();
         let free_heap_pct       = r8u!();
-        debug_assert_eq!(o, 109, "live_data decode offset drift: expected 109, got {o}");
+        let rotational_idle_cut_pct = r8u!();
+        let rotational_idle_timer_cs = r16u!();
+        let rotational_idle_active_cylinders = r8u!();
+        let rotational_idle_gate_code = r8u!();
+        let rotational_idle_sync_guard_events = r8u!();
+        debug_assert_eq!(o, 115, "live_data decode offset drift: expected 115, got {o}");
 
         Self {
             timestamp_ms,
@@ -412,6 +439,11 @@ impl LiveDataFrame {
             correction_iat, correction_clt, correction_baro, correction_flex,
             status_flags, protect_flags, error_flags,
             revolution_counter, loops_per_sec, free_heap_pct,
+            rotational_idle_cut_pct,
+            rotational_idle_timer_cs,
+            rotational_idle_active_cylinders,
+            rotational_idle_gate_code,
+            rotational_idle_sync_guard_events,
         }
     }
 }
@@ -442,6 +474,8 @@ pub mod status {
     pub const CHECK_ENGINE:    u32 = 1 << 21;
     pub const NEED_BURN:       u32 = 1 << 22;
     pub const OVERREV:         u32 = 1 << 23;
+    pub const ROTATIONAL_IDLE_ACTIVE: u32 = 1 << 24;
+    pub const ROTATIONAL_IDLE_ARMED: u32 = 1 << 25;
 }
 
 // ─── Protect flag bits ────────────────────────────────────────────────────────
@@ -504,10 +538,21 @@ mod tests {
     #[test]
     fn status_flags_roundtrip() {
         let mut frame = LiveDataFrame::default();
-        frame.status_flags = status::RUNNING | status::CLOSED_LOOP | status::CAN_ACTIVE;
+        frame.status_flags = status::RUNNING
+            | status::CLOSED_LOOP
+            | status::CAN_ACTIVE
+            | status::ROTATIONAL_IDLE_ACTIVE
+            | status::ROTATIONAL_IDLE_ARMED;
         let enc = frame.encode();
         let dec = LiveDataFrame::decode(&enc);
-        assert_eq!(dec.status_flags, status::RUNNING | status::CLOSED_LOOP | status::CAN_ACTIVE);
+        assert_eq!(
+            dec.status_flags,
+            status::RUNNING
+                | status::CLOSED_LOOP
+                | status::CAN_ACTIVE
+                | status::ROTATIONAL_IDLE_ACTIVE
+                | status::ROTATIONAL_IDLE_ARMED
+        );
     }
 
     #[test]
@@ -529,10 +574,27 @@ mod tests {
     }
 
     #[test]
+    fn rotational_idle_runtime_roundtrip() {
+        let mut frame = LiveDataFrame::default();
+        frame.rotational_idle_cut_pct = 42;
+        frame.rotational_idle_timer_cs = 315;
+        frame.rotational_idle_active_cylinders = 3;
+        frame.rotational_idle_gate_code = 8;
+        frame.rotational_idle_sync_guard_events = 2;
+        let enc = frame.encode();
+        let dec = LiveDataFrame::decode(&enc);
+        assert_eq!(dec.rotational_idle_cut_pct, 42);
+        assert_eq!(dec.rotational_idle_timer_cs, 315);
+        assert_eq!(dec.rotational_idle_active_cylinders, 3);
+        assert_eq!(dec.rotational_idle_gate_code, 8);
+        assert_eq!(dec.rotational_idle_sync_guard_events, 2);
+    }
+
+    #[test]
     fn reserved_bytes_are_zero() {
         let frame = LiveDataFrame::default();
         let enc = frame.encode();
-        for i in 109..128 {
+        for i in 115..128 {
             assert_eq!(enc[i], 0, "reserved byte {i} is not zero");
         }
     }

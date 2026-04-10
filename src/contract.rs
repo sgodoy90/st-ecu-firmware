@@ -26,6 +26,9 @@ pub enum Capability {
     UsbSerial,
     CanFd,
     WifiBridge,
+    ExternalTcu,
+    TorqueIntervention,
+    WidebandController,
     DisplayLink,
     DashboardFrames,
     Simulator,
@@ -65,6 +68,9 @@ impl Capability {
             Self::UsbSerial => 0x12,
             Self::CanFd => 0x13,
             Self::WifiBridge => 0x14,
+            Self::ExternalTcu => 0x1E,
+            Self::TorqueIntervention => 0x1F,
+            Self::WidebandController => 0x20,
             Self::DisplayLink => 0x15,
             Self::DashboardFrames => 0x16,
             Self::Simulator => 0x17,
@@ -99,6 +105,9 @@ impl Capability {
             Self::UsbSerial => "usb_serial",
             Self::CanFd => "can_fd",
             Self::WifiBridge => "wifi_bridge",
+            Self::ExternalTcu => "external_tcu",
+            Self::TorqueIntervention => "torque_intervention",
+            Self::WidebandController => "wideband_controller",
             Self::DisplayLink => "display_link",
             Self::DashboardFrames => "dashboard_frames",
             Self::Simulator => "simulator",
@@ -137,6 +146,9 @@ impl TryFrom<u8> for Capability {
             0x12 => Ok(Self::UsbSerial),
             0x13 => Ok(Self::CanFd),
             0x14 => Ok(Self::WifiBridge),
+            0x1E => Ok(Self::ExternalTcu),
+            0x1F => Ok(Self::TorqueIntervention),
+            0x20 => Ok(Self::WidebandController),
             0x15 => Ok(Self::DisplayLink),
             0x16 => Ok(Self::DashboardFrames),
             0x17 => Ok(Self::Simulator),
@@ -377,7 +389,7 @@ pub const TABLE_DIRECTORY: [TableDirectoryEntry; 8] = [
     },
 ];
 
-const BASE_CAPABILITIES: [Capability; 26] = [
+const BASE_CAPABILITIES: [Capability; 29] = [
     Capability::LiveData,
     Capability::PageRead,
     Capability::PageWrite,
@@ -404,6 +416,9 @@ const BASE_CAPABILITIES: [Capability; 26] = [
     Capability::UsbSerial,
     Capability::CanFd,
     Capability::WifiBridge,
+    Capability::ExternalTcu,
+    Capability::TorqueIntervention,
+    Capability::WidebandController,
 ];
 
 pub fn base_capabilities(simulator: bool) -> Vec<Capability> {
