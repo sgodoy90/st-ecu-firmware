@@ -220,7 +220,7 @@ impl IgnitionScheduler {
     }
 
     /// Schedule injection offset (degrees after TDC for sequential injection).
-    pub fn injection_offset(&self, cylinder: usize, advance_deg: f32) -> f32 {
+    pub fn injection_offset(&self, _cylinder: usize, advance_deg: f32) -> f32 {
         // Injection phased relative to intake valve opening
         // Simplified: 120° BTDC intake, adjusted by advance
         let base_offset = 340.0; // degrees BTDC typical MPFI target

@@ -6,7 +6,7 @@ use crate::io::{
     serialize_assignments_to_page, validate_assignment_set, AssignmentError, PinAssignmentRequest,
     ResolvedPinAssignment,
 };
-use crate::live_data::{transmission_status, LiveDataFrame};
+use crate::live_data::{error, status, LiveDataFrame};
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, encode_ack_payload,
@@ -19,9 +19,12 @@ use crate::protocol::{
     encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
     OutputTestDirectoryEntry, Packet, RawTablePayload, SensorRawDirectoryEntry,
 };
+use crate::rotational_idle::RotationalIdleRuntime;
+use crate::tcu::ExternalTcuRuntime;
 use crate::trigger::{
     sample_trigger_capture, sample_trigger_tooth_log, SUPPORTED_TRIGGER_DECODERS,
 };
+use crate::wideband::WidebandRuntime;
 use crate::ConfigPage;
 use serde::Serialize;
 
@@ -77,16 +80,10 @@ pub struct FirmwareRuntime {
     pub tables: Vec<RawTablePayload>,
     dtc_entries: Vec<RuntimeDtcEntry>,
     live_sample_counter: u32,
-    tcu_shift_active: bool,
-    tcu_shift_timer_cs: u16,
-    tcu_shift_request_counter: u8,
-    tcu_shift_timeout_counter: u8,
-    tcu_shift_fault_code: u8,
-    tcu_state_code: u8,
-    tcu_request_age_cs: u16,
-    tcu_ack_counter: u8,
-    tcu_requested_gear: u8,
-    tcu_shift_result_code: u8,
+    sync_loss_counter: u8,
+    tcu_runtime: ExternalTcuRuntime,
+    rotational_idle_runtime: RotationalIdleRuntime,
+    wideband_runtime: WidebandRuntime,
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
@@ -413,16 +410,10 @@ impl FirmwareRuntime {
             tables: default_tables(),
             dtc_entries: default_dtc_entries(),
             live_sample_counter: 0,
-            tcu_shift_active: false,
-            tcu_shift_timer_cs: 0,
-            tcu_shift_request_counter: 0,
-            tcu_shift_timeout_counter: 0,
-            tcu_shift_fault_code: 0,
-            tcu_state_code: 0,
-            tcu_request_age_cs: 0,
-            tcu_ack_counter: 0,
-            tcu_requested_gear: 0,
-            tcu_shift_result_code: 0,
+            sync_loss_counter: 0,
+            tcu_runtime: ExternalTcuRuntime::default(),
+            rotational_idle_runtime: RotationalIdleRuntime::default(),
+            wideband_runtime: WidebandRuntime::default(),
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
@@ -503,82 +494,86 @@ impl FirmwareRuntime {
 
     fn build_live_data_frame(&mut self) -> LiveDataFrame {
         self.live_sample_counter = self.live_sample_counter.wrapping_add(1);
+        if self.live_sample_counter % 190 == 0 {
+            self.sync_loss_counter = self.sync_loss_counter.wrapping_add(1);
+        }
+
         let mut frame = LiveDataFrame::default();
         frame.timestamp_ms = self.live_sample_counter.saturating_mul(20);
-        frame.rpm = if self.tcu_shift_active { 2_150.0 } else { 980.0 };
-        frame.vss_kmh = if self.tcu_shift_active { 46.0 } else { 44.0 };
-        frame.status_flags = crate::live_data::status::RUNNING | crate::live_data::status::CAN_ACTIVE;
+        let tcu = self.tcu_runtime.tick(self.live_sample_counter);
+        let shift_in_progress = self.tcu_runtime.shift_in_progress();
 
-        // Deterministic external-TCU timeline simulation so desktop/runtime contract tests
-        // can assert non-zero counters and state transitions.
-        if !self.tcu_shift_active && self.live_sample_counter % 25 == 1 {
-            self.tcu_shift_active = true;
-            self.tcu_shift_timer_cs = 36;
-            self.tcu_shift_request_counter = self.tcu_shift_request_counter.wrapping_add(1);
-            self.tcu_request_age_cs = 0;
-            self.tcu_requested_gear = (self.tcu_shift_request_counter % 6) + 1;
-            self.tcu_shift_result_code = 0;
-            self.tcu_state_code = 1; // request_pending
+        frame.sync_loss_counter = self.sync_loss_counter;
+        frame.rpm = if shift_in_progress { 2_150.0 } else { 980.0 };
+        frame.vss_kmh = if shift_in_progress { 46.0 } else { 44.0 };
+        frame.tps_pct = if shift_in_progress { 24.0 } else { 3.5 };
+        frame.map_kpa = if shift_in_progress { 62.0 } else { 36.0 };
+        frame.coolant_c = 88.5;
+        frame.intake_c = 43.0;
+        frame.aux_temp1_c = 805.0 + ((self.live_sample_counter % 8) as f32);
+        frame.aux_temp2_c = 790.0 + ((self.live_sample_counter % 6) as f32);
+        frame.idle_target_rpm = 980;
+        frame.idle_valve_pct = 34;
+        frame.status_flags =
+            status::RUNNING | status::CAN_ACTIVE | status::USB_CONNECTED | status::CLOSED_LOOP;
+        if shift_in_progress {
+            frame.status_flags |= status::FLAT_SHIFT;
         }
 
-        if self.tcu_shift_active {
-            self.tcu_request_age_cs = self.tcu_request_age_cs.saturating_add(2);
-            self.tcu_state_code = if self.tcu_shift_timer_cs > 20 { 1 } else { 3 };
-            if self.tcu_shift_timer_cs > 0 {
-                self.tcu_shift_timer_cs = self.tcu_shift_timer_cs.saturating_sub(2);
-            }
-            if self.tcu_shift_timer_cs == 0 {
-                self.tcu_shift_active = false;
-                self.tcu_shift_result_code = 1; // completed
-                self.tcu_state_code = 4; // completed
-                self.tcu_ack_counter = self.tcu_ack_counter.wrapping_add(1);
-                self.tcu_requested_gear = 0;
-                self.tcu_request_age_cs = 0;
-            }
-        } else if self.tcu_state_code == 4 && self.live_sample_counter % 25 == 5 {
-            self.tcu_state_code = 0; // idle
-            self.tcu_shift_result_code = 0;
+        let rotational = self.rotational_idle_runtime.tick(
+            self.live_sample_counter,
+            frame.aux_temp1_c,
+            frame.tps_pct,
+            frame.sync_loss_counter,
+            tcu.shift_fault_code == 5,
+        );
+        if rotational.active {
+            frame.status_flags |= status::ROTATIONAL_IDLE_ACTIVE;
+        }
+        if rotational.armed {
+            frame.status_flags |= status::ROTATIONAL_IDLE_ARMED;
+        }
+        frame.rotational_idle_cut_pct = rotational.cut_pct;
+        frame.rotational_idle_timer_cs = rotational.timer_cs;
+        frame.rotational_idle_active_cylinders = rotational.active_cylinders;
+        frame.rotational_idle_gate_code = rotational.gate_reason_code;
+        frame.rotational_idle_sync_guard_events = rotational.sync_guard_events;
+
+        let wideband = self
+            .wideband_runtime
+            .tick(self.live_sample_counter, frame.rpm > 450.0);
+        frame.lambda = wideband.lambda_primary;
+        frame.lambda2 = wideband.lambda_secondary;
+        if wideband.heater_ready {
+            frame.status_flags |= status::WIDEBAND_HEATER_READY;
+        }
+        if wideband.integrated_active {
+            frame.status_flags |= status::WIDEBAND_INTEGRATED_ACTIVE;
+        }
+        if wideband.analog_fallback {
+            frame.status_flags |= status::WIDEBAND_ANALOG_FALLBACK;
+        }
+        if wideband.primary_fault {
+            frame.error_flags |= error::O2_PRIMARY;
+        }
+        if wideband.secondary_fault {
+            frame.error_flags |= error::O2_SECONDARY;
+        }
+        if wideband.primary_fault || wideband.secondary_fault {
+            frame.status_flags |= status::CHECK_ENGINE;
         }
 
-        // Periodic synthetic timeout event to keep timeout/fault counters exercised.
-        if self.live_sample_counter % 180 == 0 {
-            self.tcu_shift_active = false;
-            self.tcu_shift_timer_cs = 0;
-            self.tcu_requested_gear = 0;
-            self.tcu_request_age_cs = 0;
-            self.tcu_shift_timeout_counter = self.tcu_shift_timeout_counter.wrapping_add(1);
-            self.tcu_shift_fault_code = 2; // timeout
-            self.tcu_shift_result_code = 2; // timeout
-            self.tcu_state_code = 5; // fault
-        } else if self.tcu_shift_fault_code != 0 && self.live_sample_counter % 180 == 3 {
-            self.tcu_shift_fault_code = 0;
-            if self.tcu_state_code == 5 {
-                self.tcu_state_code = 0;
-            }
-        }
-
-        let mut status_flags = transmission_status::TCU_LINK_ONLINE;
-        let mut torque_reduction_pct = 0u8;
-        if self.tcu_shift_active {
-            status_flags |= transmission_status::TORQUE_INTERVENTION_REQUESTED;
-            if self.tcu_state_code == 3 {
-                status_flags |= transmission_status::SHIFT_IN_PROGRESS;
-                status_flags |= transmission_status::TORQUE_INTERVENTION_ACTIVE;
-                torque_reduction_pct = 22;
-            }
-        }
-
-        frame.transmission_status_flags = status_flags;
-        frame.transmission_requested_gear = self.tcu_requested_gear;
-        frame.transmission_torque_reduction_pct = torque_reduction_pct;
-        frame.transmission_torque_reduction_timer_cs = self.tcu_shift_timer_cs;
-        frame.transmission_shift_result_code = self.tcu_shift_result_code;
-        frame.transmission_shift_request_counter = self.tcu_shift_request_counter;
-        frame.transmission_shift_timeout_counter = self.tcu_shift_timeout_counter;
-        frame.transmission_shift_fault_code = self.tcu_shift_fault_code;
-        frame.transmission_state_code = self.tcu_state_code;
-        frame.transmission_request_age_cs = self.tcu_request_age_cs;
-        frame.transmission_ack_counter = self.tcu_ack_counter;
+        frame.transmission_status_flags = tcu.status_flags;
+        frame.transmission_requested_gear = tcu.requested_gear;
+        frame.transmission_torque_reduction_pct = tcu.torque_reduction_pct;
+        frame.transmission_torque_reduction_timer_cs = tcu.torque_reduction_timer_cs;
+        frame.transmission_shift_result_code = tcu.shift_result_code;
+        frame.transmission_shift_request_counter = tcu.shift_request_counter;
+        frame.transmission_shift_timeout_counter = tcu.shift_timeout_counter;
+        frame.transmission_shift_fault_code = tcu.shift_fault_code;
+        frame.transmission_state_code = tcu.state_code;
+        frame.transmission_request_age_cs = tcu.request_age_cs;
+        frame.transmission_ack_counter = tcu.ack_counter;
         frame
     }
 
@@ -824,7 +819,7 @@ mod tests {
         apply_assignment_overrides, deserialize_assignments_from_page,
         serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
     };
-    use crate::live_data::{transmission_status, LiveDataFrame, LIVE_DATA_SIZE};
+    use crate::live_data::{error, status, transmission_status, LiveDataFrame, LIVE_DATA_SIZE};
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
@@ -872,6 +867,8 @@ mod tests {
         let mut runtime = FirmwareRuntime::new_simulator();
         let mut saw_shift_state = false;
         let mut saw_request_age = false;
+        let mut saw_online = false;
+        let mut saw_offline = false;
         let mut max_request_counter = 0u8;
         let mut max_ack_counter = 0u8;
 
@@ -879,16 +876,18 @@ mod tests {
             let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
             assert_eq!(response.cmd, Cmd::LiveData);
             let frame = decode_live_frame(&response.payload);
-            assert_ne!(
-                frame.transmission_status_flags & transmission_status::TCU_LINK_ONLINE,
-                0
-            );
+            let link_online =
+                (frame.transmission_status_flags & transmission_status::TCU_LINK_ONLINE) != 0;
+            saw_online |= link_online;
+            saw_offline |= !link_online;
             saw_shift_state |= frame.transmission_state_code == 1 || frame.transmission_state_code == 3;
             saw_request_age |= frame.transmission_request_age_cs > 0;
             max_request_counter = max_request_counter.max(frame.transmission_shift_request_counter);
             max_ack_counter = max_ack_counter.max(frame.transmission_ack_counter);
         }
 
+        assert!(saw_online, "expected link-online samples");
+        assert!(saw_offline, "expected deterministic link-offline samples");
         assert!(saw_shift_state, "expected at least one request/shifting state sample");
         assert!(saw_request_age, "expected request age counter to become non-zero");
         assert!(max_request_counter > 0, "expected shift request counter activity");
@@ -915,6 +914,48 @@ mod tests {
             "expected timeout counter to increment at least once"
         );
         assert!(saw_timeout_fault_code, "expected to observe timeout fault code 2");
+    }
+
+    #[test]
+    fn runtime_live_data_exposes_rotational_idle_runtime_fields() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+        let mut saw_active_cut = false;
+        let mut saw_sync_guard = false;
+
+        for _ in 0..260 {
+            let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+            let frame = decode_live_frame(&response.payload);
+            saw_active_cut |= frame.rotational_idle_cut_pct > 0
+                && (frame.status_flags & status::ROTATIONAL_IDLE_ACTIVE) != 0;
+            saw_sync_guard |= frame.rotational_idle_sync_guard_events > 0
+                && frame.rotational_idle_gate_code == 9;
+        }
+
+        assert!(saw_active_cut, "expected rotational-idle cut activity");
+        assert!(saw_sync_guard, "expected at least one sync-guard gate event");
+    }
+
+    #[test]
+    fn runtime_live_data_exposes_wideband_status_and_fault_windows() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+        let mut saw_heater_ready = false;
+        let mut saw_integrated_mode = false;
+        let mut saw_analog_fallback = false;
+        let mut saw_primary_fault = false;
+
+        for _ in 0..320 {
+            let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+            let frame = decode_live_frame(&response.payload);
+            saw_heater_ready |= (frame.status_flags & status::WIDEBAND_HEATER_READY) != 0;
+            saw_integrated_mode |= (frame.status_flags & status::WIDEBAND_INTEGRATED_ACTIVE) != 0;
+            saw_analog_fallback |= (frame.status_flags & status::WIDEBAND_ANALOG_FALLBACK) != 0;
+            saw_primary_fault |= (frame.error_flags & error::O2_PRIMARY) != 0;
+        }
+
+        assert!(saw_heater_ready, "expected heater-ready status bit");
+        assert!(saw_integrated_mode, "expected integrated wideband mode bit");
+        assert!(saw_analog_fallback, "expected fallback status bit");
+        assert!(saw_primary_fault, "expected deterministic primary O2 fault window");
     }
 
     #[test]

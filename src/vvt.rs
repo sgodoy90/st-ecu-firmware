@@ -15,7 +15,7 @@ pub enum VvtChannel {
     B2Exhaust = 3,
 }
 
-/// VVT target angle table: 16×16 RPM×load → target cam angle (degrees)
+/// VVT target angle table: 8×8 RPM×load → target cam angle (degrees)
 #[derive(Debug, Clone, Copy)]
 pub struct VvtTargetTable {
     pub cells: [[f32; 8]; 8],

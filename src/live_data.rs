@@ -542,6 +542,9 @@ pub mod status {
     pub const OVERREV:         u32 = 1 << 23;
     pub const ROTATIONAL_IDLE_ACTIVE: u32 = 1 << 24;
     pub const ROTATIONAL_IDLE_ARMED: u32 = 1 << 25;
+    pub const WIDEBAND_HEATER_READY: u32 = 1 << 26;
+    pub const WIDEBAND_INTEGRATED_ACTIVE: u32 = 1 << 27;
+    pub const WIDEBAND_ANALOG_FALLBACK: u32 = 1 << 28;
 }
 
 pub mod transmission_status {

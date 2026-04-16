@@ -1,15 +1,27 @@
 [package]
 name = "st-ecu-firmware"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Proprietary"
-description = "SpeedTech ST ECU firmware architecture bootstrap for STM32H743"
+description = "SpeedTech ST ECU firmware — dual-target STM32F407 + STM32H743"
 
 [lib]
 name = "st_ecu_firmware"
 path = "src/lib.rs"
 
+# ─── Features ─────────────────────────────────────────────────────────────────
+# Build with:  cargo test --features f407
+#              cargo test --features h743
+# Default (no target hardware): pure Rust host testing, both HALs compiled.
+[features]
+default = []
+f407 = []
+h743 = []
+
 [dependencies]
 crc = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# No extra dev dependencies — all tests use std alloc only
