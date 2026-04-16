@@ -6,7 +6,7 @@ use crate::io::{
     serialize_assignments_to_page, validate_assignment_set, AssignmentError, PinAssignmentRequest,
     ResolvedPinAssignment,
 };
-use crate::live_data::LiveDataFrame;
+use crate::live_data::{transmission_status, LiveDataFrame};
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, encode_ack_payload,
@@ -76,6 +76,17 @@ pub struct FirmwareRuntime {
     pub network_profile: &'static NetworkProfile,
     pub tables: Vec<RawTablePayload>,
     dtc_entries: Vec<RuntimeDtcEntry>,
+    live_sample_counter: u32,
+    tcu_shift_active: bool,
+    tcu_shift_timer_cs: u16,
+    tcu_shift_request_counter: u8,
+    tcu_shift_timeout_counter: u8,
+    tcu_shift_fault_code: u8,
+    tcu_state_code: u8,
+    tcu_request_age_cs: u16,
+    tcu_ack_counter: u8,
+    tcu_requested_gear: u8,
+    tcu_shift_result_code: u8,
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
@@ -401,6 +412,17 @@ impl FirmwareRuntime {
             network_profile: headless_network_profile(),
             tables: default_tables(),
             dtc_entries: default_dtc_entries(),
+            live_sample_counter: 0,
+            tcu_shift_active: false,
+            tcu_shift_timer_cs: 0,
+            tcu_shift_request_counter: 0,
+            tcu_shift_timeout_counter: 0,
+            tcu_shift_fault_code: 0,
+            tcu_state_code: 0,
+            tcu_request_age_cs: 0,
+            tcu_ack_counter: 0,
+            tcu_requested_gear: 0,
+            tcu_shift_result_code: 0,
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
@@ -479,6 +501,87 @@ impl FirmwareRuntime {
         Ok(())
     }
 
+    fn build_live_data_frame(&mut self) -> LiveDataFrame {
+        self.live_sample_counter = self.live_sample_counter.wrapping_add(1);
+        let mut frame = LiveDataFrame::default();
+        frame.timestamp_ms = self.live_sample_counter.saturating_mul(20);
+        frame.rpm = if self.tcu_shift_active { 2_150.0 } else { 980.0 };
+        frame.vss_kmh = if self.tcu_shift_active { 46.0 } else { 44.0 };
+        frame.status_flags = crate::live_data::status::RUNNING | crate::live_data::status::CAN_ACTIVE;
+
+        // Deterministic external-TCU timeline simulation so desktop/runtime contract tests
+        // can assert non-zero counters and state transitions.
+        if !self.tcu_shift_active && self.live_sample_counter % 25 == 1 {
+            self.tcu_shift_active = true;
+            self.tcu_shift_timer_cs = 36;
+            self.tcu_shift_request_counter = self.tcu_shift_request_counter.wrapping_add(1);
+            self.tcu_request_age_cs = 0;
+            self.tcu_requested_gear = (self.tcu_shift_request_counter % 6) + 1;
+            self.tcu_shift_result_code = 0;
+            self.tcu_state_code = 1; // request_pending
+        }
+
+        if self.tcu_shift_active {
+            self.tcu_request_age_cs = self.tcu_request_age_cs.saturating_add(2);
+            self.tcu_state_code = if self.tcu_shift_timer_cs > 20 { 1 } else { 3 };
+            if self.tcu_shift_timer_cs > 0 {
+                self.tcu_shift_timer_cs = self.tcu_shift_timer_cs.saturating_sub(2);
+            }
+            if self.tcu_shift_timer_cs == 0 {
+                self.tcu_shift_active = false;
+                self.tcu_shift_result_code = 1; // completed
+                self.tcu_state_code = 4; // completed
+                self.tcu_ack_counter = self.tcu_ack_counter.wrapping_add(1);
+                self.tcu_requested_gear = 0;
+                self.tcu_request_age_cs = 0;
+            }
+        } else if self.tcu_state_code == 4 && self.live_sample_counter % 25 == 5 {
+            self.tcu_state_code = 0; // idle
+            self.tcu_shift_result_code = 0;
+        }
+
+        // Periodic synthetic timeout event to keep timeout/fault counters exercised.
+        if self.live_sample_counter % 180 == 0 {
+            self.tcu_shift_active = false;
+            self.tcu_shift_timer_cs = 0;
+            self.tcu_requested_gear = 0;
+            self.tcu_request_age_cs = 0;
+            self.tcu_shift_timeout_counter = self.tcu_shift_timeout_counter.wrapping_add(1);
+            self.tcu_shift_fault_code = 2; // timeout
+            self.tcu_shift_result_code = 2; // timeout
+            self.tcu_state_code = 5; // fault
+        } else if self.tcu_shift_fault_code != 0 && self.live_sample_counter % 180 == 3 {
+            self.tcu_shift_fault_code = 0;
+            if self.tcu_state_code == 5 {
+                self.tcu_state_code = 0;
+            }
+        }
+
+        let mut status_flags = transmission_status::TCU_LINK_ONLINE;
+        let mut torque_reduction_pct = 0u8;
+        if self.tcu_shift_active {
+            status_flags |= transmission_status::TORQUE_INTERVENTION_REQUESTED;
+            if self.tcu_state_code == 3 {
+                status_flags |= transmission_status::SHIFT_IN_PROGRESS;
+                status_flags |= transmission_status::TORQUE_INTERVENTION_ACTIVE;
+                torque_reduction_pct = 22;
+            }
+        }
+
+        frame.transmission_status_flags = status_flags;
+        frame.transmission_requested_gear = self.tcu_requested_gear;
+        frame.transmission_torque_reduction_pct = torque_reduction_pct;
+        frame.transmission_torque_reduction_timer_cs = self.tcu_shift_timer_cs;
+        frame.transmission_shift_result_code = self.tcu_shift_result_code;
+        frame.transmission_shift_request_counter = self.tcu_shift_request_counter;
+        frame.transmission_shift_timeout_counter = self.tcu_shift_timeout_counter;
+        frame.transmission_shift_fault_code = self.tcu_shift_fault_code;
+        frame.transmission_state_code = self.tcu_state_code;
+        frame.transmission_request_age_cs = self.tcu_request_age_cs;
+        frame.transmission_ack_counter = self.tcu_ack_counter;
+        frame
+    }
+
     pub fn handle_packet(&mut self, packet: Packet) -> Packet {
         match packet.cmd {
             Cmd::Ping => Packet::new(Cmd::Pong, vec![]),
@@ -490,9 +593,7 @@ impl FirmwareRuntime {
                 Cmd::Capabilities,
                 encode_capabilities_payload(&self.capabilities),
             ),
-            Cmd::GetLiveData => {
-                Packet::new(Cmd::LiveData, LiveDataFrame::current().encode_payload())
-            }
+            Cmd::GetLiveData => Packet::new(Cmd::LiveData, self.build_live_data_frame().encode().to_vec()),
             Cmd::GetSensorRaw => {
                 let channel = packet.payload.first().copied().unwrap_or(0);
                 let (adc, voltage) = sensor_raw_sample(channel);
@@ -723,6 +824,7 @@ mod tests {
         apply_assignment_overrides, deserialize_assignments_from_page,
         serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
     };
+    use crate::live_data::{transmission_status, LiveDataFrame, LIVE_DATA_SIZE};
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
@@ -737,6 +839,13 @@ mod tests {
     use serde_json::Value;
 
     use super::FirmwareRuntime;
+
+    fn decode_live_frame(payload: &[u8]) -> LiveDataFrame {
+        assert_eq!(payload.len(), LIVE_DATA_SIZE);
+        let mut bytes = [0u8; LIVE_DATA_SIZE];
+        bytes.copy_from_slice(payload);
+        LiveDataFrame::decode(&bytes)
+    }
 
     #[test]
     fn get_version_returns_identity_payload() {
@@ -756,6 +865,56 @@ mod tests {
 
         assert_eq!(response.cmd, Cmd::Capabilities);
         assert!(!capabilities.is_empty());
+    }
+
+    #[test]
+    fn runtime_live_data_tcu_extensions_progress_over_time() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+        let mut saw_shift_state = false;
+        let mut saw_request_age = false;
+        let mut max_request_counter = 0u8;
+        let mut max_ack_counter = 0u8;
+
+        for _ in 0..90 {
+            let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+            assert_eq!(response.cmd, Cmd::LiveData);
+            let frame = decode_live_frame(&response.payload);
+            assert_ne!(
+                frame.transmission_status_flags & transmission_status::TCU_LINK_ONLINE,
+                0
+            );
+            saw_shift_state |= frame.transmission_state_code == 1 || frame.transmission_state_code == 3;
+            saw_request_age |= frame.transmission_request_age_cs > 0;
+            max_request_counter = max_request_counter.max(frame.transmission_shift_request_counter);
+            max_ack_counter = max_ack_counter.max(frame.transmission_ack_counter);
+        }
+
+        assert!(saw_shift_state, "expected at least one request/shifting state sample");
+        assert!(saw_request_age, "expected request age counter to become non-zero");
+        assert!(max_request_counter > 0, "expected shift request counter activity");
+        assert!(max_ack_counter > 0, "expected shift ack counter activity");
+    }
+
+    #[test]
+    fn runtime_live_data_periodically_reports_tcu_timeout_counter() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+        let mut max_timeout_counter = 0u8;
+        let mut saw_timeout_fault_code = false;
+
+        for _ in 0..220 {
+            let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+            let frame = decode_live_frame(&response.payload);
+            max_timeout_counter = max_timeout_counter.max(frame.transmission_shift_timeout_counter);
+            if frame.transmission_shift_fault_code == 2 {
+                saw_timeout_fault_code = true;
+            }
+        }
+
+        assert!(
+            max_timeout_counter > 0,
+            "expected timeout counter to increment at least once"
+        );
+        assert!(saw_timeout_fault_code, "expected to observe timeout fault code 2");
     }
 
     #[test]
