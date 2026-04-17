@@ -8,6 +8,10 @@ const DEFAULT_SHIFT_TIMER_CS: u16 = 36;
 const STALE_REQUEST_CS: u16 = 46;
 const TIMEOUT_REQUEST_CS: u16 = 62;
 const RESULT_HOLD_TICKS: u8 = 8;
+const RX_STALE_PERIOD_SAMPLES: u32 = 170;
+const RX_STALE_WINDOW_SAMPLES: u32 = 10;
+const TX_STALE_PERIOD_SAMPLES: u32 = 210;
+const TX_STALE_WINDOW_SAMPLES: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransmissionSample {
@@ -37,6 +41,8 @@ pub struct ExternalTcuRuntime {
     requested_gear: u8,
     shift_result_code: u8,
     hold_ticks: u8,
+    rx_stream_fresh: bool,
+    tx_stream_fresh: bool,
 }
 
 impl Default for ExternalTcuRuntime {
@@ -53,14 +59,19 @@ impl Default for ExternalTcuRuntime {
             requested_gear: 0,
             shift_result_code: 0,
             hold_ticks: 0,
+            rx_stream_fresh: false,
+            tx_stream_fresh: false,
         }
     }
 }
 
 impl ExternalTcuRuntime {
     pub fn tick(&mut self, sample_counter: u32) -> TransmissionSample {
-        let link_online =
-            sample_counter % OFFLINE_PERIOD_SAMPLES >= OFFLINE_WINDOW_SAMPLES;
+        let link_online = sample_counter % OFFLINE_PERIOD_SAMPLES >= OFFLINE_WINDOW_SAMPLES;
+        let (rx_stream_fresh, tx_stream_fresh) =
+            self.compute_stream_freshness(sample_counter, link_online);
+        self.rx_stream_fresh = rx_stream_fresh;
+        self.tx_stream_fresh = tx_stream_fresh;
 
         if !link_online {
             if self.shift_active || self.requested_gear > 0 {
@@ -86,7 +97,7 @@ impl ExternalTcuRuntime {
             }
 
             if self.shift_active {
-                self.step_active_shift();
+                self.step_active_shift(self.rx_stream_fresh, self.tx_stream_fresh);
             } else if self.hold_ticks > 0 {
                 self.hold_ticks = self.hold_ticks.saturating_sub(1);
                 if self.hold_ticks == 0 && self.state_code != 6 {
@@ -98,6 +109,12 @@ impl ExternalTcuRuntime {
         let mut status_flags = 0u8;
         if link_online {
             status_flags |= transmission_status::TCU_LINK_ONLINE;
+        }
+        if self.rx_stream_fresh {
+            status_flags |= transmission_status::RX_STREAM_FRESH;
+        }
+        if self.tx_stream_fresh {
+            status_flags |= transmission_status::TX_STREAM_FRESH;
         }
 
         let mut torque_reduction_pct = 0u8;
@@ -148,7 +165,7 @@ impl ExternalTcuRuntime {
         self.requested_gear = (self.shift_request_counter % 6) + 1;
     }
 
-    fn step_active_shift(&mut self) {
+    fn step_active_shift(&mut self, rx_stream_fresh: bool, tx_stream_fresh: bool) {
         self.request_age_cs = self.request_age_cs.saturating_add(REQUEST_STEP_CS);
         if self.request_age_cs >= 8 {
             self.state_code = 2; // torque_reduction
@@ -157,6 +174,18 @@ impl ExternalTcuRuntime {
             self.state_code = 3; // shifting
         }
         self.shift_timer_cs = self.shift_timer_cs.saturating_sub(REQUEST_STEP_CS);
+
+        // Stream watchdog faults are surfaced via explicit fault codes so desktop can
+        // classify communication freshness regressions without guessing.
+        let timeout_vector_request = self.shift_request_counter % 5 == 0;
+        if !timeout_vector_request && !rx_stream_fresh && self.request_age_cs >= 10 {
+            self.raise_fault(7, 5, 5, false); // rx_watchdog
+            return;
+        }
+        if !timeout_vector_request && !tx_stream_fresh && self.request_age_cs >= 14 {
+            self.raise_fault(8, 5, 5, false); // tx_watchdog
+            return;
+        }
 
         // Deterministic failure vectors for diagnostics and parser hardening.
         if self.shift_request_counter % 11 == 0 && self.request_age_cs >= 14 {
@@ -208,10 +237,22 @@ impl ExternalTcuRuntime {
         self.requested_gear = 0;
         self.request_age_cs = 0;
     }
+
+    fn compute_stream_freshness(&self, sample_counter: u32, link_online: bool) -> (bool, bool) {
+        if !link_online {
+            return (false, false);
+        }
+
+        let rx_stale = sample_counter % RX_STALE_PERIOD_SAMPLES < RX_STALE_WINDOW_SAMPLES;
+        let tx_stale = sample_counter % TX_STALE_PERIOD_SAMPLES < TX_STALE_WINDOW_SAMPLES;
+        (!rx_stale, !tx_stale)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::live_data::transmission_status;
+
     use super::{ExternalTcuRuntime, TransmissionSample};
 
     fn sample_for_tick(runtime: &mut ExternalTcuRuntime, tick: u32) -> TransmissionSample {
@@ -267,5 +308,45 @@ mod tests {
         }
 
         assert!(saw_request_age, "request age counter never became non-zero");
+    }
+
+    #[test]
+    fn toggles_rx_tx_freshness_status_bits() {
+        let mut runtime = ExternalTcuRuntime::default();
+        let mut saw_rx_stale = false;
+        let mut saw_tx_stale = false;
+        let mut saw_both_fresh = false;
+
+        for tick in 0..420 {
+            let sample = sample_for_tick(&mut runtime, tick);
+            let rx_fresh = (sample.status_flags & transmission_status::RX_STREAM_FRESH) != 0;
+            let tx_fresh = (sample.status_flags & transmission_status::TX_STREAM_FRESH) != 0;
+            saw_rx_stale |= !rx_fresh;
+            saw_tx_stale |= !tx_fresh;
+            saw_both_fresh |= rx_fresh && tx_fresh;
+        }
+
+        assert!(saw_rx_stale, "expected deterministic rx stale windows");
+        assert!(saw_tx_stale, "expected deterministic tx stale windows");
+        assert!(saw_both_fresh, "expected steady-state fresh windows");
+    }
+
+    #[test]
+    fn raises_watchdog_fault_codes_when_stream_freshness_drops_mid_request() {
+        let mut runtime = ExternalTcuRuntime::default();
+        let mut saw_rx_watchdog_fault = false;
+        let mut saw_tx_watchdog_fault = false;
+
+        for tick in 0..1800 {
+            let sample = sample_for_tick(&mut runtime, tick);
+            saw_rx_watchdog_fault |= sample.shift_fault_code == 7;
+            saw_tx_watchdog_fault |= sample.shift_fault_code == 8;
+            if saw_rx_watchdog_fault && saw_tx_watchdog_fault {
+                break;
+            }
+        }
+
+        assert!(saw_rx_watchdog_fault, "expected rx watchdog fault code 7");
+        assert!(saw_tx_watchdog_fault, "expected tx watchdog fault code 8");
     }
 }

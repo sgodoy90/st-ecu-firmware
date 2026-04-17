@@ -98,7 +98,7 @@ pub struct LiveDataFrame {
 
     // Engine speed / sync
     pub rpm: f32,
-    pub rpm_accel: f32,     // RPM/s
+    pub rpm_accel: f32, // RPM/s
     pub sync_loss_counter: u8,
 
     // Pressures (kPa)
@@ -106,15 +106,15 @@ pub struct LiveDataFrame {
     pub baro_kpa: f32,
     pub oil_pressure_kpa: f32,
     pub fuel_pressure_kpa: f32,
-    pub boost_kpa: f32,     // can be negative
+    pub boost_kpa: f32, // can be negative
 
     // Temperatures (°C)
     pub coolant_c: f32,
     pub intake_c: f32,
     pub oil_temp_c: f32,
     pub fuel_temp_c: f32,
-    pub aux_temp1_c: f32,   // EGT1
-    pub aux_temp2_c: f32,   // EGT2
+    pub aux_temp1_c: f32, // EGT1
+    pub aux_temp2_c: f32, // EGT2
     pub mcu_temp_c: f32,
 
     // Throttle / load (%)
@@ -124,9 +124,9 @@ pub struct LiveDataFrame {
     pub ign_load: f32,
 
     // Fuel
-    pub lambda: f32,        // e.g. 1.0000
+    pub lambda: f32, // e.g. 1.0000
     pub lambda2: f32,
-    pub afr_target: f32,    // e.g. 14.70
+    pub afr_target: f32, // e.g. 14.70
     pub injector_duty_pct: f32,
     pub ve_pct: f32,
     pub fuel_correction_pct: f32,
@@ -140,8 +140,8 @@ pub struct LiveDataFrame {
     pub injection_offset_deg: f32,
 
     // Electrical
-    pub vbatt: f32,     // V
-    pub vref_mv: f32,   // V
+    pub vbatt: f32,   // V
+    pub vref_mv: f32, // V
 
     // Motion
     pub vss_kmh: f32,
@@ -154,7 +154,7 @@ pub struct LiveDataFrame {
     pub vvt_b2_exhaust_deg: f32,
 
     // Knock
-    pub knock_level: u8,    // 0..100
+    pub knock_level: u8, // 0..100
     pub knock_retard_deg: f32,
 
     // Boost
@@ -210,22 +210,40 @@ impl LiveDataFrame {
         let mut o: usize = 0;
 
         macro_rules! w32u {
-            ($v:expr) => { b[o..o+4].copy_from_slice(&($v as u32).to_be_bytes()); o += 4; };
+            ($v:expr) => {
+                b[o..o + 4].copy_from_slice(&($v as u32).to_be_bytes());
+                o += 4;
+            };
         }
         macro_rules! w16u {
-            ($v:expr) => { b[o..o+2].copy_from_slice(&($v as u16).to_be_bytes()); o += 2; };
+            ($v:expr) => {
+                b[o..o + 2].copy_from_slice(&($v as u16).to_be_bytes());
+                o += 2;
+            };
         }
         macro_rules! w16i {
-            ($v:expr) => { b[o..o+2].copy_from_slice(&($v as i16).to_be_bytes()); o += 2; };
+            ($v:expr) => {
+                b[o..o + 2].copy_from_slice(&($v as i16).to_be_bytes());
+                o += 2;
+            };
         }
         macro_rules! w8u {
-            ($v:expr) => { b[o] = $v as u8; o += 1; };
+            ($v:expr) => {
+                b[o] = $v as u8;
+                o += 1;
+            };
         }
         macro_rules! w8i {
-            ($v:expr) => { b[o] = ($v as i8) as u8; o += 1; };
+            ($v:expr) => {
+                b[o] = ($v as i8) as u8;
+                o += 1;
+            };
         }
         macro_rules! pad {
-            () => { b[o] = 0; o += 1; };
+            () => {
+                b[o] = 0;
+                o += 1;
+            };
         }
 
         // 0: timestamp_ms  u32
@@ -245,7 +263,10 @@ impl LiveDataFrame {
         // 14: oil_pressure_kpa ×10  u16
         w16u!((self.oil_pressure_kpa * 10.0).round().max(0.0).min(65535.0));
         // 16: fuel_pressure_kpa ×10  u16
-        w16u!((self.fuel_pressure_kpa * 10.0).round().max(0.0).min(65535.0));
+        w16u!((self.fuel_pressure_kpa * 10.0)
+            .round()
+            .max(0.0)
+            .min(65535.0));
         // 18: boost_kpa ×10  i16
         w16i!((self.boost_kpa * 10.0).round().max(-32768.0).min(32767.0));
         // 20: coolant_c ×10  i16
@@ -283,13 +304,19 @@ impl LiveDataFrame {
         // 49: ve_pct  u8
         w8u!(self.ve_pct.round().max(0.0).min(255.0));
         // 50: fuel_correction_pct ×100  i16
-        w16i!((self.fuel_correction_pct * 100.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.fuel_correction_pct * 100.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 52: accel_enrich_pct  u8
         w8u!(self.accel_enrich_pct.round().max(0.0).min(255.0));
         // 53: pad
         pad!();
         // 54: actual_pulsewidth_ms ×1000  u16
-        w16u!((self.actual_pulsewidth_ms * 1000.0).round().max(0.0).min(65535.0));
+        w16u!((self.actual_pulsewidth_ms * 1000.0)
+            .round()
+            .max(0.0)
+            .min(65535.0));
         // 56: wall_fuel_mg ×100  u16
         w16u!((self.wall_fuel_mg * 100.0).round().max(0.0).min(65535.0));
         // 58: advance_deg ×10  i16
@@ -309,13 +336,25 @@ impl LiveDataFrame {
         // 71: pad
         pad!();
         // 72: vvt_b1_intake_deg ×10  i16
-        w16i!((self.vvt_b1_intake_deg * 10.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.vvt_b1_intake_deg * 10.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 74: vvt_b1_exhaust_deg ×10  i16
-        w16i!((self.vvt_b1_exhaust_deg * 10.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.vvt_b1_exhaust_deg * 10.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 76: vvt_b2_intake_deg ×10  i16
-        w16i!((self.vvt_b2_intake_deg * 10.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.vvt_b2_intake_deg * 10.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 78: vvt_b2_exhaust_deg ×10  i16
-        w16i!((self.vvt_b2_exhaust_deg * 10.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.vvt_b2_exhaust_deg * 10.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 80: knock_level  u8
         w8u!(self.knock_level);
         // 81: knock_retard_deg  i8
@@ -329,13 +368,25 @@ impl LiveDataFrame {
         // 87: idle_valve_pct  u8
         w8u!(self.idle_valve_pct);
         // 88: correction_iat ×100  i16
-        w16i!((self.correction_iat * 100.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.correction_iat * 100.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 90: correction_clt ×100  i16
-        w16i!((self.correction_clt * 100.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.correction_clt * 100.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 92: correction_baro ×100  i16
-        w16i!((self.correction_baro * 100.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.correction_baro * 100.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 94: correction_flex ×100  i16
-        w16i!((self.correction_flex * 100.0).round().max(-32768.0).min(32767.0));
+        w16i!((self.correction_flex * 100.0)
+            .round()
+            .max(-32768.0)
+            .min(32767.0));
         // 96: status_flags  u32
         w32u!(self.status_flags);
         // 100: protect_flags  u8
@@ -383,81 +434,118 @@ impl LiveDataFrame {
         // 127: transmission_ack_counter  u8
         w8u!(self.transmission_ack_counter);
 
-        debug_assert_eq!(o, 128, "live_data encode offset drift: expected 128, got {o}");
+        debug_assert_eq!(
+            o, 128,
+            "live_data encode offset drift: expected 128, got {o}"
+        );
         b
     }
 
     /// Decode a 128-byte buffer back into LiveDataFrame (for testing).
     pub fn decode(b: &[u8; LIVE_DATA_SIZE]) -> Self {
         let mut o: usize = 0;
-        macro_rules! r32u { () => {{ let v = u32::from_be_bytes([b[o],b[o+1],b[o+2],b[o+3]]); o+=4; v }} }
-        macro_rules! r16u { () => {{ let v = u16::from_be_bytes([b[o],b[o+1]]); o+=2; v }} }
-        macro_rules! r16i { () => {{ let v = i16::from_be_bytes([b[o],b[o+1]]); o+=2; v }} }
-        macro_rules! r8u  { () => {{ let v = b[o]; o+=1; v }} }
-        macro_rules! r8i  { () => {{ let v = b[o] as i8; o+=1; v }} }
-        macro_rules! skip { ($n:expr) => { o += $n; } }
+        macro_rules! r32u {
+            () => {{
+                let v = u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                o += 4;
+                v
+            }};
+        }
+        macro_rules! r16u {
+            () => {{
+                let v = u16::from_be_bytes([b[o], b[o + 1]]);
+                o += 2;
+                v
+            }};
+        }
+        macro_rules! r16i {
+            () => {{
+                let v = i16::from_be_bytes([b[o], b[o + 1]]);
+                o += 2;
+                v
+            }};
+        }
+        macro_rules! r8u {
+            () => {{
+                let v = b[o];
+                o += 1;
+                v
+            }};
+        }
+        macro_rules! r8i {
+            () => {{
+                let v = b[o] as i8;
+                o += 1;
+                v
+            }};
+        }
+        macro_rules! skip {
+            ($n:expr) => {
+                o += $n;
+            };
+        }
 
-        let timestamp_ms        = r32u!();
-        let rpm                 = r16u!() as f32;
-        let rpm_accel           = r16i!() as f32;
-        let sync_loss_counter   = r8u!();
+        let timestamp_ms = r32u!();
+        let rpm = r16u!() as f32;
+        let rpm_accel = r16i!() as f32;
+        let sync_loss_counter = r8u!();
         skip!(1);
-        let map_kpa             = r16u!() as f32 / 10.0;
-        let baro_kpa            = r16u!() as f32 / 10.0;
-        let oil_pressure_kpa    = r16u!() as f32 / 10.0;
-        let fuel_pressure_kpa   = r16u!() as f32 / 10.0;
-        let boost_kpa           = r16i!() as f32 / 10.0;
-        let coolant_c           = r16i!() as f32 / 10.0;
-        let intake_c            = r16i!() as f32 / 10.0;
-        let oil_temp_c          = r16i!() as f32 / 10.0;
-        let fuel_temp_c         = r16i!() as f32 / 10.0;
-        let aux_temp1_c         = r16i!() as f32 / 10.0;
-        let aux_temp2_c         = r16i!() as f32 / 10.0;
-        let mcu_temp_c          = r8i!() as f32;
+        let map_kpa = r16u!() as f32 / 10.0;
+        let baro_kpa = r16u!() as f32 / 10.0;
+        let oil_pressure_kpa = r16u!() as f32 / 10.0;
+        let fuel_pressure_kpa = r16u!() as f32 / 10.0;
+        let boost_kpa = r16i!() as f32 / 10.0;
+        let coolant_c = r16i!() as f32 / 10.0;
+        let intake_c = r16i!() as f32 / 10.0;
+        let oil_temp_c = r16i!() as f32 / 10.0;
+        let fuel_temp_c = r16i!() as f32 / 10.0;
+        let aux_temp1_c = r16i!() as f32 / 10.0;
+        let aux_temp2_c = r16i!() as f32 / 10.0;
+        let mcu_temp_c = r8i!() as f32;
         skip!(1);
-        let tps_pct             = r16i!() as f32 / 100.0;
-        let pedal_pct           = r16i!() as f32 / 100.0;
-        let fuel_load           = r16i!() as f32 / 100.0;
-        let ign_load            = r16i!() as f32 / 100.0;
-        let lambda              = r16u!() as f32 / 10000.0;
-        let lambda2             = r16u!() as f32 / 10000.0;
-        let afr_target          = r16u!() as f32 / 100.0;
-        let injector_duty_pct   = r8u!() as f32 / 2.0;
-        let ve_pct              = r8u!() as f32;
+        let tps_pct = r16i!() as f32 / 100.0;
+        let pedal_pct = r16i!() as f32 / 100.0;
+        let fuel_load = r16i!() as f32 / 100.0;
+        let ign_load = r16i!() as f32 / 100.0;
+        let lambda = r16u!() as f32 / 10000.0;
+        let lambda2 = r16u!() as f32 / 10000.0;
+        let afr_target = r16u!() as f32 / 100.0;
+        let injector_duty_pct = r8u!() as f32 / 2.0;
+        let ve_pct = r8u!() as f32;
         let fuel_correction_pct = r16i!() as f32 / 100.0;
-        let accel_enrich_pct    = r8u!() as f32;
+        let accel_enrich_pct = r8u!() as f32;
         skip!(1);
         let actual_pulsewidth_ms = r16u!() as f32 / 1000.0;
-        let wall_fuel_mg        = r16u!() as f32 / 100.0;
-        let advance_deg         = r16i!() as f32 / 10.0;
-        let dwell_ms            = r16u!() as f32 / 1000.0;
+        let wall_fuel_mg = r16u!() as f32 / 100.0;
+        let advance_deg = r16i!() as f32 / 10.0;
+        let dwell_ms = r16u!() as f32 / 1000.0;
         let injection_offset_deg = r16i!() as f32;
-        let vbatt               = r16u!() as f32 / 100.0;
-        let vref_mv             = r16i!() as f32 / 1000.0;
-        let vss_kmh             = r16u!() as f32;
-        let gear                = r8u!();
+        let vbatt = r16u!() as f32 / 100.0;
+        let vref_mv = r16i!() as f32 / 1000.0;
+        let vss_kmh = r16u!() as f32;
+        let gear = r8u!();
         skip!(1);
-        let vvt_b1_intake_deg   = r16i!() as f32 / 10.0;
-        let vvt_b1_exhaust_deg  = r16i!() as f32 / 10.0;
-        let vvt_b2_intake_deg   = r16i!() as f32 / 10.0;
-        let vvt_b2_exhaust_deg  = r16i!() as f32 / 10.0;
-        let knock_level         = r8u!();
-        let knock_retard_deg    = r8i!() as f32;
-        let boost_target_kpa    = r16u!() as f32 / 10.0;
-        let boost_duty_pct      = r8u!();
-        let idle_target_rpm     = r16u!();
-        let idle_valve_pct      = r8u!();
-        let correction_iat      = r16i!() as f32 / 100.0;
-        let correction_clt      = r16i!() as f32 / 100.0;
-        let correction_baro     = r16i!() as f32 / 100.0;
-        let correction_flex     = r16i!() as f32 / 100.0;
-        let status_flags        = r32u!();
-        let protect_flags       = r8u!();
-        let error_flags         = r16u!();
+        let vvt_b1_intake_deg = r16i!() as f32 / 10.0;
+        let vvt_b1_exhaust_deg = r16i!() as f32 / 10.0;
+        let vvt_b2_intake_deg = r16i!() as f32 / 10.0;
+        let vvt_b2_exhaust_deg = r16i!() as f32 / 10.0;
+        let knock_level = r8u!();
+        let knock_retard_deg = r8i!() as f32;
+        let boost_target_kpa = r16u!() as f32 / 10.0;
+        let boost_duty_pct = r8u!();
+        let idle_target_rpm = r16u!();
+        let idle_valve_pct = r8u!();
+        let correction_iat = r16i!() as f32 / 100.0;
+        let correction_clt = r16i!() as f32 / 100.0;
+        let correction_baro = r16i!() as f32 / 100.0;
+        let correction_flex = r16i!() as f32 / 100.0;
+        let status_flags = r32u!();
+        let protect_flags = r8u!();
+        let error_flags = r16u!();
         skip!(1);
-        let revolution_counter  = r16u!();
-        let loops_per_sec       = r16u!();
-        let free_heap_pct       = r8u!();
+        let revolution_counter = r16u!();
+        let loops_per_sec = r16u!();
+        let free_heap_pct = r8u!();
         let rotational_idle_cut_pct = r8u!();
         let rotational_idle_timer_cs = r16u!();
         let rotational_idle_active_cylinders = r8u!();
@@ -474,26 +562,68 @@ impl LiveDataFrame {
         let transmission_state_code = r8u!();
         let transmission_request_age_cs = r16u!();
         let transmission_ack_counter = r8u!();
-        debug_assert_eq!(o, 128, "live_data decode offset drift: expected 128, got {o}");
+        debug_assert_eq!(
+            o, 128,
+            "live_data decode offset drift: expected 128, got {o}"
+        );
 
         Self {
             timestamp_ms,
-            rpm, rpm_accel, sync_loss_counter,
-            map_kpa, baro_kpa, oil_pressure_kpa, fuel_pressure_kpa, boost_kpa,
-            coolant_c, intake_c, oil_temp_c, fuel_temp_c, aux_temp1_c, aux_temp2_c, mcu_temp_c,
-            tps_pct, pedal_pct, fuel_load, ign_load,
-            lambda, lambda2, afr_target, injector_duty_pct, ve_pct,
-            fuel_correction_pct, accel_enrich_pct, actual_pulsewidth_ms, wall_fuel_mg,
-            advance_deg, dwell_ms, injection_offset_deg,
-            vbatt, vref_mv,
-            vss_kmh, gear,
-            vvt_b1_intake_deg, vvt_b1_exhaust_deg, vvt_b2_intake_deg, vvt_b2_exhaust_deg,
-            knock_level, knock_retard_deg,
-            boost_target_kpa, boost_duty_pct,
-            idle_target_rpm, idle_valve_pct,
-            correction_iat, correction_clt, correction_baro, correction_flex,
-            status_flags, protect_flags, error_flags,
-            revolution_counter, loops_per_sec, free_heap_pct,
+            rpm,
+            rpm_accel,
+            sync_loss_counter,
+            map_kpa,
+            baro_kpa,
+            oil_pressure_kpa,
+            fuel_pressure_kpa,
+            boost_kpa,
+            coolant_c,
+            intake_c,
+            oil_temp_c,
+            fuel_temp_c,
+            aux_temp1_c,
+            aux_temp2_c,
+            mcu_temp_c,
+            tps_pct,
+            pedal_pct,
+            fuel_load,
+            ign_load,
+            lambda,
+            lambda2,
+            afr_target,
+            injector_duty_pct,
+            ve_pct,
+            fuel_correction_pct,
+            accel_enrich_pct,
+            actual_pulsewidth_ms,
+            wall_fuel_mg,
+            advance_deg,
+            dwell_ms,
+            injection_offset_deg,
+            vbatt,
+            vref_mv,
+            vss_kmh,
+            gear,
+            vvt_b1_intake_deg,
+            vvt_b1_exhaust_deg,
+            vvt_b2_intake_deg,
+            vvt_b2_exhaust_deg,
+            knock_level,
+            knock_retard_deg,
+            boost_target_kpa,
+            boost_duty_pct,
+            idle_target_rpm,
+            idle_valve_pct,
+            correction_iat,
+            correction_clt,
+            correction_baro,
+            correction_flex,
+            status_flags,
+            protect_flags,
+            error_flags,
+            revolution_counter,
+            loops_per_sec,
+            free_heap_pct,
             rotational_idle_cut_pct,
             rotational_idle_timer_cs,
             rotational_idle_active_cylinders,
@@ -516,35 +646,36 @@ impl LiveDataFrame {
 
 // ─── Status flag bit positions (match StatusFlags in protocol.ts) ─────────────
 pub mod status {
-    pub const RUNNING:         u32 = 1 << 0;
-    pub const CRANKING:        u32 = 1 << 1;
-    pub const WARMUP:          u32 = 1 << 2;
-    pub const ASE:             u32 = 1 << 3;
-    pub const DFCO:            u32 = 1 << 4;
-    pub const CLOSED_LOOP:     u32 = 1 << 5;
-    pub const ACCEL_ENRICH:    u32 = 1 << 6;
-    pub const LAUNCH_ACTIVE:   u32 = 1 << 7;
+    pub const RUNNING: u32 = 1 << 0;
+    pub const CRANKING: u32 = 1 << 1;
+    pub const WARMUP: u32 = 1 << 2;
+    pub const ASE: u32 = 1 << 3;
+    pub const DFCO: u32 = 1 << 4;
+    pub const CLOSED_LOOP: u32 = 1 << 5;
+    pub const ACCEL_ENRICH: u32 = 1 << 6;
+    pub const LAUNCH_ACTIVE: u32 = 1 << 7;
     pub const LAUNCH_HARD_CUT: u32 = 1 << 8;
-    pub const FLAT_SHIFT:      u32 = 1 << 9;
-    pub const BOOST_CUT_FUEL:  u32 = 1 << 10;
+    pub const FLAT_SHIFT: u32 = 1 << 9;
+    pub const BOOST_CUT_FUEL: u32 = 1 << 10;
     pub const BOOST_CUT_SPARK: u32 = 1 << 11;
-    pub const NITROUS_ACTIVE:  u32 = 1 << 12;
+    pub const NITROUS_ACTIVE: u32 = 1 << 12;
     pub const TRACTION_ACTIVE: u32 = 1 << 13;
-    pub const VSS_VALID:       u32 = 1 << 14;
-    pub const FLEX_VALID:      u32 = 1 << 15;
-    pub const SD_PRESENT:      u32 = 1 << 16;
-    pub const SD_LOGGING:      u32 = 1 << 17;
-    pub const WIFI_CONNECTED:  u32 = 1 << 18;
-    pub const CAN_ACTIVE:      u32 = 1 << 19;
-    pub const USB_CONNECTED:   u32 = 1 << 20;
-    pub const CHECK_ENGINE:    u32 = 1 << 21;
-    pub const NEED_BURN:       u32 = 1 << 22;
-    pub const OVERREV:         u32 = 1 << 23;
+    pub const VSS_VALID: u32 = 1 << 14;
+    pub const FLEX_VALID: u32 = 1 << 15;
+    pub const SD_PRESENT: u32 = 1 << 16;
+    pub const SD_LOGGING: u32 = 1 << 17;
+    pub const WIFI_CONNECTED: u32 = 1 << 18;
+    pub const CAN_ACTIVE: u32 = 1 << 19;
+    pub const USB_CONNECTED: u32 = 1 << 20;
+    pub const CHECK_ENGINE: u32 = 1 << 21;
+    pub const NEED_BURN: u32 = 1 << 22;
+    pub const OVERREV: u32 = 1 << 23;
     pub const ROTATIONAL_IDLE_ACTIVE: u32 = 1 << 24;
     pub const ROTATIONAL_IDLE_ARMED: u32 = 1 << 25;
     pub const WIDEBAND_HEATER_READY: u32 = 1 << 26;
     pub const WIDEBAND_INTEGRATED_ACTIVE: u32 = 1 << 27;
     pub const WIDEBAND_ANALOG_FALLBACK: u32 = 1 << 28;
+    pub const WIDEBAND_EXTERNAL_ACTIVE: u32 = 1 << 29;
 }
 
 pub mod transmission_status {
@@ -552,35 +683,37 @@ pub mod transmission_status {
     pub const SHIFT_IN_PROGRESS: u8 = 1 << 1;
     pub const TORQUE_INTERVENTION_ACTIVE: u8 = 1 << 2;
     pub const TORQUE_INTERVENTION_REQUESTED: u8 = 1 << 3;
+    pub const RX_STREAM_FRESH: u8 = 1 << 4;
+    pub const TX_STREAM_FRESH: u8 = 1 << 5;
 }
 
 // ─── Protect flag bits ────────────────────────────────────────────────────────
 pub mod protect {
-    pub const RPM:     u8 = 1 << 0;
-    pub const MAP:     u8 = 1 << 1;
-    pub const OIL:     u8 = 1 << 2;
-    pub const AFR:     u8 = 1 << 3;
+    pub const RPM: u8 = 1 << 0;
+    pub const MAP: u8 = 1 << 1;
+    pub const OIL: u8 = 1 << 2;
+    pub const AFR: u8 = 1 << 3;
     pub const COOLANT: u8 = 1 << 4;
 }
 
 // ─── Error flag bits ─────────────────────────────────────────────────────────
 pub mod error {
-    pub const TPS:            u16 = 1 << 0;
-    pub const TPS2:           u16 = 1 << 1;
-    pub const CLT:            u16 = 1 << 2;
-    pub const IAT:            u16 = 1 << 3;
-    pub const MAP:            u16 = 1 << 4;
-    pub const O2_PRIMARY:     u16 = 1 << 5;
-    pub const O2_SECONDARY:   u16 = 1 << 6;
-    pub const TRIGGER:        u16 = 1 << 7;
-    pub const PEDAL:          u16 = 1 << 8;
-    pub const INJECTOR:       u16 = 1 << 9;
-    pub const IGNITION:       u16 = 1 << 10;
-    pub const ANALOG_SUPPLY:  u16 = 1 << 11;
-    pub const KNOCK:          u16 = 1 << 12;
-    pub const VVT:            u16 = 1 << 13;
-    pub const BOOST_VALVE:    u16 = 1 << 14;
-    pub const CRITICAL:       u16 = 1 << 15;
+    pub const TPS: u16 = 1 << 0;
+    pub const TPS2: u16 = 1 << 1;
+    pub const CLT: u16 = 1 << 2;
+    pub const IAT: u16 = 1 << 3;
+    pub const MAP: u16 = 1 << 4;
+    pub const O2_PRIMARY: u16 = 1 << 5;
+    pub const O2_SECONDARY: u16 = 1 << 6;
+    pub const TRIGGER: u16 = 1 << 7;
+    pub const PEDAL: u16 = 1 << 8;
+    pub const INJECTOR: u16 = 1 << 9;
+    pub const IGNITION: u16 = 1 << 10;
+    pub const ANALOG_SUPPLY: u16 = 1 << 11;
+    pub const KNOCK: u16 = 1 << 12;
+    pub const VVT: u16 = 1 << 13;
+    pub const BOOST_VALVE: u16 = 1 << 14;
+    pub const CRITICAL: u16 = 1 << 15;
 }
 
 #[cfg(test)]
@@ -684,7 +817,10 @@ mod tests {
         frame.transmission_ack_counter = 15;
         let enc = frame.encode();
         let dec = LiveDataFrame::decode(&enc);
-        assert_eq!(dec.transmission_status_flags, frame.transmission_status_flags);
+        assert_eq!(
+            dec.transmission_status_flags,
+            frame.transmission_status_flags
+        );
         assert_eq!(dec.transmission_requested_gear, 4);
         assert_eq!(dec.transmission_torque_reduction_pct, 28);
         assert_eq!(dec.transmission_torque_reduction_timer_cs, 145);

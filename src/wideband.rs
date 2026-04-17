@@ -1,10 +1,13 @@
 const HEATER_WARMUP_CS: u16 = 260;
 const PRIMARY_FAULT_HOLD_CS: u16 = 42;
 const SECONDARY_FAULT_HOLD_CS: u16 = 28;
+const EXTERNAL_MODULE_PERIOD_SAMPLES: u32 = 280;
+const EXTERNAL_MODULE_WINDOW_SAMPLES: u32 = 26;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WidebandSource {
     IntegratedController,
+    ExternalModule,
     AnalogFallback,
     Unknown,
 }
@@ -59,8 +62,7 @@ impl WidebandRuntime {
         }
 
         if self.heater_warmup_remaining_cs > 0 {
-            self.heater_warmup_remaining_cs =
-                self.heater_warmup_remaining_cs.saturating_sub(2);
+            self.heater_warmup_remaining_cs = self.heater_warmup_remaining_cs.saturating_sub(2);
         }
         let heater_ready = self.heater_warmup_remaining_cs == 0;
         let calibration_ready = heater_ready;
@@ -82,10 +84,17 @@ impl WidebandRuntime {
 
         let primary_fault = self.primary_fault_hold_cs > 0;
         let secondary_fault = self.secondary_fault_hold_cs > 0;
-        let integrated_active = heater_ready && !primary_fault && !secondary_fault;
-        let analog_fallback = !integrated_active;
+        let external_module_active = heater_ready
+            && !primary_fault
+            && !secondary_fault
+            && sample_counter % EXTERNAL_MODULE_PERIOD_SAMPLES < EXTERNAL_MODULE_WINDOW_SAMPLES;
+        let integrated_active =
+            heater_ready && !primary_fault && !secondary_fault && !external_module_active;
+        let analog_fallback = !integrated_active && !external_module_active;
         let source = if integrated_active {
             WidebandSource::IntegratedController
+        } else if external_module_active {
+            WidebandSource::ExternalModule
         } else {
             WidebandSource::AnalogFallback
         };
@@ -93,11 +102,15 @@ impl WidebandRuntime {
         let ripple = ((sample_counter % 17) as f32 - 8.0) * 0.0008;
         let lambda_primary = if integrated_active {
             0.998 + ripple
+        } else if external_module_active {
+            1.006 + ripple * 0.7
         } else {
             1.028 + ripple
         };
         let lambda_secondary = if integrated_active {
             1.004 + ripple * 0.8
+        } else if external_module_active {
+            1.01 + ripple * 0.6
         } else {
             1.034 + ripple * 0.8
         };
@@ -130,7 +143,10 @@ mod tests {
 
         assert!(last.heater_ready, "heater never became ready");
         assert!(last.calibration_ready, "calibration never became ready");
-        assert!(last.integrated_active, "controller never became integrated-active");
+        assert!(
+            last.integrated_active,
+            "controller never became integrated-active"
+        );
         assert_eq!(last.source, WidebandSource::IntegratedController);
     }
 
@@ -159,5 +175,29 @@ mod tests {
         let stopped = runtime.tick(181, false);
         assert!(!stopped.heater_ready);
         assert_eq!(stopped.source, WidebandSource::Unknown);
+    }
+
+    #[test]
+    fn periodically_reports_external_module_source_window() {
+        let mut runtime = WidebandRuntime::default();
+
+        // Warmup first.
+        for tick in 0..220 {
+            runtime.tick(tick, true);
+        }
+
+        let mut saw_external_source = false;
+        for tick in 220..620 {
+            let sample = runtime.tick(tick, true);
+            if sample.source == WidebandSource::ExternalModule {
+                saw_external_source = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_external_source,
+            "expected external wideband source window"
+        );
     }
 }

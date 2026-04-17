@@ -553,6 +553,12 @@ impl FirmwareRuntime {
         if wideband.analog_fallback {
             frame.status_flags |= status::WIDEBAND_ANALOG_FALLBACK;
         }
+        if matches!(
+            wideband.source,
+            crate::wideband::WidebandSource::ExternalModule
+        ) {
+            frame.status_flags |= status::WIDEBAND_EXTERNAL_ACTIVE;
+        }
         if wideband.primary_fault {
             frame.error_flags |= error::O2_PRIMARY;
         }
@@ -588,7 +594,10 @@ impl FirmwareRuntime {
                 Cmd::Capabilities,
                 encode_capabilities_payload(&self.capabilities),
             ),
-            Cmd::GetLiveData => Packet::new(Cmd::LiveData, self.build_live_data_frame().encode().to_vec()),
+            Cmd::GetLiveData => Packet::new(
+                Cmd::LiveData,
+                self.build_live_data_frame().encode().to_vec(),
+            ),
             Cmd::GetSensorRaw => {
                 let channel = packet.payload.first().copied().unwrap_or(0);
                 let (adc, voltage) = sensor_raw_sample(channel);
@@ -880,7 +889,8 @@ mod tests {
                 (frame.transmission_status_flags & transmission_status::TCU_LINK_ONLINE) != 0;
             saw_online |= link_online;
             saw_offline |= !link_online;
-            saw_shift_state |= frame.transmission_state_code == 1 || frame.transmission_state_code == 3;
+            saw_shift_state |=
+                frame.transmission_state_code == 1 || frame.transmission_state_code == 3;
             saw_request_age |= frame.transmission_request_age_cs > 0;
             max_request_counter = max_request_counter.max(frame.transmission_shift_request_counter);
             max_ack_counter = max_ack_counter.max(frame.transmission_ack_counter);
@@ -888,9 +898,18 @@ mod tests {
 
         assert!(saw_online, "expected link-online samples");
         assert!(saw_offline, "expected deterministic link-offline samples");
-        assert!(saw_shift_state, "expected at least one request/shifting state sample");
-        assert!(saw_request_age, "expected request age counter to become non-zero");
-        assert!(max_request_counter > 0, "expected shift request counter activity");
+        assert!(
+            saw_shift_state,
+            "expected at least one request/shifting state sample"
+        );
+        assert!(
+            saw_request_age,
+            "expected request age counter to become non-zero"
+        );
+        assert!(
+            max_request_counter > 0,
+            "expected shift request counter activity"
+        );
         assert!(max_ack_counter > 0, "expected shift ack counter activity");
     }
 
@@ -913,7 +932,10 @@ mod tests {
             max_timeout_counter > 0,
             "expected timeout counter to increment at least once"
         );
-        assert!(saw_timeout_fault_code, "expected to observe timeout fault code 2");
+        assert!(
+            saw_timeout_fault_code,
+            "expected to observe timeout fault code 2"
+        );
     }
 
     #[test]
@@ -927,12 +949,15 @@ mod tests {
             let frame = decode_live_frame(&response.payload);
             saw_active_cut |= frame.rotational_idle_cut_pct > 0
                 && (frame.status_flags & status::ROTATIONAL_IDLE_ACTIVE) != 0;
-            saw_sync_guard |= frame.rotational_idle_sync_guard_events > 0
-                && frame.rotational_idle_gate_code == 9;
+            saw_sync_guard |=
+                frame.rotational_idle_sync_guard_events > 0 && frame.rotational_idle_gate_code == 9;
         }
 
         assert!(saw_active_cut, "expected rotational-idle cut activity");
-        assert!(saw_sync_guard, "expected at least one sync-guard gate event");
+        assert!(
+            saw_sync_guard,
+            "expected at least one sync-guard gate event"
+        );
     }
 
     #[test]
@@ -941,6 +966,7 @@ mod tests {
         let mut saw_heater_ready = false;
         let mut saw_integrated_mode = false;
         let mut saw_analog_fallback = false;
+        let mut saw_external_module = false;
         let mut saw_primary_fault = false;
 
         for _ in 0..320 {
@@ -949,13 +975,18 @@ mod tests {
             saw_heater_ready |= (frame.status_flags & status::WIDEBAND_HEATER_READY) != 0;
             saw_integrated_mode |= (frame.status_flags & status::WIDEBAND_INTEGRATED_ACTIVE) != 0;
             saw_analog_fallback |= (frame.status_flags & status::WIDEBAND_ANALOG_FALLBACK) != 0;
+            saw_external_module |= (frame.status_flags & status::WIDEBAND_EXTERNAL_ACTIVE) != 0;
             saw_primary_fault |= (frame.error_flags & error::O2_PRIMARY) != 0;
         }
 
         assert!(saw_heater_ready, "expected heater-ready status bit");
         assert!(saw_integrated_mode, "expected integrated wideband mode bit");
         assert!(saw_analog_fallback, "expected fallback status bit");
-        assert!(saw_primary_fault, "expected deterministic primary O2 fault window");
+        assert!(saw_external_module, "expected external wideband mode bit");
+        assert!(
+            saw_primary_fault,
+            "expected deterministic primary O2 fault window"
+        );
     }
 
     #[test]
@@ -976,6 +1007,54 @@ mod tests {
         let burn = runtime.handle_packet(Packet::new(Cmd::BurnPage, encode_page_request(0)));
         assert_eq!(burn.cmd, Cmd::Ack);
         assert_eq!(decode_ack_payload(&burn.payload).unwrap(), (0, false));
+    }
+
+    #[test]
+    fn write_read_and_burn_page_flow_is_consistent_for_pages_2_5_9() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        for page_id in [2u8, 5u8, 9u8] {
+            let len = runtime.store.page_length(page_id).unwrap();
+            let data = (0..len)
+                .map(|index| page_id.wrapping_mul(29).wrapping_add((index % 251) as u8))
+                .collect::<Vec<_>>();
+
+            let write = runtime.handle_packet(Packet::new(
+                Cmd::WritePage,
+                encode_page_payload(page_id, &data),
+            ));
+            assert_eq!(write.cmd, Cmd::Ack);
+            assert_eq!(decode_ack_payload(&write.payload).unwrap(), (page_id, true));
+
+            let read =
+                runtime.handle_packet(Packet::new(Cmd::ReadPage, encode_page_request(page_id)));
+            let decoded_page = decode_page_payload(&read.payload).unwrap();
+            assert_eq!(read.cmd, Cmd::PageData);
+            assert_eq!(decoded_page.payload, data);
+
+            let statuses_before = runtime.handle_packet(Packet::new(Cmd::GetPageStatuses, vec![]));
+            let decoded_before = decode_page_statuses_payload(&statuses_before.payload).unwrap();
+            assert!(
+                decoded_before
+                    .iter()
+                    .any(|status| status.page_id == page_id && status.needs_burn),
+                "page {page_id} should require burn after write"
+            );
+
+            let burn =
+                runtime.handle_packet(Packet::new(Cmd::BurnPage, encode_page_request(page_id)));
+            assert_eq!(burn.cmd, Cmd::Ack);
+            assert_eq!(decode_ack_payload(&burn.payload).unwrap(), (page_id, false));
+
+            let statuses_after = runtime.handle_packet(Packet::new(Cmd::GetPageStatuses, vec![]));
+            let decoded_after = decode_page_statuses_payload(&statuses_after.payload).unwrap();
+            assert!(
+                decoded_after
+                    .iter()
+                    .any(|status| status.page_id == page_id && !status.needs_burn),
+                "page {page_id} should be clean after burn"
+            );
+        }
     }
 
     #[test]
