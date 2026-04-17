@@ -869,6 +869,7 @@ fn nack(code: RuntimeNackCode, reason: &str) -> Packet {
 
 #[cfg(test)]
 mod tests {
+    use crate::contract::Capability;
     use crate::io::{
         apply_assignment_overrides, deserialize_assignments_from_page,
         serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
@@ -1034,6 +1035,42 @@ mod tests {
     }
 
     #[test]
+    fn runtime_rotational_idle_tracks_diagnostics_counters() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+
+        for _ in 0..720 {
+            let _ = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        }
+        for tick in 0..620 {
+            let _ = runtime
+                .rotational_idle_runtime
+                .tick(tick, 860.0, 2.0, 0, false);
+        }
+
+        let diagnostics = runtime.rotational_idle_runtime.diagnostics();
+        assert!(
+            diagnostics.activation_count > 0,
+            "expected rotational-idle activation counter"
+        );
+        assert!(
+            diagnostics.sync_guard_events_total > 0,
+            "expected sync-guard event accounting"
+        );
+        assert!(
+            diagnostics.timeout_count > 0,
+            "expected timeout-event accounting"
+        );
+        assert!(
+            diagnostics.gate_reason_histogram[9] > 0,
+            "expected sync-guard gate histogram activity"
+        );
+        assert!(
+            diagnostics.gate_reason_histogram[8] > 0,
+            "expected timeout gate histogram activity"
+        );
+    }
+
+    #[test]
     fn runtime_live_data_exposes_wideband_status_and_fault_windows() {
         let mut runtime = FirmwareRuntime::new_simulator();
         let mut saw_heater_ready = false;
@@ -1128,6 +1165,62 @@ mod tests {
                 "page {page_id} should be clean after burn"
             );
         }
+    }
+
+    #[test]
+    fn runtime_end_to_end_handshake_live_page_and_table_flow() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let version = runtime.handle_packet(Packet::new(Cmd::GetVersion, vec![]));
+        let parsed_version = decode_identity_payload(&version.payload).unwrap();
+        assert_eq!(version.cmd, Cmd::VersionResponse);
+        assert_eq!(parsed_version.board_id, "st-ecu-v1");
+
+        let capabilities = runtime.handle_packet(Packet::new(Cmd::GetCapabilities, vec![]));
+        let parsed_caps = decode_capabilities_payload(&capabilities.payload).unwrap();
+        assert_eq!(capabilities.cmd, Cmd::Capabilities);
+        assert!(parsed_caps.contains(&Capability::LiveData));
+        assert!(parsed_caps.contains(&Capability::PageWrite));
+        assert!(parsed_caps.contains(&Capability::TableWrite));
+
+        let live = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        assert_eq!(live.cmd, Cmd::LiveData);
+        let live_frame = decode_live_frame(&live.payload);
+        assert!(live_frame.rpm > 0.0);
+
+        let page_data = vec![0x5A; runtime.store.page_length(0).unwrap()];
+        let write_page = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(0, &page_data),
+        ));
+        assert_eq!(write_page.cmd, Cmd::Ack);
+
+        let read_page = runtime.handle_packet(Packet::new(Cmd::ReadPage, encode_page_request(0)));
+        let decoded_page = decode_page_payload(&read_page.payload).unwrap();
+        assert_eq!(read_page.cmd, Cmd::PageData);
+        assert_eq!(decoded_page.payload, page_data);
+
+        let burn_page = runtime.handle_packet(Packet::new(Cmd::BurnPage, encode_page_request(0)));
+        assert_eq!(burn_page.cmd, Cmd::Ack);
+        assert_eq!(decode_ack_payload(&burn_page.payload).unwrap(), (0, false));
+
+        let baseline = runtime.handle_packet(Packet::new(Cmd::ReadTable, vec![0x03]));
+        let mut decoded_table = decode_raw_table_payload(&baseline.payload).unwrap();
+        decoded_table.data[0] = decoded_table.data[0].wrapping_add(3);
+
+        let write_table = runtime.handle_packet(Packet::new(Cmd::WriteTable, decoded_table.to_payload()));
+        assert_eq!(write_table.cmd, Cmd::Ack);
+
+        let write_cell =
+            runtime.handle_packet(Packet::new(Cmd::WriteCell, vec![0x03, 1, 2, 0x00, 0x9C]));
+        assert_eq!(write_cell.cmd, Cmd::Ack);
+
+        let table_after = runtime.handle_packet(Packet::new(Cmd::ReadTable, vec![0x03]));
+        let decoded_after = decode_raw_table_payload(&table_after.payload).unwrap();
+        assert_eq!(table_after.cmd, Cmd::TableData);
+        assert_eq!(decoded_after.data[0], decoded_table.data[0]);
+        let cell_offset = 2 * decoded_after.x_count as usize + 1;
+        assert_eq!(decoded_after.data[cell_offset], 0x009C);
     }
 
     #[test]
