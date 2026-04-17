@@ -6,8 +6,9 @@ use crate::io::{
     serialize_assignments_to_page, validate_assignment_set, AssignmentError, PinAssignmentRequest,
     ResolvedPinAssignment,
 };
-use crate::live_data::{error, status, LiveDataFrame};
+use crate::live_data::{error, protect, status, LiveDataFrame};
 use crate::network::{headless_network_profile, NetworkProfile};
+use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, ProtectionState};
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, encode_ack_payload,
     encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
@@ -84,6 +85,8 @@ pub struct FirmwareRuntime {
     tcu_runtime: ExternalTcuRuntime,
     rotational_idle_runtime: RotationalIdleRuntime,
     wideband_runtime: WidebandRuntime,
+    protection_manager: ProtectionManager,
+    protection_state: ProtectionState,
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
@@ -414,6 +417,8 @@ impl FirmwareRuntime {
             tcu_runtime: ExternalTcuRuntime::default(),
             rotational_idle_runtime: RotationalIdleRuntime::default(),
             wideband_runtime: WidebandRuntime::default(),
+            protection_manager: ProtectionManager::new(ProtectionConfig::default()),
+            protection_state: ProtectionState::default(),
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
@@ -508,10 +513,15 @@ impl FirmwareRuntime {
         frame.vss_kmh = if shift_in_progress { 46.0 } else { 44.0 };
         frame.tps_pct = if shift_in_progress { 24.0 } else { 3.5 };
         frame.map_kpa = if shift_in_progress { 62.0 } else { 36.0 };
+        frame.baro_kpa = 100.4;
+        frame.boost_kpa = frame.map_kpa - frame.baro_kpa;
+        frame.oil_pressure_kpa = if shift_in_progress { 255.0 } else { 298.0 };
+        frame.fuel_pressure_kpa = 392.0;
         frame.coolant_c = 88.5;
         frame.intake_c = 43.0;
         frame.aux_temp1_c = 805.0 + ((self.live_sample_counter % 8) as f32);
         frame.aux_temp2_c = 790.0 + ((self.live_sample_counter % 6) as f32);
+        frame.afr_target = 14.7;
         frame.idle_target_rpm = 980;
         frame.idle_valve_pct = 34;
         frame.status_flags =
@@ -519,25 +529,6 @@ impl FirmwareRuntime {
         if shift_in_progress {
             frame.status_flags |= status::FLAT_SHIFT;
         }
-
-        let rotational = self.rotational_idle_runtime.tick(
-            self.live_sample_counter,
-            frame.aux_temp1_c,
-            frame.tps_pct,
-            frame.sync_loss_counter,
-            tcu.shift_fault_code == 5,
-        );
-        if rotational.active {
-            frame.status_flags |= status::ROTATIONAL_IDLE_ACTIVE;
-        }
-        if rotational.armed {
-            frame.status_flags |= status::ROTATIONAL_IDLE_ARMED;
-        }
-        frame.rotational_idle_cut_pct = rotational.cut_pct;
-        frame.rotational_idle_timer_cs = rotational.timer_cs;
-        frame.rotational_idle_active_cylinders = rotational.active_cylinders;
-        frame.rotational_idle_gate_code = rotational.gate_reason_code;
-        frame.rotational_idle_sync_guard_events = rotational.sync_guard_events;
 
         let wideband = self
             .wideband_runtime
@@ -568,6 +559,60 @@ impl FirmwareRuntime {
         if wideband.primary_fault || wideband.secondary_fault {
             frame.status_flags |= status::CHECK_ENGINE;
         }
+
+        let afr_estimate = if frame.lambda.is_finite() && frame.lambda > 0.05 {
+            frame.lambda * 14.7
+        } else {
+            frame.afr_target.max(1.0)
+        };
+        let protection_action = self.protection_manager.evaluate(
+            &mut self.protection_state,
+            frame.rpm,
+            frame.map_kpa,
+            frame.oil_pressure_kpa,
+            frame.coolant_c,
+            afr_estimate,
+            frame.aux_temp1_c,
+            frame.aux_temp2_c,
+        );
+        frame.protect_flags = 0;
+        if self.protection_state.rpm_protect {
+            frame.protect_flags |= protect::RPM;
+        }
+        if self.protection_state.map_protect {
+            frame.protect_flags |= protect::MAP;
+        }
+        if self.protection_state.oil_protect {
+            frame.protect_flags |= protect::OIL;
+        }
+        if self.protection_state.afr_protect {
+            frame.protect_flags |= protect::AFR;
+        }
+        if self.protection_state.coolant_protect {
+            frame.protect_flags |= protect::COOLANT;
+        }
+        if !matches!(protection_action, ProtectionAction::None) {
+            frame.status_flags |= status::CHECK_ENGINE;
+        }
+
+        let rotational = self.rotational_idle_runtime.tick(
+            self.live_sample_counter,
+            frame.aux_temp1_c,
+            frame.tps_pct,
+            frame.sync_loss_counter,
+            frame.protect_flags != 0 || tcu.shift_fault_code == 5,
+        );
+        if rotational.active {
+            frame.status_flags |= status::ROTATIONAL_IDLE_ACTIVE;
+        }
+        if rotational.armed {
+            frame.status_flags |= status::ROTATIONAL_IDLE_ARMED;
+        }
+        frame.rotational_idle_cut_pct = rotational.cut_pct;
+        frame.rotational_idle_timer_cs = rotational.timer_cs;
+        frame.rotational_idle_active_cylinders = rotational.active_cylinders;
+        frame.rotational_idle_gate_code = rotational.gate_reason_code;
+        frame.rotational_idle_sync_guard_events = rotational.sync_guard_events;
 
         frame.transmission_status_flags = tcu.status_flags;
         frame.transmission_requested_gear = tcu.requested_gear;
@@ -828,7 +873,9 @@ mod tests {
         apply_assignment_overrides, deserialize_assignments_from_page,
         serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
     };
-    use crate::live_data::{error, status, transmission_status, LiveDataFrame, LIVE_DATA_SIZE};
+    use crate::live_data::{
+        error, protect, status, transmission_status, LiveDataFrame, LIVE_DATA_SIZE,
+    };
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
@@ -957,6 +1004,32 @@ mod tests {
         assert!(
             saw_sync_guard,
             "expected at least one sync-guard gate event"
+        );
+    }
+
+    #[test]
+    fn runtime_rotational_idle_respects_protection_gate_and_sets_protect_flags() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+        runtime.protection_manager.config.map_max_kpa.action = 30.0;
+
+        let mut saw_map_protection = false;
+        let mut saw_protection_gate = false;
+
+        for _ in 0..80 {
+            let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+            let frame = decode_live_frame(&response.payload);
+            saw_map_protection |= (frame.protect_flags & protect::MAP) != 0;
+            saw_protection_gate |= frame.rotational_idle_gate_code == 10
+                && (frame.status_flags & status::ROTATIONAL_IDLE_ACTIVE) == 0;
+            if saw_map_protection && saw_protection_gate {
+                break;
+            }
+        }
+
+        assert!(saw_map_protection, "expected MAP protection flag activity");
+        assert!(
+            saw_protection_gate,
+            "expected rotational-idle protection gate reason (10)"
         );
     }
 

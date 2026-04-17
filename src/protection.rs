@@ -66,6 +66,7 @@ pub struct ProtectionState {
     pub overrev_cut_events: u8,
 }
 
+#[derive(Debug, Clone)]
 pub struct ProtectionManager {
     pub config: ProtectionConfig,
 }
