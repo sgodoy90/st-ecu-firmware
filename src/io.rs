@@ -3,6 +3,7 @@ use crate::pinmux::PinFunctionClass;
 
 const PIN_ASSIGNMENT_FORMAT_VERSION: u8 = 1;
 const PIN_ASSIGNMENT_MAGIC: [u8; 4] = *b"STIO";
+const PIN_ASSIGNMENT_MAGIC_LEGACY: [u8; 4] = *b"STP3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EcuFunction {
@@ -348,7 +349,11 @@ pub fn serialize_assignments_to_page(
 pub fn deserialize_assignments_from_page(
     payload: &[u8],
 ) -> Result<Vec<ResolvedPinAssignment>, AssignmentError> {
-    if payload.len() < 6 || payload[0..4] != PIN_ASSIGNMENT_MAGIC {
+    if payload.len() < 6 {
+        return Err(AssignmentError::InvalidPayload);
+    }
+    let magic = [payload[0], payload[1], payload[2], payload[3]];
+    if magic != PIN_ASSIGNMENT_MAGIC && magic != PIN_ASSIGNMENT_MAGIC_LEGACY {
         return Err(AssignmentError::InvalidPayload);
     }
     if payload[4] != PIN_ASSIGNMENT_FORMAT_VERSION {
@@ -509,6 +514,17 @@ mod tests {
     fn page_codec_roundtrips_assignments() {
         let assignments = validate_assignment_set(&default_pin_assignments()).unwrap();
         let payload = serialize_assignments_to_page(&assignments, 128).unwrap();
+        let decoded = deserialize_assignments_from_page(&payload).unwrap();
+
+        assert_eq!(decoded, assignments);
+    }
+
+    #[test]
+    fn page_codec_accepts_legacy_magic_header() {
+        let assignments = validate_assignment_set(&default_pin_assignments()).unwrap();
+        let mut payload = serialize_assignments_to_page(&assignments, 128).unwrap();
+        payload[2] = b'P';
+        payload[3] = b'3';
         let decoded = deserialize_assignments_from_page(&payload).unwrap();
 
         assert_eq!(decoded, assignments);

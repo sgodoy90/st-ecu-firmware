@@ -27,6 +27,7 @@ use crate::trigger::{
 };
 use crate::wideband::WidebandRuntime;
 use crate::ConfigPage;
+use crc::{Crc, CRC_32_ISO_HDLC};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +165,11 @@ const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
         default_pulse_ms: None,
     },
 ];
+
+const FLASH_BLOCK_HEADER_LEN: usize = 4;
+const FLASH_BLOCK_MAX_BYTES: usize = 1024;
+const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
+static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 fn default_dtc_entries() -> Vec<RuntimeDtcEntry> {
     vec![
@@ -594,6 +600,42 @@ impl FirmwareRuntime {
         if !matches!(protection_action, ProtectionAction::None) {
             frame.status_flags |= status::CHECK_ENGINE;
         }
+        if self.protection_state.fuel_enrich_factor > 1.0 {
+            frame.fuel_correction_pct =
+                ((self.protection_state.fuel_enrich_factor - 1.0) * 100.0).clamp(0.0, 100.0);
+        }
+        match protection_action {
+            ProtectionAction::None => {}
+            ProtectionAction::IgnitionRetard => {
+                frame.advance_deg = frame.advance_deg.min(-8.0);
+            }
+            ProtectionAction::SparkCut => {
+                frame.status_flags |= status::BOOST_CUT_SPARK | status::OVERREV;
+            }
+            ProtectionAction::FuelEnrich => {
+                frame.fuel_correction_pct = frame.fuel_correction_pct.max(5.0);
+            }
+            ProtectionAction::FuelCut => {
+                frame.status_flags |= status::BOOST_CUT_FUEL;
+            }
+            ProtectionAction::SparkAndFuelCut => {
+                frame.status_flags |= status::BOOST_CUT_SPARK | status::BOOST_CUT_FUEL;
+                frame.status_flags |= status::OVERREV;
+            }
+            ProtectionAction::LimpMode => {
+                frame.status_flags |= status::BOOST_CUT_SPARK | status::BOOST_CUT_FUEL;
+                frame.rpm = frame.rpm.min(2_500.0);
+                frame.tps_pct = frame.tps_pct.min(30.0);
+            }
+            ProtectionAction::Shutdown => {
+                frame.status_flags |= status::BOOST_CUT_SPARK | status::BOOST_CUT_FUEL;
+                frame.status_flags &= !status::RUNNING;
+                frame.error_flags |= error::CRITICAL;
+                frame.rpm = 0.0;
+                frame.tps_pct = 0.0;
+                frame.map_kpa = frame.baro_kpa;
+            }
+        }
 
         let rotational = self.rotational_idle_runtime.tick(
             self.live_sample_counter,
@@ -730,6 +772,24 @@ impl FirmwareRuntime {
                 if packet.payload.len() < 2 {
                     return nack(RuntimeNackCode::MalformedPayload, "bad output-test payload");
                 }
+                if self.flash_session_active {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "output-test blocked during flash session",
+                    );
+                }
+                let protection_active = self.protection_state.rpm_protect
+                    || self.protection_state.map_protect
+                    || self.protection_state.oil_protect
+                    || self.protection_state.afr_protect
+                    || self.protection_state.coolant_protect
+                    || self.protection_state.egt_protect;
+                if protection_active {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "output-test blocked by active protection",
+                    );
+                }
                 let channel = packet.payload[0];
                 let known_channel = OUTPUT_TEST_DIRECTORY
                     .iter()
@@ -819,8 +879,11 @@ impl FirmwareRuntime {
                         "flash session not started",
                     );
                 }
-                if packet.payload.len() < 4 {
+                if packet.payload.len() <= FLASH_BLOCK_HEADER_LEN {
                     return nack(RuntimeNackCode::MalformedPayload, "bad flash-block payload");
+                }
+                if packet.payload.len() > FLASH_BLOCK_HEADER_LEN + FLASH_BLOCK_MAX_BYTES {
+                    return nack(RuntimeNackCode::MalformedPayload, "flash block too large");
                 }
                 let block_index = u32::from_be_bytes([
                     packet.payload[0],
@@ -834,13 +897,38 @@ impl FirmwareRuntime {
                         "unexpected flash block index",
                     );
                 }
-                self.flash_buffer.extend_from_slice(&packet.payload[4..]);
+                let payload = &packet.payload[FLASH_BLOCK_HEADER_LEN..];
+                if self.flash_buffer.len().saturating_add(payload.len()) > FLASH_BUFFER_MAX_BYTES {
+                    return nack(RuntimeNackCode::MalformedPayload, "flash image too large");
+                }
+                self.flash_buffer.extend_from_slice(payload);
                 self.flash_next_block = self.flash_next_block.saturating_add(1);
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashVerify => {
                 if !self.flash_session_active || self.flash_buffer.is_empty() {
                     return nack(RuntimeNackCode::MalformedPayload, "nothing to verify");
+                }
+                if !packet.payload.is_empty() && packet.payload.len() != 4 {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "bad flash-verify payload",
+                    );
+                }
+                if self.flash_buffer.iter().all(|byte| *byte == 0) {
+                    return nack(RuntimeNackCode::MalformedPayload, "flash image is blank");
+                }
+                if packet.payload.len() == 4 {
+                    let expected_crc = u32::from_be_bytes([
+                        packet.payload[0],
+                        packet.payload[1],
+                        packet.payload[2],
+                        packet.payload[3],
+                    ]);
+                    let actual_crc = FLASH_CRC32.checksum(&self.flash_buffer);
+                    if expected_crc != actual_crc {
+                        return nack(RuntimeNackCode::MalformedPayload, "flash crc mismatch");
+                    }
                 }
                 Packet::new(Cmd::Ack, vec![])
             }
@@ -853,6 +941,7 @@ impl FirmwareRuntime {
                 }
                 self.flash_session_active = false;
                 self.flash_next_block = 0;
+                self.flash_buffer.clear();
                 Packet::new(Cmd::Ack, vec![])
             }
             _ => nack(
@@ -1208,7 +1297,8 @@ mod tests {
         let mut decoded_table = decode_raw_table_payload(&baseline.payload).unwrap();
         decoded_table.data[0] = decoded_table.data[0].wrapping_add(3);
 
-        let write_table = runtime.handle_packet(Packet::new(Cmd::WriteTable, decoded_table.to_payload()));
+        let write_table =
+            runtime.handle_packet(Packet::new(Cmd::WriteTable, decoded_table.to_payload()));
         assert_eq!(write_table.cmd, Cmd::Ack);
 
         let write_cell =
