@@ -10,16 +10,17 @@ use crate::live_data::{error, protect, status, LiveDataFrame};
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, ProtectionState};
 use crate::protocol::{
-    decode_page_payload, decode_page_request, decode_raw_table_payload, encode_ack_payload,
-    encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
-    encode_log_block_payload, encode_log_status_payload, encode_nack_payload,
-    encode_network_profile_payload, encode_output_test_directory_payload,
-    encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
-    encode_pin_assignments_payload, encode_pin_directory_payload,
+    decode_page_payload, decode_page_request, decode_raw_table_payload, decode_sync_rtc_payload,
+    encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
+    encode_identity_payload, encode_log_block_payload, encode_log_status_payload,
+    encode_logbook_summary_payload, encode_nack_payload, encode_network_profile_payload,
+    encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
+    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
     encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
-    LogStatusPayload, OutputTestDirectoryEntry, Packet, RawTablePayload, SensorRawDirectoryEntry,
+    LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, RawTablePayload,
+    SensorRawDirectoryEntry,
 };
 use crate::rotational_idle::RotationalIdleRuntime;
 use crate::tcu::ExternalTcuRuntime;
@@ -96,6 +97,13 @@ pub struct FirmwareRuntime {
     log_storage_present: bool,
     log_rtc_synced: bool,
     logbook_entries: u8,
+    log_total_sessions: u32,
+    log_total_elapsed_ms: u32,
+    log_total_bytes_written: u32,
+    log_last_elapsed_ms: u32,
+    log_last_bytes_written: u32,
+    log_last_block_count: u16,
+    log_last_rtc_sync_ms: u32,
     log_session_id: u32,
     log_started_sample_counter: u32,
     log_elapsed_ms_latched: u32,
@@ -571,8 +579,15 @@ impl FirmwareRuntime {
             flash_buffer: Vec::new(),
             log_active: false,
             log_storage_present: true,
-            log_rtc_synced: true,
+            log_rtc_synced: false,
             logbook_entries: 0,
+            log_total_sessions: 0,
+            log_total_elapsed_ms: 0,
+            log_total_bytes_written: 0,
+            log_last_elapsed_ms: 0,
+            log_last_bytes_written: 0,
+            log_last_block_count: 0,
+            log_last_rtc_sync_ms: 0,
             log_session_id: 0,
             log_started_sample_counter: 0,
             log_elapsed_ms_latched: 0,
@@ -661,9 +676,13 @@ impl FirmwareRuntime {
         Ok(())
     }
 
+    fn current_runtime_ms(&self) -> u32 {
+        self.live_sample_counter.saturating_mul(20)
+    }
+
     fn current_log_elapsed_ms(&self) -> u32 {
         if self.log_active {
-            let now_ms = self.live_sample_counter.saturating_mul(20);
+            let now_ms = self.current_runtime_ms();
             let start_ms = self.log_started_sample_counter.saturating_mul(20);
             now_ms.saturating_sub(start_ms)
         } else {
@@ -718,6 +737,36 @@ impl FirmwareRuntime {
         None
     }
 
+    fn build_logbook_summary(&self) -> LogbookSummaryPayload {
+        LogbookSummaryPayload {
+            sessions: self.log_total_sessions,
+            entries: self.logbook_entries as u16,
+            total_elapsed_ms: self.log_total_elapsed_ms,
+            total_bytes_written: self.log_total_bytes_written,
+            last_session_id: self.log_session_id,
+            last_elapsed_ms: self.log_last_elapsed_ms,
+            last_bytes_written: self.log_last_bytes_written,
+            last_block_count: self.log_last_block_count,
+            rtc_synced: self.log_rtc_synced,
+            last_rtc_sync_ms: self.log_last_rtc_sync_ms,
+        }
+    }
+
+    fn reset_logbook(&mut self) {
+        self.logbook_entries = 0;
+        self.log_total_sessions = 0;
+        self.log_total_elapsed_ms = 0;
+        self.log_total_bytes_written = 0;
+        self.log_last_elapsed_ms = 0;
+        self.log_last_bytes_written = 0;
+        self.log_last_block_count = 0;
+        self.log_session_id = 0;
+        self.log_elapsed_ms_latched = 0;
+        self.log_bytes_written = 0;
+        self.log_blocks.clear();
+        self.log_staging_block.clear();
+    }
+
     fn build_live_data_frame(&mut self) -> LiveDataFrame {
         self.live_sample_counter = self.live_sample_counter.wrapping_add(1);
         self.trigger_runtime.observe_tick(self.live_sample_counter);
@@ -726,7 +775,7 @@ impl FirmwareRuntime {
         }
 
         let mut frame = LiveDataFrame::default();
-        frame.timestamp_ms = self.live_sample_counter.saturating_mul(20);
+        frame.timestamp_ms = self.current_runtime_ms();
         let tcu = self.tcu_runtime.tick(self.live_sample_counter);
         let shift_in_progress = self.tcu_runtime.shift_in_progress();
         let actuator_config = self
@@ -1004,7 +1053,7 @@ impl FirmwareRuntime {
                 let header = format!(
                     "session={} start_ms={}\n",
                     self.log_session_id,
-                    self.live_sample_counter.saturating_mul(20)
+                    self.current_runtime_ms()
                 );
                 self.append_log_bytes(header.as_bytes());
                 Packet::new(Cmd::Ack, vec![])
@@ -1017,6 +1066,16 @@ impl FirmwareRuntime {
                         self.log_blocks.push(std::mem::take(&mut self.log_staging_block));
                     }
                     self.logbook_entries = self.logbook_entries.saturating_add(1);
+                    self.log_total_sessions = self.log_total_sessions.saturating_add(1);
+                    self.log_total_elapsed_ms = self
+                        .log_total_elapsed_ms
+                        .saturating_add(self.log_elapsed_ms_latched);
+                    self.log_total_bytes_written = self
+                        .log_total_bytes_written
+                        .saturating_add(self.log_bytes_written);
+                    self.log_last_elapsed_ms = self.log_elapsed_ms_latched;
+                    self.log_last_bytes_written = self.log_bytes_written;
+                    self.log_last_block_count = self.current_log_block_count();
                 }
                 Packet::new(Cmd::Ack, vec![])
             }
@@ -1034,6 +1093,28 @@ impl FirmwareRuntime {
                     block_size: self.log_block_size,
                 }),
             ),
+            Cmd::GetLogbookSummary => Packet::new(
+                Cmd::LogbookSummaryResponse,
+                encode_logbook_summary_payload(&self.build_logbook_summary()),
+            ),
+            Cmd::ResetLogbook => {
+                if self.log_active {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "cannot reset logbook while logging",
+                    );
+                }
+                self.reset_logbook();
+                Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::SyncRtc => match decode_sync_rtc_payload(&packet.payload) {
+                Ok(epoch_ms) => {
+                    self.log_rtc_synced = true;
+                    self.log_last_rtc_sync_ms = epoch_ms.min(u32::MAX as u64) as u32;
+                    Packet::new(Cmd::Ack, vec![])
+                }
+                Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad sync-rtc payload"),
+            },
             Cmd::ReadLogBlock => {
                 if packet.payload.len() != 2 {
                     return nack(RuntimeNackCode::MalformedPayload, "bad read-log-block payload");
@@ -1324,12 +1405,13 @@ mod tests {
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
         decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
-        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
-        decode_page_payload, decode_page_statuses_payload,
+        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
+        decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
         decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
-        decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request, Cmd, Packet,
+        decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request,
+        encode_sync_rtc_payload, Cmd, Packet,
     };
     use crate::ConfigPage;
     use serde_json::Value;
@@ -2043,6 +2125,72 @@ mod tests {
         let decoded_after = decode_log_status_payload(&status_after.payload).unwrap();
         assert!(!decoded_after.active);
         assert!(decoded_after.logbook_entries >= 1);
+    }
+
+    #[test]
+    fn runtime_logbook_summary_reset_and_rtc_sync() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let initial_summary = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let decoded_initial = decode_logbook_summary_payload(&initial_summary.payload).unwrap();
+        assert_eq!(initial_summary.cmd, Cmd::LogbookSummaryResponse);
+        assert_eq!(decoded_initial.sessions, 0);
+        assert_eq!(decoded_initial.entries, 0);
+        assert!(!decoded_initial.rtc_synced);
+
+        assert_eq!(runtime.handle_packet(Packet::new(Cmd::LogStart, vec![])).cmd, Cmd::Ack);
+        for _ in 0..10 {
+            let _ = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        }
+        assert_eq!(runtime.handle_packet(Packet::new(Cmd::LogStop, vec![])).cmd, Cmd::Ack);
+
+        let summary_after_log = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let decoded_after_log = decode_logbook_summary_payload(&summary_after_log.payload).unwrap();
+        assert_eq!(decoded_after_log.sessions, 1);
+        assert_eq!(decoded_after_log.entries, 1);
+        assert_eq!(decoded_after_log.last_session_id, 1);
+        assert!(decoded_after_log.last_elapsed_ms > 0);
+        assert!(decoded_after_log.last_bytes_written > 0);
+        assert!(decoded_after_log.last_block_count > 0);
+
+        let sync = runtime.handle_packet(Packet::new(
+            Cmd::SyncRtc,
+            encode_sync_rtc_payload(1_710_000_123_456),
+        ));
+        assert_eq!(sync.cmd, Cmd::Ack);
+        let synced_summary = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let decoded_synced = decode_logbook_summary_payload(&synced_summary.payload).unwrap();
+        assert!(decoded_synced.rtc_synced);
+        assert_eq!(decoded_synced.last_rtc_sync_ms, u32::MAX);
+
+        let reset = runtime.handle_packet(Packet::new(Cmd::ResetLogbook, vec![]));
+        assert_eq!(reset.cmd, Cmd::Ack);
+
+        let summary_after_reset = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let decoded_after_reset = decode_logbook_summary_payload(&summary_after_reset.payload).unwrap();
+        assert_eq!(decoded_after_reset.sessions, 0);
+        assert_eq!(decoded_after_reset.entries, 0);
+        assert_eq!(decoded_after_reset.total_elapsed_ms, 0);
+        assert_eq!(decoded_after_reset.total_bytes_written, 0);
+        assert_eq!(decoded_after_reset.last_session_id, 0);
+        assert_eq!(decoded_after_reset.last_block_count, 0);
+        assert!(decoded_after_reset.rtc_synced);
+    }
+
+    #[test]
+    fn runtime_rejects_invalid_rtc_sync_and_reset_while_logging() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(runtime.handle_packet(Packet::new(Cmd::LogStart, vec![])).cmd, Cmd::Ack);
+
+        let reset_while_logging = runtime.handle_packet(Packet::new(Cmd::ResetLogbook, vec![]));
+        assert_eq!(reset_while_logging.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&reset_while_logging.payload).unwrap();
+        assert!(reason.contains("cannot reset"));
+
+        let bad_sync = runtime.handle_packet(Packet::new(Cmd::SyncRtc, vec![0x00, 0x01]));
+        assert_eq!(bad_sync.cmd, Cmd::Nack);
+        let (_, bad_reason) = decode_nack_payload(&bad_sync.payload).unwrap();
+        assert!(bad_reason.contains("sync-rtc"));
     }
 
     #[test]
