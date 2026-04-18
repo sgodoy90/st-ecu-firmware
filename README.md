@@ -48,6 +48,8 @@ At the moment, shared contract docs live in:
 - `../st-manager/PROTOCOL-SCHEMA.md`
 - `../st-manager/LIVE-DATA-SCHEMA.md`
 - `../st-manager/FIRMWARE-COMPATIBILITY.md`
+- `../st-manager/UPDATE-LIFECYCLE.md`
+- `./docs/UPDATE-LIFECYCLE.md`
 
 This repository should eventually own the runtime implementation of those contracts.
 
