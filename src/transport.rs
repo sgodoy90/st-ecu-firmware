@@ -11,15 +11,17 @@ use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, ProtectionState};
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, decode_sync_rtc_payload,
-    encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
-    encode_identity_payload, encode_log_block_payload, encode_log_status_payload,
-    encode_logbook_summary_payload, encode_nack_payload, encode_network_profile_payload,
-    encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
-    encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+    encode_ack_payload, encode_can_signal_directory_payload, encode_can_template_directory_payload,
+    encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
+    encode_log_block_payload, encode_log_status_payload, encode_logbook_summary_payload,
+    encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
+    encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
+    encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
-    encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
-    LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, RawTablePayload,
+    encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload,
+    CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, LogStatusPayload,
+    LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, RawTablePayload,
     SensorRawDirectoryEntry,
 };
 use crate::rotational_idle::RotationalIdleRuntime;
@@ -255,8 +257,8 @@ fn parse_page0_actuator_config(payload: &[u8]) -> ActuatorRuntimeConfig {
     }
 
     if let Some(deadtime_raw) = read_be_u16(payload, PAGE0_OFFSET_DEADTIME_14V_MS) {
-        config.injector_deadtime_14v_ms =
-            (deadtime_raw as f32 / 1000.0).clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1);
+        config.injector_deadtime_14v_ms = (deadtime_raw as f32 / 1000.0)
+            .clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1);
     }
 
     config.dwell_mode_table = payload[PAGE0_OFFSET_DWELL_MODE] == 1;
@@ -278,7 +280,8 @@ fn parse_page0_actuator_config(payload: &[u8]) -> ActuatorRuntimeConfig {
         std::mem::swap(&mut dwell_max_ms, &mut dwell_min_ms);
     }
     if (dwell_max_ms - dwell_min_ms) < 0.1 {
-        dwell_max_ms = (dwell_min_ms + 0.1).clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
+        dwell_max_ms =
+            (dwell_min_ms + 0.1).clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
         if dwell_max_ms <= dwell_min_ms {
             dwell_min_ms = (dwell_max_ms - 0.1).max(ACTUATOR_DWELL_BOUNDS_MS.0);
         }
@@ -294,14 +297,21 @@ fn parse_page0_actuator_config(payload: &[u8]) -> ActuatorRuntimeConfig {
 
 fn injector_deadtime_for_conditions_ms(deadtime_14v_ms: f32, vbatt: f32, fuel_temp_c: f32) -> f32 {
     let voltage_comp_ms = (14.0 - vbatt).clamp(-6.0, 6.0) * 0.06;
-    let temperature_scale = (1.0 + ((20.0 - fuel_temp_c).clamp(-60.0, 60.0) * 0.0025)).clamp(0.85, 1.2);
+    let temperature_scale =
+        (1.0 + ((20.0 - fuel_temp_c).clamp(-60.0, 60.0) * 0.0025)).clamp(0.85, 1.2);
     ((deadtime_14v_ms + voltage_comp_ms).max(0.01) * temperature_scale)
         .clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1)
 }
 
-fn dwell_for_conditions_ms(config: &ActuatorRuntimeConfig, vbatt: f32, coolant_c: f32) -> (f32, f32) {
+fn dwell_for_conditions_ms(
+    config: &ActuatorRuntimeConfig,
+    vbatt: f32,
+    coolant_c: f32,
+) -> (f32, f32) {
     let voltage_exponent = if config.dwell_mode_table { 0.55 } else { 0.40 };
-    let voltage_scale = (14.0 / vbatt.max(8.0)).powf(voltage_exponent).clamp(0.65, 1.7);
+    let voltage_scale = (14.0 / vbatt.max(8.0))
+        .powf(voltage_exponent)
+        .clamp(0.65, 1.7);
     let coolant_bias_ms = if coolant_c < 40.0 {
         ((40.0 - coolant_c).min(40.0)) * 0.01
     } else {
@@ -518,6 +528,296 @@ const SENSOR_RAW_DIRECTORY: [SensorRawDirectoryEntry; 11] = [
     },
 ];
 
+const CAN_TEMPLATE_DIRECTORY: [CanTemplateDirectoryEntry; 6] = [
+    CanTemplateDirectoryEntry {
+        id: 1,
+        key: "st_engine_stream_tx",
+        label: "ST Engine Stream TX",
+        direction: "tx",
+        category: "stream",
+        can_id: 0x7E0,
+        extended_id: false,
+        dlc: 8,
+    },
+    CanTemplateDirectoryEntry {
+        id: 2,
+        key: "st_fault_stream_tx",
+        label: "ST Fault Stream TX",
+        direction: "tx",
+        category: "diagnostic",
+        can_id: 0x7E1,
+        extended_id: false,
+        dlc: 8,
+    },
+    CanTemplateDirectoryEntry {
+        id: 3,
+        key: "st_tcu_request_rx",
+        label: "ST TCU Request RX",
+        direction: "rx",
+        category: "integration",
+        can_id: 0x620,
+        extended_id: false,
+        dlc: 8,
+    },
+    CanTemplateDirectoryEntry {
+        id: 4,
+        key: "st_wideband_status_rx",
+        label: "ST Wideband Status RX",
+        direction: "rx",
+        category: "wideband",
+        can_id: 0x640,
+        extended_id: false,
+        dlc: 8,
+    },
+    CanTemplateDirectoryEntry {
+        id: 5,
+        key: "st_dash_fast_tx",
+        label: "ST Dash Fast TX",
+        direction: "tx",
+        category: "dash",
+        can_id: 0x700,
+        extended_id: false,
+        dlc: 8,
+    },
+    CanTemplateDirectoryEntry {
+        id: 6,
+        key: "st_dash_slow_tx",
+        label: "ST Dash Slow TX",
+        direction: "tx",
+        category: "dash",
+        can_id: 0x701,
+        extended_id: false,
+        dlc: 8,
+    },
+];
+
+const CAN_SIGNAL_DIRECTORY: [CanSignalDirectoryEntry; 14] = [
+    CanSignalDirectoryEntry {
+        id: 1,
+        template_id: 1,
+        key: "engine_rpm",
+        label: "Engine RPM",
+        maps_to: "rpm",
+        start_bit: 0,
+        bit_length: 16,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 12_000.0,
+        unit: "rpm",
+    },
+    CanSignalDirectoryEntry {
+        id: 2,
+        template_id: 1,
+        key: "engine_map_kpa",
+        label: "MAP",
+        maps_to: "map_kpa",
+        start_bit: 16,
+        bit_length: 16,
+        signed: false,
+        little_endian: true,
+        scale: 0.1,
+        offset: 0.0,
+        min: 0.0,
+        max: 500.0,
+        unit: "kPa",
+    },
+    CanSignalDirectoryEntry {
+        id: 3,
+        template_id: 1,
+        key: "engine_tps_pct",
+        label: "TPS",
+        maps_to: "tps_pct",
+        start_bit: 32,
+        bit_length: 8,
+        signed: false,
+        little_endian: true,
+        scale: 0.5,
+        offset: 0.0,
+        min: 0.0,
+        max: 100.0,
+        unit: "%",
+    },
+    CanSignalDirectoryEntry {
+        id: 4,
+        template_id: 2,
+        key: "fault_active",
+        label: "Fault Active",
+        maps_to: "fault_active",
+        start_bit: 0,
+        bit_length: 1,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 1.0,
+        unit: "bool",
+    },
+    CanSignalDirectoryEntry {
+        id: 5,
+        template_id: 2,
+        key: "fault_code",
+        label: "Fault Code",
+        maps_to: "fault_code",
+        start_bit: 8,
+        bit_length: 16,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 65_535.0,
+        unit: "raw",
+    },
+    CanSignalDirectoryEntry {
+        id: 6,
+        template_id: 3,
+        key: "tcu_torque_reduction_pct",
+        label: "TCU Torque Reduction",
+        maps_to: "torque_reduction_pct",
+        start_bit: 0,
+        bit_length: 8,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 100.0,
+        unit: "%",
+    },
+    CanSignalDirectoryEntry {
+        id: 7,
+        template_id: 3,
+        key: "tcu_target_gear",
+        label: "TCU Target Gear",
+        maps_to: "gear_target",
+        start_bit: 8,
+        bit_length: 8,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 10.0,
+        unit: "gear",
+    },
+    CanSignalDirectoryEntry {
+        id: 8,
+        template_id: 3,
+        key: "tcu_shift_request",
+        label: "TCU Shift Request",
+        maps_to: "shift_request",
+        start_bit: 16,
+        bit_length: 8,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 1.0,
+        unit: "bool",
+    },
+    CanSignalDirectoryEntry {
+        id: 9,
+        template_id: 4,
+        key: "wideband_lambda",
+        label: "Wideband Lambda",
+        maps_to: "lambda",
+        start_bit: 0,
+        bit_length: 16,
+        signed: false,
+        little_endian: true,
+        scale: 0.0001,
+        offset: 0.0,
+        min: 0.6,
+        max: 1.6,
+        unit: "lambda",
+    },
+    CanSignalDirectoryEntry {
+        id: 10,
+        template_id: 4,
+        key: "wideband_status",
+        label: "Wideband Status",
+        maps_to: "wideband_status",
+        start_bit: 16,
+        bit_length: 8,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 255.0,
+        unit: "raw",
+    },
+    CanSignalDirectoryEntry {
+        id: 11,
+        template_id: 5,
+        key: "dash_speed_kmh",
+        label: "Dash Speed",
+        maps_to: "vss_kmh",
+        start_bit: 0,
+        bit_length: 16,
+        signed: false,
+        little_endian: true,
+        scale: 0.1,
+        offset: 0.0,
+        min: 0.0,
+        max: 320.0,
+        unit: "km/h",
+    },
+    CanSignalDirectoryEntry {
+        id: 12,
+        template_id: 5,
+        key: "dash_gear",
+        label: "Dash Gear",
+        maps_to: "gear",
+        start_bit: 16,
+        bit_length: 8,
+        signed: false,
+        little_endian: true,
+        scale: 1.0,
+        offset: 0.0,
+        min: 0.0,
+        max: 10.0,
+        unit: "gear",
+    },
+    CanSignalDirectoryEntry {
+        id: 13,
+        template_id: 6,
+        key: "dash_coolant_c",
+        label: "Dash Coolant",
+        maps_to: "coolant_c",
+        start_bit: 0,
+        bit_length: 16,
+        signed: true,
+        little_endian: true,
+        scale: 0.1,
+        offset: 0.0,
+        min: -40.0,
+        max: 180.0,
+        unit: "degC",
+    },
+    CanSignalDirectoryEntry {
+        id: 14,
+        template_id: 6,
+        key: "dash_oil_pressure",
+        label: "Dash Oil Pressure",
+        maps_to: "oil_pressure_kpa",
+        start_bit: 16,
+        bit_length: 16,
+        signed: false,
+        little_endian: true,
+        scale: 0.1,
+        offset: 0.0,
+        min: 0.0,
+        max: 800.0,
+        unit: "kPa",
+    },
+];
+
 fn sensor_raw_sample(channel: u8) -> (u16, f32) {
     let voltage: f32 = match channel {
         0 => 2.18,
@@ -707,7 +1007,8 @@ impl FirmwareRuntime {
         for byte in bytes {
             self.log_staging_block.push(*byte);
             if self.log_staging_block.len() >= block_size {
-                self.log_blocks.push(std::mem::take(&mut self.log_staging_block));
+                self.log_blocks
+                    .push(std::mem::take(&mut self.log_staging_block));
             }
         }
         self.log_elapsed_ms_latched = self.current_log_elapsed_ms();
@@ -719,7 +1020,12 @@ impl FirmwareRuntime {
         }
         let line = format!(
             "t={} rpm={:.0} map={:.1} tps={:.1} lambda={:.4} clt={:.1}\n",
-            frame.timestamp_ms, frame.rpm, frame.map_kpa, frame.tps_pct, frame.lambda, frame.coolant_c
+            frame.timestamp_ms,
+            frame.rpm,
+            frame.map_kpa,
+            frame.tps_pct,
+            frame.lambda,
+            frame.coolant_c
         );
         self.append_log_bytes(line.as_bytes());
     }
@@ -800,8 +1106,8 @@ impl FirmwareRuntime {
         frame.aux_temp1_c = 805.0 + ((self.live_sample_counter % 8) as f32);
         frame.aux_temp2_c = 790.0 + ((self.live_sample_counter % 6) as f32);
         frame.afr_target = 14.7;
-        frame.vbatt = (13.8 + ((self.live_sample_counter % 11) as f32 * 0.03) - 0.12)
-            .clamp(11.5, 15.2);
+        frame.vbatt =
+            (13.8 + ((self.live_sample_counter % 11) as f32 * 0.03) - 0.12).clamp(11.5, 15.2);
         frame.vref_mv = 5.0;
         frame.advance_deg = if shift_in_progress { 8.0 } else { 13.5 };
         frame.fuel_load = ((frame.map_kpa / frame.baro_kpa.max(1.0)) * 100.0).clamp(10.0, 250.0);
@@ -844,7 +1150,8 @@ impl FirmwareRuntime {
             frame.status_flags |= status::CHECK_ENGINE;
         }
         let event_cycle_ms = (120_000.0 / frame.rpm.max(1.0)).max(1.0);
-        frame.injector_duty_pct = ((frame.actual_pulsewidth_ms / event_cycle_ms) * 100.0).clamp(0.0, 99.5);
+        frame.injector_duty_pct =
+            ((frame.actual_pulsewidth_ms / event_cycle_ms) * 100.0).clamp(0.0, 99.5);
         if frame.injector_duty_pct > 95.0 {
             frame.error_flags |= error::INJECTOR;
             frame.status_flags |= status::CHECK_ENGINE;
@@ -1028,17 +1335,35 @@ impl FirmwareRuntime {
                 encode_freeze_frames_payload(&SAMPLE_FREEZE_FRAMES),
             ),
             Cmd::GetTriggerCapture => {
-                let capture = self.trigger_runtime.trigger_capture(self.live_sample_counter);
-                Packet::new(Cmd::TriggerCapture, encode_trigger_capture_payload(&capture))
+                let capture = self
+                    .trigger_runtime
+                    .trigger_capture(self.live_sample_counter);
+                Packet::new(
+                    Cmd::TriggerCapture,
+                    encode_trigger_capture_payload(&capture),
+                )
             }
             Cmd::GetTriggerDecoderDirectory => Packet::new(
                 Cmd::TriggerDecoderDirectory,
                 encode_trigger_decoder_directory_payload(&SUPPORTED_TRIGGER_DECODERS),
             ),
             Cmd::GetTriggerToothLog => {
-                let tooth_log = self.trigger_runtime.trigger_tooth_log(self.live_sample_counter);
-                Packet::new(Cmd::TriggerToothLog, encode_trigger_tooth_log_payload(&tooth_log))
+                let tooth_log = self
+                    .trigger_runtime
+                    .trigger_tooth_log(self.live_sample_counter);
+                Packet::new(
+                    Cmd::TriggerToothLog,
+                    encode_trigger_tooth_log_payload(&tooth_log),
+                )
             }
+            Cmd::GetCanTemplateDirectory => Packet::new(
+                Cmd::CanTemplateDirectory,
+                encode_can_template_directory_payload(&CAN_TEMPLATE_DIRECTORY),
+            ),
+            Cmd::GetCanSignalDirectory => Packet::new(
+                Cmd::CanSignalDirectory,
+                encode_can_signal_directory_payload(&CAN_SIGNAL_DIRECTORY),
+            ),
             Cmd::LogStart => {
                 self.log_active = true;
                 self.log_session_id = self.log_session_id.wrapping_add(1);
@@ -1063,7 +1388,8 @@ impl FirmwareRuntime {
                     self.log_elapsed_ms_latched = self.current_log_elapsed_ms();
                     self.log_active = false;
                     if !self.log_staging_block.is_empty() {
-                        self.log_blocks.push(std::mem::take(&mut self.log_staging_block));
+                        self.log_blocks
+                            .push(std::mem::take(&mut self.log_staging_block));
                     }
                     self.logbook_entries = self.logbook_entries.saturating_add(1);
                     self.log_total_sessions = self.log_total_sessions.saturating_add(1);
@@ -1117,7 +1443,10 @@ impl FirmwareRuntime {
             },
             Cmd::ReadLogBlock => {
                 if packet.payload.len() != 2 {
-                    return nack(RuntimeNackCode::MalformedPayload, "bad read-log-block payload");
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "bad read-log-block payload",
+                    );
                 }
                 let block_index = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
                 let total_blocks = self.current_log_block_count();
@@ -1403,12 +1732,13 @@ mod tests {
     };
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
-        decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
-        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
-        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
-        decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
-        decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
-        decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
+        decode_ack_payload, decode_can_signal_directory_payload,
+        decode_can_template_directory_payload, decode_capabilities_payload,
+        decode_freeze_frames_payload, decode_identity_payload, decode_log_block_payload,
+        decode_log_status_payload, decode_logbook_summary_payload, decode_nack_payload,
+        decode_network_profile_payload, decode_output_test_directory_payload, decode_page_payload,
+        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
         decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request,
         encode_sync_rtc_payload, Cmd, Packet,
@@ -1446,6 +1776,29 @@ mod tests {
 
         assert_eq!(response.cmd, Cmd::Capabilities);
         assert!(!capabilities.is_empty());
+    }
+
+    #[test]
+    fn can_directory_handlers_return_runtime_catalog_payloads() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let templates = runtime.handle_packet(Packet::new(Cmd::GetCanTemplateDirectory, vec![]));
+        assert_eq!(templates.cmd, Cmd::CanTemplateDirectory);
+        let decoded_templates = decode_can_template_directory_payload(&templates.payload).unwrap();
+        assert!(decoded_templates
+            .iter()
+            .any(|entry| entry.key == "st_engine_stream_tx"));
+        assert!(decoded_templates
+            .iter()
+            .any(|entry| entry.direction == "rx"));
+
+        let signals = runtime.handle_packet(Packet::new(Cmd::GetCanSignalDirectory, vec![]));
+        assert_eq!(signals.cmd, Cmd::CanSignalDirectory);
+        let decoded_signals = decode_can_signal_directory_payload(&signals.payload).unwrap();
+        assert!(decoded_signals.iter().any(|entry| entry.maps_to == "rpm"));
+        assert!(decoded_signals
+            .iter()
+            .any(|entry| entry.maps_to == "torque_reduction_pct"));
     }
 
     #[test]
@@ -2036,7 +2389,10 @@ mod tests {
         assert_eq!(tooth_log.cmd, Cmd::TriggerToothLog);
         assert_eq!(decoded_tooth_log.preset_key, "generic_60_2");
         assert!(!decoded_tooth_log.tooth_intervals_us.is_empty());
-        assert!(decoded_tooth_log.reference_event_index < decoded_tooth_log.tooth_intervals_us.len() as u16);
+        assert!(
+            decoded_tooth_log.reference_event_index
+                < decoded_tooth_log.tooth_intervals_us.len() as u16
+        );
         assert!(decoded_tooth_log.dominant_gap_ratio >= 1.0);
     }
 
@@ -2057,8 +2413,10 @@ mod tests {
             encode_page_payload(page_id, &page),
         ));
         assert_eq!(distributor_write.cmd, Cmd::Ack);
-        let distributor_capture = runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
-        let decoded_distributor = decode_trigger_capture_payload(&distributor_capture.payload).unwrap();
+        let distributor_capture =
+            runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
+        let decoded_distributor =
+            decode_trigger_capture_payload(&distributor_capture.payload).unwrap();
         assert_eq!(decoded_distributor.preset_key, "distributor_basic_8");
 
         // Single-tooth + secondary should map into dual-wheel runtime mode.
@@ -2138,11 +2496,19 @@ mod tests {
         assert_eq!(decoded_initial.entries, 0);
         assert!(!decoded_initial.rtc_synced);
 
-        assert_eq!(runtime.handle_packet(Packet::new(Cmd::LogStart, vec![])).cmd, Cmd::Ack);
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::LogStart, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
         for _ in 0..10 {
             let _ = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
         }
-        assert_eq!(runtime.handle_packet(Packet::new(Cmd::LogStop, vec![])).cmd, Cmd::Ack);
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::LogStop, vec![])).cmd,
+            Cmd::Ack
+        );
 
         let summary_after_log = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
         let decoded_after_log = decode_logbook_summary_payload(&summary_after_log.payload).unwrap();
@@ -2166,8 +2532,10 @@ mod tests {
         let reset = runtime.handle_packet(Packet::new(Cmd::ResetLogbook, vec![]));
         assert_eq!(reset.cmd, Cmd::Ack);
 
-        let summary_after_reset = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
-        let decoded_after_reset = decode_logbook_summary_payload(&summary_after_reset.payload).unwrap();
+        let summary_after_reset =
+            runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let decoded_after_reset =
+            decode_logbook_summary_payload(&summary_after_reset.payload).unwrap();
         assert_eq!(decoded_after_reset.sessions, 0);
         assert_eq!(decoded_after_reset.entries, 0);
         assert_eq!(decoded_after_reset.total_elapsed_ms, 0);
@@ -2180,7 +2548,12 @@ mod tests {
     #[test]
     fn runtime_rejects_invalid_rtc_sync_and_reset_while_logging() {
         let mut runtime = FirmwareRuntime::new_ecu_v1();
-        assert_eq!(runtime.handle_packet(Packet::new(Cmd::LogStart, vec![])).cmd, Cmd::Ack);
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::LogStart, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
 
         let reset_while_logging = runtime.handle_packet(Packet::new(Cmd::ResetLogbook, vec![]));
         assert_eq!(reset_while_logging.cmd, Cmd::Nack);

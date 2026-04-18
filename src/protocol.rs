@@ -81,6 +81,10 @@ pub enum Cmd {
     SyncRtc = 0x69,
     GetTriggerToothLog = 0x70,
     TriggerToothLog = 0x71,
+    GetCanTemplateDirectory = 0x72,
+    CanTemplateDirectory = 0x73,
+    GetCanSignalDirectory = 0x74,
+    CanSignalDirectory = 0x75,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
     Ack = 0xA0,
@@ -157,6 +161,10 @@ impl TryFrom<u8> for Cmd {
             0x69 => Ok(Self::SyncRtc),
             0x70 => Ok(Self::GetTriggerToothLog),
             0x71 => Ok(Self::TriggerToothLog),
+            0x72 => Ok(Self::GetCanTemplateDirectory),
+            0x73 => Ok(Self::CanTemplateDirectory),
+            0x74 => Ok(Self::GetCanSignalDirectory),
+            0x75 => Ok(Self::CanSignalDirectory),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
             0xA0 => Ok(Self::Ack),
@@ -467,6 +475,66 @@ pub struct DecodedTriggerToothLog {
     pub dominant_gap_ratio: f32,
     pub tooth_intervals_us: Vec<u32>,
     pub secondary_event_indexes: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanTemplateDirectoryEntry {
+    pub id: u8,
+    pub key: &'static str,
+    pub label: &'static str,
+    pub direction: &'static str,
+    pub category: &'static str,
+    pub can_id: u32,
+    pub extended_id: bool,
+    pub dlc: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanSignalDirectoryEntry {
+    pub id: u8,
+    pub template_id: u8,
+    pub key: &'static str,
+    pub label: &'static str,
+    pub maps_to: &'static str,
+    pub start_bit: u8,
+    pub bit_length: u8,
+    pub signed: bool,
+    pub little_endian: bool,
+    pub scale: f32,
+    pub offset: f32,
+    pub min: f32,
+    pub max: f32,
+    pub unit: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedCanTemplateDirectoryEntry {
+    pub id: u8,
+    pub key: String,
+    pub label: String,
+    pub direction: String,
+    pub category: String,
+    pub can_id: u32,
+    pub extended_id: bool,
+    pub dlc: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedCanSignalDirectoryEntry {
+    pub id: u8,
+    pub template_id: u8,
+    pub key: String,
+    pub label: String,
+    pub maps_to: String,
+    pub start_bit: u8,
+    pub bit_length: u8,
+    pub signed: bool,
+    pub little_endian: bool,
+    pub scale: f32,
+    pub offset: f32,
+    pub min: f32,
+    pub max: f32,
+    pub unit: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1325,6 +1393,168 @@ pub fn decode_trigger_tooth_log_payload(
     })
 }
 
+pub fn encode_can_template_directory_payload(entries: &[CanTemplateDirectoryEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for entry in entries {
+        out.push(entry.id);
+        out.extend_from_slice(&entry.can_id.to_be_bytes());
+        out.push(entry.extended_id as u8);
+        out.push(entry.dlc);
+        push_string(&mut out, entry.key);
+        push_string(&mut out, entry.label);
+        push_string(&mut out, entry.direction);
+        push_string(&mut out, entry.category);
+    }
+    out
+}
+
+pub fn decode_can_template_directory_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedCanTemplateDirectoryEntry>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        if payload.len() < offset + 7 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let id = payload[offset];
+        let can_id = u32::from_be_bytes([
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+            payload[offset + 4],
+        ]);
+        let extended_id = payload[offset + 5] != 0;
+        let dlc = payload[offset + 6];
+        offset += 7;
+        let key = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        let direction = read_string(payload, &mut offset)?;
+        let category = read_string(payload, &mut offset)?;
+        entries.push(DecodedCanTemplateDirectoryEntry {
+            id,
+            key,
+            label,
+            direction,
+            category,
+            can_id,
+            extended_id,
+            dlc,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
+pub fn encode_can_signal_directory_payload(entries: &[CanSignalDirectoryEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(entries.len() as u8);
+    for entry in entries {
+        out.push(entry.id);
+        out.push(entry.template_id);
+        out.push(entry.start_bit);
+        out.push(entry.bit_length);
+        let mut flags = 0u8;
+        if entry.signed {
+            flags |= 0x01;
+        }
+        if entry.little_endian {
+            flags |= 0x02;
+        }
+        out.push(flags);
+        out.extend_from_slice(&entry.scale.to_be_bytes());
+        out.extend_from_slice(&entry.offset.to_be_bytes());
+        out.extend_from_slice(&entry.min.to_be_bytes());
+        out.extend_from_slice(&entry.max.to_be_bytes());
+        push_string(&mut out, entry.key);
+        push_string(&mut out, entry.label);
+        push_string(&mut out, entry.maps_to);
+        push_string(&mut out, entry.unit);
+    }
+    out
+}
+
+pub fn decode_can_signal_directory_payload(
+    payload: &[u8],
+) -> Result<Vec<DecodedCanSignalDirectoryEntry>, ProtocolError> {
+    let Some(&count) = payload.first() else {
+        return Err(ProtocolError::MalformedPayload);
+    };
+    let mut offset = 1usize;
+    let mut entries = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        if payload.len() < offset + 21 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        let id = payload[offset];
+        let template_id = payload[offset + 1];
+        let start_bit = payload[offset + 2];
+        let bit_length = payload[offset + 3];
+        let flags = payload[offset + 4];
+        let scale = f32::from_be_bytes([
+            payload[offset + 5],
+            payload[offset + 6],
+            payload[offset + 7],
+            payload[offset + 8],
+        ]);
+        let offset_value = f32::from_be_bytes([
+            payload[offset + 9],
+            payload[offset + 10],
+            payload[offset + 11],
+            payload[offset + 12],
+        ]);
+        let min = f32::from_be_bytes([
+            payload[offset + 13],
+            payload[offset + 14],
+            payload[offset + 15],
+            payload[offset + 16],
+        ]);
+        let max = f32::from_be_bytes([
+            payload[offset + 17],
+            payload[offset + 18],
+            payload[offset + 19],
+            payload[offset + 20],
+        ]);
+        offset += 21;
+        let key = read_string(payload, &mut offset)?;
+        let label = read_string(payload, &mut offset)?;
+        let maps_to = read_string(payload, &mut offset)?;
+        let unit = read_string(payload, &mut offset)?;
+        entries.push(DecodedCanSignalDirectoryEntry {
+            id,
+            template_id,
+            key,
+            label,
+            maps_to,
+            start_bit,
+            bit_length,
+            signed: (flags & 0x01) != 0,
+            little_endian: (flags & 0x02) != 0,
+            scale,
+            offset: offset_value,
+            min,
+            max,
+            unit,
+        });
+    }
+
+    if offset != payload.len() {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(entries)
+}
+
 pub fn encode_page_statuses_payload(statuses: &[ConfigPageStatus]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + statuses.len() * 15);
     out.push(statuses.len() as u8);
@@ -1664,7 +1894,8 @@ pub fn decode_sync_rtc_payload(payload: &[u8]) -> Result<u64, ProtocolError> {
         return Err(ProtocolError::MalformedPayload);
     }
     Ok(u64::from_be_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
     ]))
 }
 
@@ -1798,26 +2029,29 @@ mod tests {
     use crate::trigger::{sample_trigger_capture, sample_trigger_tooth_log, TriggerDecoderPreset};
 
     use super::{
-        decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
-        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
-        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
-        decode_output_test_directory_payload, decode_page_payload, decode_page_request,
-        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
-        decode_sync_rtc_payload, decode_table_metadata_payload, decode_trigger_capture_payload,
+        decode_ack_payload, decode_can_signal_directory_payload,
+        decode_can_template_directory_payload, decode_capabilities_payload,
+        decode_freeze_frames_payload, decode_identity_payload, decode_log_block_payload,
+        decode_log_status_payload, decode_logbook_summary_payload, decode_nack_payload,
+        decode_network_profile_payload, decode_output_test_directory_payload, decode_page_payload,
+        decode_page_request, decode_page_statuses_payload, decode_pin_assignments_payload,
+        decode_pin_directory_payload, decode_raw_table_payload,
+        decode_sensor_raw_directory_payload, decode_sensor_raw_payload, decode_sync_rtc_payload,
+        decode_table_metadata_payload, decode_trigger_capture_payload,
         decode_trigger_decoder_directory_payload, decode_trigger_tooth_log_payload,
-        encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
-        encode_identity_payload, encode_log_block_payload, encode_log_status_payload,
-        encode_logbook_summary_payload, encode_nack_payload, encode_network_profile_payload,
-        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload, encode_page_request,
+        encode_ack_payload, encode_can_signal_directory_payload,
+        encode_can_template_directory_payload, encode_capabilities_payload,
+        encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
+        encode_log_status_payload, encode_logbook_summary_payload, encode_nack_payload,
+        encode_network_profile_payload, encode_output_test_directory_payload,
+        encode_page_directory_payload, encode_page_payload, encode_page_request,
         encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-        encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
-        encode_sync_rtc_payload,
+        encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_sync_rtc_payload,
         encode_table_directory_payload, encode_table_metadata_payload,
         encode_trigger_capture_payload, encode_trigger_decoder_directory_payload,
-        encode_trigger_tooth_log_payload, Cmd, DecodedPinAssignment, LogStatusPayload,
-        LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, ProtocolError, RawTablePayload,
-        SensorRawDirectoryEntry,
+        encode_trigger_tooth_log_payload, CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd,
+        DecodedPinAssignment, LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry,
+        Packet, ProtocolError, RawTablePayload, SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -2240,6 +2474,85 @@ mod tests {
     }
 
     #[test]
+    fn can_template_directory_payload_roundtrip() {
+        let payload = encode_can_template_directory_payload(&[
+            CanTemplateDirectoryEntry {
+                id: 1,
+                key: "st_engine_stream_tx",
+                label: "ST Engine Stream TX",
+                direction: "tx",
+                category: "stream",
+                can_id: 0x7E0,
+                extended_id: false,
+                dlc: 8,
+            },
+            CanTemplateDirectoryEntry {
+                id: 2,
+                key: "st_tcu_req_rx",
+                label: "ST TCU Request RX",
+                direction: "rx",
+                category: "integration",
+                can_id: 0x620,
+                extended_id: false,
+                dlc: 8,
+            },
+        ]);
+
+        let decoded = decode_can_template_directory_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].id, 1);
+        assert_eq!(decoded[0].direction, "tx");
+        assert_eq!(decoded[1].key, "st_tcu_req_rx");
+        assert_eq!(decoded[1].can_id, 0x620);
+    }
+
+    #[test]
+    fn can_signal_directory_payload_roundtrip() {
+        let payload = encode_can_signal_directory_payload(&[
+            CanSignalDirectoryEntry {
+                id: 11,
+                template_id: 2,
+                key: "tcu_torque_reduction_pct",
+                label: "TCU Torque Reduction",
+                maps_to: "torque_reduction_pct",
+                start_bit: 0,
+                bit_length: 8,
+                signed: false,
+                little_endian: true,
+                scale: 1.0,
+                offset: 0.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            CanSignalDirectoryEntry {
+                id: 12,
+                template_id: 2,
+                key: "tcu_target_gear",
+                label: "TCU Target Gear",
+                maps_to: "gear_target",
+                start_bit: 8,
+                bit_length: 8,
+                signed: false,
+                little_endian: true,
+                scale: 1.0,
+                offset: 0.0,
+                min: 0.0,
+                max: 10.0,
+                unit: "gear",
+            },
+        ]);
+
+        let decoded = decode_can_signal_directory_payload(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].template_id, 2);
+        assert_eq!(decoded[0].maps_to, "torque_reduction_pct");
+        assert_eq!(decoded[0].unit, "%");
+        assert_eq!(decoded[1].start_bit, 8);
+        assert_eq!(decoded[1].bit_length, 8);
+    }
+
+    #[test]
     fn page_statuses_payload_roundtrip() {
         let statuses = vec![
             ConfigPageStatus {
@@ -2359,6 +2672,10 @@ mod tests {
         assert_eq!(Cmd::PinAssignments as u8, 0x6B);
         assert_eq!(Cmd::GetTriggerToothLog as u8, 0x70);
         assert_eq!(Cmd::TriggerToothLog as u8, 0x71);
+        assert_eq!(Cmd::GetCanTemplateDirectory as u8, 0x72);
+        assert_eq!(Cmd::CanTemplateDirectory as u8, 0x73);
+        assert_eq!(Cmd::GetCanSignalDirectory as u8, 0x74);
+        assert_eq!(Cmd::CanSignalDirectory as u8, 0x75);
 
         assert_eq!(Cmd::Ack as u8, 0xA0);
         assert_eq!(Cmd::Nack as u8, 0xA1);
