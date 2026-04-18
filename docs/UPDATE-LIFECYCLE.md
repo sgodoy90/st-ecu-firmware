@@ -95,10 +95,12 @@ Already present:
 - `FlashComplete` gated by successful verify in the same session
 - config page image/header CRC and dirty-state tracking
 - config image CRC validation that respects image header schema/format versions
+- persisted config import path with explicit schema/format migration executor baseline
+  - when migrator steps are missing, firmware fails closed with explicit reason (no silent coercion)
 
 Still required for production anti-brick:
 
 - real target bootloader implementation (STM32H743)
 - bank swap + pending metadata persistence
 - first-boot health marker + watchdog-managed rollback
-- fully wired schema migration executor on persisted config
+- concrete per-version migrators (`vN_to_vN+1`) wired to target startup path
