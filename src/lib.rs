@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod reset_reason;
 pub mod transport;
 pub mod trigger;
+pub mod trigger_model;
 pub mod rotational_idle;
 pub mod tcu;
 pub mod wideband;
@@ -95,6 +96,10 @@ pub use transport::{FirmwareRuntime, RuntimeNackCode, TransportCapabilities, Tra
 pub use trigger::{
     sample_trigger_capture, sample_trigger_tooth_log, TriggerCapture, TriggerDecoderPreset,
     TriggerToothLog, SUPPORTED_TRIGGER_DECODERS,
+};
+pub use trigger_model::{
+    distributor_even, missing_tooth, EngineStroke, TriggerEdgePolicy, TriggerModelError,
+    TriggerSyncCorrelation,
 };
 pub use rotational_idle::{RotationalIdleRuntime, RotationalIdleSample};
 pub use tcu::{ExternalTcuRuntime, TransmissionSample};

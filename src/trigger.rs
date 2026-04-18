@@ -55,7 +55,7 @@ pub struct TriggerToothLog {
     pub secondary_event_indexes: Vec<u16>,
 }
 
-pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 16] = [
+pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 20] = [
     TriggerDecoderPreset {
         key: "generic_60_2",
         label: "Generic 60-2 + Home",
@@ -75,6 +75,86 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 16] = [
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "generic_36_1",
+        label: "Generic 36-1 + Home",
+        family: "Universal Missing-Tooth",
+        decoder: "missing_tooth_36_1",
+        pattern_kind: "missing_tooth",
+        primary_input_label: "Crank VR/Hall",
+        secondary_input_label: Some("Cam Home"),
+        primary_sensor_kind: "vr_or_hall",
+        secondary_sensor_kind: Some("hall_or_optical"),
+        edge_policy: "configurable",
+        sync_strategy: "missing_tooth_plus_home",
+        primary_pattern_hint: "36-1 crank wheel on the primary input",
+        secondary_pattern_hint: Some("Single home or cam-sync event every 720 deg"),
+        reference_description:
+            "Missing-tooth lock from a 36-1 crank pattern with phase confirmation from home input.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "distributor_basic_4",
+        label: "Distributor Basic (4 cyl)",
+        family: "Basic Distributor",
+        decoder: "distributor_even_4",
+        pattern_kind: "distributor",
+        primary_input_label: "Distributor Signal",
+        secondary_input_label: None,
+        primary_sensor_kind: "hall_or_vr",
+        secondary_sensor_kind: None,
+        edge_policy: "configurable",
+        sync_strategy: "even_spacing_distributor",
+        primary_pattern_hint: "4 evenly spaced events per 720 deg engine cycle",
+        secondary_pattern_hint: None,
+        reference_description:
+            "Basic distributor mode for 4-cylinder engines using evenly spaced events.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: false,
+        supports_sequential: false,
+    },
+    TriggerDecoderPreset {
+        key: "distributor_basic_6",
+        label: "Distributor Basic (6 cyl)",
+        family: "Basic Distributor",
+        decoder: "distributor_even_6",
+        pattern_kind: "distributor",
+        primary_input_label: "Distributor Signal",
+        secondary_input_label: None,
+        primary_sensor_kind: "hall_or_vr",
+        secondary_sensor_kind: None,
+        edge_policy: "configurable",
+        sync_strategy: "even_spacing_distributor",
+        primary_pattern_hint: "6 evenly spaced events per 720 deg engine cycle",
+        secondary_pattern_hint: None,
+        reference_description:
+            "Basic distributor mode for 6-cylinder engines using evenly spaced events.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: false,
+        supports_sequential: false,
+    },
+    TriggerDecoderPreset {
+        key: "distributor_basic_8",
+        label: "Distributor Basic (8 cyl)",
+        family: "Basic Distributor",
+        decoder: "distributor_even_8",
+        pattern_kind: "distributor",
+        primary_input_label: "Distributor Signal",
+        secondary_input_label: None,
+        primary_sensor_kind: "hall_or_vr",
+        secondary_sensor_kind: None,
+        edge_policy: "configurable",
+        sync_strategy: "even_spacing_distributor",
+        primary_pattern_hint: "8 evenly spaced events per 720 deg engine cycle",
+        secondary_pattern_hint: None,
+        reference_description:
+            "Basic distributor mode for 8-cylinder engines using evenly spaced events.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: false,
+        supports_sequential: false,
     },
     TriggerDecoderPreset {
         key: "honda_k20_12_1",
@@ -436,6 +516,10 @@ mod tests {
     fn decoder_catalog_includes_wave1_oem_families() {
         let expected_keys = [
             "generic_60_2",
+            "generic_36_1",
+            "distributor_basic_4",
+            "distributor_basic_6",
+            "distributor_basic_8",
             "honda_k20_12_1",
             "toyota_36_2_2_2",
             "nissan_360_slot",
@@ -491,5 +575,24 @@ mod tests {
         assert_eq!(preset.sync_strategy, "missing_tooth_plus_home");
         assert!(preset.requires_secondary);
         assert!(preset.supports_sequential);
+    }
+
+    #[test]
+    fn distributor_presets_are_phase_safe_defaults() {
+        let keys = [
+            "distributor_basic_4",
+            "distributor_basic_6",
+            "distributor_basic_8",
+        ];
+        for key in keys {
+            let preset = SUPPORTED_TRIGGER_DECODERS
+                .iter()
+                .find(|preset| preset.key == key)
+                .expect("distributor preset must be present");
+            assert_eq!(preset.pattern_kind, "distributor");
+            assert_eq!(preset.sync_strategy, "even_spacing_distributor");
+            assert!(!preset.requires_secondary);
+            assert!(!preset.supports_sequential);
+        }
     }
 }
