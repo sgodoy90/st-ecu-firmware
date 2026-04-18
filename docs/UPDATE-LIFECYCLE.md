@@ -92,7 +92,9 @@ Already present:
 - protocol commands for firmware flash lifecycle
 - ordered-block validation
 - optional verify CRC handling
+- `FlashComplete` gated by successful verify in the same session
 - config page image/header CRC and dirty-state tracking
+- config image CRC validation that respects image header schema/format versions
 
 Still required for production anti-brick:
 

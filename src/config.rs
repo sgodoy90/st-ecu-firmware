@@ -346,14 +346,38 @@ impl ConfigStore {
 }
 
 fn build_page_header(page_id: u8, generation: u32, payload: &[u8]) -> ConfigPageHeader {
+    build_page_header_with_versions(
+        page_id,
+        generation,
+        crate::SCHEMA_VERSION,
+        CONFIG_FORMAT_VERSION,
+        payload,
+    )
+}
+
+fn build_page_header_with_versions(
+    page_id: u8,
+    generation: u32,
+    schema_version: u16,
+    format_version: u8,
+    payload: &[u8],
+) -> ConfigPageHeader {
     let payload_length =
         u16::try_from(payload.len()).expect("config page payload length must fit u16");
     let payload_crc = CRC32.checksum(payload);
-    let image_crc = calculate_image_crc(page_id, generation, payload_length, payload_crc, payload);
+    let image_crc = calculate_image_crc(
+        format_version,
+        schema_version,
+        page_id,
+        generation,
+        payload_length,
+        payload_crc,
+        payload,
+    );
     ConfigPageHeader {
         page_id,
-        schema_version: crate::SCHEMA_VERSION,
-        format_version: CONFIG_FORMAT_VERSION,
+        schema_version,
+        format_version,
         generation,
         payload_length,
         payload_crc,
@@ -362,7 +386,29 @@ fn build_page_header(page_id: u8, generation: u32, payload: &[u8]) -> ConfigPage
 }
 
 fn encode_stored_page_image(page_id: u8, generation: u32, payload: &[u8]) -> Vec<u8> {
-    let header = build_page_header(page_id, generation, payload);
+    encode_stored_page_image_with_versions(
+        page_id,
+        generation,
+        crate::SCHEMA_VERSION,
+        CONFIG_FORMAT_VERSION,
+        payload,
+    )
+}
+
+fn encode_stored_page_image_with_versions(
+    page_id: u8,
+    generation: u32,
+    schema_version: u16,
+    format_version: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let header = build_page_header_with_versions(
+        page_id,
+        generation,
+        schema_version,
+        format_version,
+        payload,
+    );
     let mut out = encode_image_prefix(&header);
     out.extend_from_slice(&header.image_crc.to_be_bytes());
     out.extend_from_slice(payload);
@@ -400,8 +446,15 @@ fn decode_stored_page_image(raw_image: &[u8]) -> Result<StoredPageImage, ConfigI
         return Err(ConfigImageError::PayloadCrcMismatch);
     }
 
-    let expected_image_crc =
-        calculate_image_crc(page_id, generation, payload_length, payload_crc, &payload);
+    let expected_image_crc = calculate_image_crc(
+        format_version,
+        schema_version,
+        page_id,
+        generation,
+        payload_length,
+        payload_crc,
+        &payload,
+    );
     if expected_image_crc != image_crc {
         return Err(ConfigImageError::ImageCrcMismatch);
     }
@@ -433,6 +486,8 @@ fn encode_image_prefix(header: &ConfigPageHeader) -> Vec<u8> {
 }
 
 fn calculate_image_crc(
+    format_version: u8,
+    schema_version: u16,
     page_id: u8,
     generation: u32,
     payload_length: u16,
@@ -441,9 +496,9 @@ fn calculate_image_crc(
 ) -> u32 {
     let mut encoded = Vec::with_capacity(STORED_PAGE_PREFIX_LEN + payload.len());
     encoded.extend_from_slice(&CONFIG_IMAGE_MAGIC);
-    encoded.push(CONFIG_FORMAT_VERSION);
+    encoded.push(format_version);
     encoded.push(page_id);
-    encoded.extend_from_slice(&crate::SCHEMA_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&schema_version.to_be_bytes());
     encoded.extend_from_slice(&generation.to_be_bytes());
     encoded.extend_from_slice(&payload_length.to_be_bytes());
     encoded.extend_from_slice(&payload_crc.to_be_bytes());
@@ -454,8 +509,8 @@ fn calculate_image_crc(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_stored_page_image, encode_stored_page_image, ConfigImageError, ConfigPage,
-        ConfigStore,
+        decode_stored_page_image, encode_stored_page_image, encode_stored_page_image_with_versions,
+        ConfigImageError, ConfigPage, ConfigStore, CONFIG_FORMAT_VERSION,
     };
 
     #[test]
@@ -547,6 +602,23 @@ mod tests {
             decode_stored_page_image(&raw_image),
             Err(ConfigImageError::PayloadCrcMismatch)
         );
+    }
+
+    #[test]
+    fn stored_page_image_crc_accepts_legacy_schema_headers() {
+        let legacy_schema_version = crate::SCHEMA_VERSION.saturating_sub(1);
+        let raw_image = encode_stored_page_image_with_versions(
+            ConfigPage::Sensors as u8,
+            5,
+            legacy_schema_version,
+            CONFIG_FORMAT_VERSION,
+            &[0x10, 0x20, 0x30, 0x40],
+        );
+
+        let decoded =
+            decode_stored_page_image(&raw_image).expect("legacy schema image must decode");
+        assert_eq!(decoded.header.schema_version, legacy_schema_version);
+        assert_eq!(decoded.payload, vec![0x10, 0x20, 0x30, 0x40]);
     }
 
     #[test]

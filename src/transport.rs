@@ -95,6 +95,9 @@ pub struct FirmwareRuntime {
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
+    flash_verified: bool,
+    flash_verified_crc: Option<u32>,
+    flash_verified_len: usize,
     log_active: bool,
     log_storage_present: bool,
     log_rtc_synced: bool,
@@ -877,6 +880,9 @@ impl FirmwareRuntime {
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
+            flash_verified: false,
+            flash_verified_crc: None,
+            flash_verified_len: 0,
             log_active: false,
             log_storage_present: true,
             log_rtc_synced: false,
@@ -1634,6 +1640,9 @@ impl FirmwareRuntime {
                 self.flash_session_active = true;
                 self.flash_next_block = 0;
                 self.flash_buffer.clear();
+                self.flash_verified = false;
+                self.flash_verified_crc = None;
+                self.flash_verified_len = 0;
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashBlock => {
@@ -1667,6 +1676,9 @@ impl FirmwareRuntime {
                 }
                 self.flash_buffer.extend_from_slice(payload);
                 self.flash_next_block = self.flash_next_block.saturating_add(1);
+                self.flash_verified = false;
+                self.flash_verified_crc = None;
+                self.flash_verified_len = 0;
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashVerify => {
@@ -1682,6 +1694,7 @@ impl FirmwareRuntime {
                 if self.flash_buffer.iter().all(|byte| *byte == 0) {
                     return nack(RuntimeNackCode::MalformedPayload, "flash image is blank");
                 }
+                let actual_crc = FLASH_CRC32.checksum(&self.flash_buffer);
                 if packet.payload.len() == 4 {
                     let expected_crc = u32::from_be_bytes([
                         packet.payload[0],
@@ -1689,11 +1702,13 @@ impl FirmwareRuntime {
                         packet.payload[2],
                         packet.payload[3],
                     ]);
-                    let actual_crc = FLASH_CRC32.checksum(&self.flash_buffer);
                     if expected_crc != actual_crc {
                         return nack(RuntimeNackCode::MalformedPayload, "flash crc mismatch");
                     }
                 }
+                self.flash_verified = true;
+                self.flash_verified_crc = Some(actual_crc);
+                self.flash_verified_len = self.flash_buffer.len();
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashComplete => {
@@ -1703,9 +1718,31 @@ impl FirmwareRuntime {
                         "flash session not started",
                     );
                 }
+                if !self.flash_verified {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash image must be verified before complete",
+                    );
+                }
+                if self.flash_verified_len != self.flash_buffer.len() {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash image changed after verify",
+                    );
+                }
+                let final_crc = FLASH_CRC32.checksum(&self.flash_buffer);
+                if self.flash_verified_crc != Some(final_crc) {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash image changed after verify",
+                    );
+                }
                 self.flash_session_active = false;
                 self.flash_next_block = 0;
                 self.flash_buffer.clear();
+                self.flash_verified = false;
+                self.flash_verified_crc = None;
+                self.flash_verified_len = 0;
                 Packet::new(Cmd::Ack, vec![])
             }
             _ => nack(
@@ -2241,6 +2278,53 @@ mod tests {
 
         let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![]));
         assert_eq!(verify.cmd, Cmd::Ack);
+        let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
+        assert_eq!(complete.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_flash_complete_requires_prior_verify() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let start = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(start.cmd, Cmd::Ack);
+
+        let block0 = runtime.handle_packet(Packet::new(
+            Cmd::FlashBlock,
+            vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC],
+        ));
+        assert_eq!(block0.cmd, Cmd::Ack);
+
+        let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
+        assert_eq!(complete.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&complete.payload).unwrap();
+        assert!(reason.contains("verified"));
+    }
+
+    #[test]
+    fn runtime_flash_new_block_invalidates_previous_verify() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let start = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(start.cmd, Cmd::Ack);
+
+        let block0 = runtime.handle_packet(Packet::new(
+            Cmd::FlashBlock,
+            vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC],
+        ));
+        assert_eq!(block0.cmd, Cmd::Ack);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![]));
+        assert_eq!(verify.cmd, Cmd::Ack);
+
+        let block1 =
+            runtime.handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 1, 0xDD, 0xEE]));
+        assert_eq!(block1.cmd, Cmd::Ack);
+
+        let complete_without_reverify =
+            runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
+        assert_eq!(complete_without_reverify.cmd, Cmd::Nack);
+
+        let verify_again = runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![]));
+        assert_eq!(verify_again.cmd, Cmd::Ack);
         let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
         assert_eq!(complete.cmd, Cmd::Ack);
     }
