@@ -55,7 +55,7 @@ pub struct TriggerToothLog {
     pub secondary_event_indexes: Vec<u16>,
 }
 
-pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 15] = [
+pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 16] = [
     TriggerDecoderPreset {
         key: "generic_60_2",
         label: "Generic 60-2 + Home",
@@ -179,7 +179,7 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 15] = [
         key: "mitsubishi_4g63",
         label: "Mitsubishi 4G63",
         family: "Mitsubishi EVO",
-        decoder: "oem_4g63_cam_crank",
+        decoder: "oem_mitsubishi_4g63",
         pattern_kind: "oem_pattern",
         primary_input_label: "Crank (CAS primary)",
         secondary_input_label: Some("Cam (CAS phase)"),
@@ -317,7 +317,7 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 15] = [
         key: "subaru_ej_36_2_2_2",
         label: "Subaru EJ 36-2-2-2",
         family: "Subaru EJ Phase 2",
-        decoder: "oem_subaru_36_2_2_2",
+        decoder: "oem_subaru_ej_36_2_2_2",
         pattern_kind: "oem_pattern",
         primary_input_label: "Crank (36-2-2-2)",
         secondary_input_label: Some("Cam Phase"),
@@ -329,6 +329,26 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 15] = [
         secondary_pattern_hint: Some("Subaru cam phase windows"),
         reference_description:
             "Decodes Subaru phase-2 gap pattern and cam windows for sequential phase lock.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "mazda_bp_4_1",
+        label: "Mazda BP 4+1",
+        family: "Mazda BP / Miata",
+        decoder: "oem_mazda_bp_4_1",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank (4-tooth)",
+        secondary_input_label: Some("Cam (1-tooth)"),
+        primary_sensor_kind: "hall_or_optical",
+        secondary_sensor_kind: Some("hall_or_optical"),
+        edge_policy: "decoder_defined",
+        sync_strategy: "ckp_plus_cmp_phase",
+        primary_pattern_hint: "4 evenly spaced crank events per engine revolution",
+        secondary_pattern_hint: Some("Single cam phase event every 720 deg"),
+        reference_description:
+            "Mazda BP trigger family using a simple crank pattern plus cam phase marker.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -414,41 +434,62 @@ mod tests {
 
     #[test]
     fn decoder_catalog_includes_wave1_oem_families() {
-        assert!(SUPPORTED_TRIGGER_DECODERS
+        let expected_keys = [
+            "generic_60_2",
+            "honda_k20_12_1",
+            "toyota_36_2_2_2",
+            "nissan_360_slot",
+            "gm_24x",
+            "subaru_6_7",
+            "mitsubishi_4g63",
+            "mazda_36_2_1",
+            "ford_st170",
+            "gm_58x",
+            "toyota_2jz_vvti",
+            "bmw_m54_60_2",
+            "ford_coyote",
+            "subaru_ej_36_2_2_2",
+            "nissan_vq_36_2_2_2",
+            "mazda_bp_4_1",
+        ];
+        assert_eq!(SUPPORTED_TRIGGER_DECODERS.len(), expected_keys.len());
+        for key in expected_keys {
+            assert!(
+                SUPPORTED_TRIGGER_DECODERS.iter().any(|preset| preset.key == key),
+                "missing trigger decoder preset key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_catalog_preserves_key_decoder_contract() {
+        let expected_pairs = [
+            ("mitsubishi_4g63", "oem_mitsubishi_4g63"),
+            ("subaru_ej_36_2_2_2", "oem_subaru_ej_36_2_2_2"),
+            ("mazda_bp_4_1", "oem_mazda_bp_4_1"),
+        ];
+        for (key, decoder) in expected_pairs {
+            let preset = SUPPORTED_TRIGGER_DECODERS
+                .iter()
+                .find(|preset| preset.key == key)
+                .expect("expected preset key to exist");
+            assert_eq!(
+                preset.decoder, decoder,
+                "decoder id mismatch for key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_missing_tooth_preset_remains_configurable() {
+        let preset = SUPPORTED_TRIGGER_DECODERS
             .iter()
-            .any(|preset| preset.key == "honda_k20_12_1"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "toyota_36_2_2_2"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "nissan_360_slot"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "gm_24x"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "subaru_6_7"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "mitsubishi_4g63"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "gm_58x"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "toyota_2jz_vvti"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "bmw_m54_60_2"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "ford_coyote"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "subaru_ej_36_2_2_2"));
-        assert!(SUPPORTED_TRIGGER_DECODERS
-            .iter()
-            .any(|preset| preset.key == "nissan_vq_36_2_2_2"));
+            .find(|preset| preset.key == "generic_60_2")
+            .expect("generic_60_2 must be present");
+        assert_eq!(preset.pattern_kind, "missing_tooth");
+        assert_eq!(preset.edge_policy, "configurable");
+        assert_eq!(preset.sync_strategy, "missing_tooth_plus_home");
+        assert!(preset.requires_secondary);
+        assert!(preset.supports_sequential);
     }
 }
