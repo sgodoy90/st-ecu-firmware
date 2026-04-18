@@ -248,6 +248,7 @@ pub struct DecodedIdentity {
     pub board_id: String,
     pub serial: String,
     pub signature: String,
+    pub reset_reason: Option<String>,
     pub capabilities: Vec<u8>,
 }
 
@@ -591,6 +592,7 @@ pub fn encode_identity_payload(
     push_string(&mut out, identity.board_id);
     push_string(&mut out, identity.serial);
     push_string(&mut out, identity.signature);
+    push_string(&mut out, identity.reset_reason);
     for capability in capabilities {
         out.push(capability.code());
     }
@@ -614,6 +616,18 @@ pub fn decode_identity_payload(payload: &[u8]) -> Result<DecodedIdentity, Protoc
     let board_id = read_string(payload, &mut offset)?;
     let serial = read_string(payload, &mut offset)?;
     let signature = read_string(payload, &mut offset)?;
+    let mut reset_reason = None;
+    if payload.len() != offset + capability_count {
+        let mut extended_offset = offset;
+        let parsed_reset_reason = read_string(payload, &mut extended_offset)?;
+        if payload.len() != extended_offset + capability_count {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        if !parsed_reset_reason.is_empty() {
+            reset_reason = Some(parsed_reset_reason);
+        }
+        offset = extended_offset;
+    }
 
     if payload.len() < offset + capability_count {
         return Err(ProtocolError::MalformedPayload);
@@ -628,6 +642,7 @@ pub fn decode_identity_payload(payload: &[u8]) -> Result<DecodedIdentity, Protoc
         board_id,
         serial,
         signature,
+        reset_reason,
         capabilities,
     })
 }
@@ -2070,6 +2085,30 @@ mod tests {
         assert_eq!(decoded.protocol_version, 1);
         assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded.board_id, "st-ecu-v1");
+        assert_eq!(decoded.reset_reason.as_deref(), Some("power_on"));
+        assert!(!decoded.capabilities.is_empty());
+    }
+
+    #[test]
+    fn identity_payload_decode_supports_legacy_shape_without_reset_reason() {
+        let identity = FirmwareIdentity::ecu_v1();
+        let capabilities = base_capabilities(false);
+        let mut payload = Vec::new();
+        payload.push(identity.protocol_version);
+        payload.extend_from_slice(&identity.schema_version.to_be_bytes());
+        payload.push(capabilities.len() as u8);
+        super::push_string(&mut payload, identity.firmware_id);
+        super::push_string(&mut payload, identity.firmware_semver);
+        super::push_string(&mut payload, identity.board_id);
+        super::push_string(&mut payload, identity.serial);
+        super::push_string(&mut payload, identity.signature);
+        for capability in capabilities {
+            payload.push(capability.code());
+        }
+
+        let decoded = decode_identity_payload(&payload).unwrap();
+        assert_eq!(decoded.board_id, "st-ecu-v1");
+        assert_eq!(decoded.reset_reason, None);
         assert!(!decoded.capabilities.is_empty());
     }
 
