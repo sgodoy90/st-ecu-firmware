@@ -72,6 +72,9 @@ pub enum Cmd {
     LogStart = 0x60,
     LogStop = 0x61,
     LogStatus = 0x62,
+    LogStatusResponse = 0x63,
+    ReadLogBlock = 0x64,
+    LogBlockData = 0x65,
     GetTriggerToothLog = 0x70,
     TriggerToothLog = 0x71,
     GetPinAssignments = 0x6A,
@@ -141,6 +144,9 @@ impl TryFrom<u8> for Cmd {
             0x60 => Ok(Self::LogStart),
             0x61 => Ok(Self::LogStop),
             0x62 => Ok(Self::LogStatus),
+            0x63 => Ok(Self::LogStatusResponse),
+            0x64 => Ok(Self::ReadLogBlock),
+            0x65 => Ok(Self::LogBlockData),
             0x70 => Ok(Self::GetTriggerToothLog),
             0x71 => Ok(Self::TriggerToothLog),
             0x6A => Ok(Self::GetPinAssignments),
@@ -232,6 +238,27 @@ pub struct DecodedIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedPagePayload {
     pub page_id: u8,
+    pub payload_crc: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogStatusPayload {
+    pub active: bool,
+    pub storage_present: bool,
+    pub rtc_synced: bool,
+    pub logbook_entries: u8,
+    pub session_id: u32,
+    pub elapsed_ms: u32,
+    pub bytes_written: u32,
+    pub block_count: u16,
+    pub block_size: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedLogBlockPayload {
+    pub block_index: u16,
+    pub total_blocks: u16,
     pub payload_crc: u32,
     pub payload: Vec<u8>,
 }
@@ -1496,6 +1523,71 @@ pub fn decode_page_payload(payload: &[u8]) -> Result<DecodedPagePayload, Protoco
     })
 }
 
+pub fn encode_log_status_payload(status: &LogStatusPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    out.push(status.active as u8);
+    out.push(status.storage_present as u8);
+    out.push(status.rtc_synced as u8);
+    out.push(status.logbook_entries);
+    out.extend_from_slice(&status.session_id.to_be_bytes());
+    out.extend_from_slice(&status.elapsed_ms.to_be_bytes());
+    out.extend_from_slice(&status.bytes_written.to_be_bytes());
+    out.extend_from_slice(&status.block_count.to_be_bytes());
+    out.extend_from_slice(&status.block_size.to_be_bytes());
+    out
+}
+
+pub fn decode_log_status_payload(payload: &[u8]) -> Result<LogStatusPayload, ProtocolError> {
+    if payload.len() != 20 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    Ok(LogStatusPayload {
+        active: payload[0] != 0,
+        storage_present: payload[1] != 0,
+        rtc_synced: payload[2] != 0,
+        logbook_entries: payload[3],
+        session_id: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        elapsed_ms: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
+        bytes_written: u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]),
+        block_count: u16::from_be_bytes([payload[16], payload[17]]),
+        block_size: u16::from_be_bytes([payload[18], payload[19]]),
+    })
+}
+
+pub fn encode_log_block_payload(block_index: u16, total_blocks: u16, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + data.len());
+    out.extend_from_slice(&block_index.to_be_bytes());
+    out.extend_from_slice(&total_blocks.to_be_bytes());
+    out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    out.extend_from_slice(&CRC32.checksum(data).to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+pub fn decode_log_block_payload(payload: &[u8]) -> Result<DecodedLogBlockPayload, ProtocolError> {
+    if payload.len() < 10 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let block_index = u16::from_be_bytes([payload[0], payload[1]]);
+    let total_blocks = u16::from_be_bytes([payload[2], payload[3]]);
+    let data_len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+    if payload.len() != 10 + data_len {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let payload_crc = u32::from_be_bytes([payload[6], payload[7], payload[8], payload[9]]);
+    let data = payload[10..].to_vec();
+    let actual_crc = CRC32.checksum(&data);
+    if payload_crc != actual_crc {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    Ok(DecodedLogBlockPayload {
+        block_index,
+        total_blocks,
+        payload_crc,
+        payload: data,
+    })
+}
+
 pub fn decode_raw_table_payload(payload: &[u8]) -> Result<RawTablePayload, ProtocolError> {
     if payload.len() < 3 {
         return Err(ProtocolError::MalformedPayload);
@@ -1627,21 +1719,24 @@ mod tests {
 
     use super::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
-        decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
+        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
+        decode_nack_payload, decode_network_profile_payload,
         decode_output_test_directory_payload, decode_page_payload, decode_page_request,
         decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
         decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_table_metadata_payload, decode_trigger_capture_payload,
         decode_trigger_decoder_directory_payload, decode_trigger_tooth_log_payload,
         encode_ack_payload, encode_capabilities_payload, encode_freeze_frames_payload,
-        encode_identity_payload, encode_nack_payload, encode_network_profile_payload,
-        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
-        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-        encode_pin_directory_payload, encode_sensor_raw_directory_payload,
-        encode_sensor_raw_payload, encode_table_directory_payload, encode_table_metadata_payload,
+        encode_identity_payload, encode_log_block_payload, encode_log_status_payload,
+        encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
+        encode_page_directory_payload, encode_page_payload, encode_page_request,
+        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+        encode_sensor_raw_directory_payload, encode_sensor_raw_payload,
+        encode_table_directory_payload, encode_table_metadata_payload,
         encode_trigger_capture_payload, encode_trigger_decoder_directory_payload,
-        encode_trigger_tooth_log_payload, Cmd, DecodedPinAssignment, OutputTestDirectoryEntry,
-        Packet, ProtocolError, RawTablePayload, SensorRawDirectoryEntry,
+        encode_trigger_tooth_log_payload, Cmd, DecodedPinAssignment, LogStatusPayload,
+        OutputTestDirectoryEntry, Packet, ProtocolError, RawTablePayload,
+        SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -1757,6 +1852,37 @@ mod tests {
             decode_nack_payload(&payload).unwrap(),
             (2, "bad page".to_string())
         );
+    }
+
+    #[test]
+    fn log_status_payload_roundtrip() {
+        let payload = encode_log_status_payload(&LogStatusPayload {
+            active: true,
+            storage_present: true,
+            rtc_synced: false,
+            logbook_entries: 4,
+            session_id: 17,
+            elapsed_ms: 2_450,
+            bytes_written: 98_112,
+            block_count: 12,
+            block_size: 256,
+        });
+        let decoded = decode_log_status_payload(&payload).unwrap();
+        assert!(decoded.active);
+        assert_eq!(decoded.logbook_entries, 4);
+        assert_eq!(decoded.session_id, 17);
+        assert_eq!(decoded.bytes_written, 98_112);
+        assert_eq!(decoded.block_count, 12);
+        assert_eq!(decoded.block_size, 256);
+    }
+
+    #[test]
+    fn log_block_payload_roundtrip() {
+        let payload = encode_log_block_payload(3, 9, &[0xAA, 0x10, 0x99, 0x01]);
+        let decoded = decode_log_block_payload(&payload).unwrap();
+        assert_eq!(decoded.block_index, 3);
+        assert_eq!(decoded.total_blocks, 9);
+        assert_eq!(decoded.payload, vec![0xAA, 0x10, 0x99, 0x01]);
     }
 
     #[test]
@@ -2109,6 +2235,9 @@ mod tests {
         assert_eq!(Cmd::LogStart as u8, 0x60);
         assert_eq!(Cmd::LogStop as u8, 0x61);
         assert_eq!(Cmd::LogStatus as u8, 0x62);
+        assert_eq!(Cmd::LogStatusResponse as u8, 0x63);
+        assert_eq!(Cmd::ReadLogBlock as u8, 0x64);
+        assert_eq!(Cmd::LogBlockData as u8, 0x65);
 
         assert_eq!(Cmd::GetPinAssignments as u8, 0x6A);
         assert_eq!(Cmd::PinAssignments as u8, 0x6B);
@@ -2122,7 +2251,7 @@ mod tests {
 
     #[test]
     fn runtime_rejects_desktop_legacy_bridge_command_ids() {
-        for code in [0x10u8, 0x11, 0x12, 0x13, 0x14, 0x63, 0x64, 0x65] {
+        for code in [0x10u8, 0x11, 0x12, 0x13, 0x14] {
             assert!(matches!(
                 Cmd::try_from(code),
                 Err(ProtocolError::UnknownCmd(v)) if v == code

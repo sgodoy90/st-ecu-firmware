@@ -12,13 +12,14 @@ use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, P
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, encode_ack_payload,
     encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
-    encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
+    encode_log_block_payload, encode_log_status_payload, encode_nack_payload,
+    encode_network_profile_payload, encode_output_test_directory_payload,
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
     encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
     encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload, Cmd,
-    OutputTestDirectoryEntry, Packet, RawTablePayload, SensorRawDirectoryEntry,
+    LogStatusPayload, OutputTestDirectoryEntry, Packet, RawTablePayload, SensorRawDirectoryEntry,
 };
 use crate::rotational_idle::RotationalIdleRuntime;
 use crate::tcu::ExternalTcuRuntime;
@@ -91,6 +92,17 @@ pub struct FirmwareRuntime {
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
+    log_active: bool,
+    log_storage_present: bool,
+    log_rtc_synced: bool,
+    logbook_entries: u8,
+    log_session_id: u32,
+    log_started_sample_counter: u32,
+    log_elapsed_ms_latched: u32,
+    log_bytes_written: u32,
+    log_block_size: u16,
+    log_blocks: Vec<Vec<u8>>,
+    log_staging_block: Vec<u8>,
 }
 
 const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
@@ -170,6 +182,7 @@ const FLASH_BLOCK_HEADER_LEN: usize = 4;
 const FLASH_BLOCK_MAX_BYTES: usize = 1024;
 const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
 static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+const LOG_BLOCK_SIZE_BYTES: u16 = 256;
 
 fn default_dtc_entries() -> Vec<RuntimeDtcEntry> {
     vec![
@@ -428,6 +441,17 @@ impl FirmwareRuntime {
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
+            log_active: false,
+            log_storage_present: true,
+            log_rtc_synced: true,
+            logbook_entries: 0,
+            log_session_id: 0,
+            log_started_sample_counter: 0,
+            log_elapsed_ms_latched: 0,
+            log_bytes_written: 0,
+            log_block_size: LOG_BLOCK_SIZE_BYTES,
+            log_blocks: Vec::new(),
+            log_staging_block: Vec::new(),
         }
     }
 
@@ -501,6 +525,63 @@ impl FirmwareRuntime {
 
         self.tables[index] = incoming;
         Ok(())
+    }
+
+    fn current_log_elapsed_ms(&self) -> u32 {
+        if self.log_active {
+            let now_ms = self.live_sample_counter.saturating_mul(20);
+            let start_ms = self.log_started_sample_counter.saturating_mul(20);
+            now_ms.saturating_sub(start_ms)
+        } else {
+            self.log_elapsed_ms_latched
+        }
+    }
+
+    fn current_log_block_count(&self) -> u16 {
+        let mut count = self.log_blocks.len() as u16;
+        if self.log_active && !self.log_staging_block.is_empty() {
+            count = count.saturating_add(1);
+        }
+        count
+    }
+
+    fn append_log_bytes(&mut self, bytes: &[u8]) {
+        if !self.log_active || bytes.is_empty() {
+            return;
+        }
+        self.log_bytes_written = self.log_bytes_written.saturating_add(bytes.len() as u32);
+        let block_size = self.log_block_size.max(1) as usize;
+        for byte in bytes {
+            self.log_staging_block.push(*byte);
+            if self.log_staging_block.len() >= block_size {
+                self.log_blocks.push(std::mem::take(&mut self.log_staging_block));
+            }
+        }
+        self.log_elapsed_ms_latched = self.current_log_elapsed_ms();
+    }
+
+    fn append_log_sample(&mut self, frame: &LiveDataFrame) {
+        if !self.log_active {
+            return;
+        }
+        let line = format!(
+            "t={} rpm={:.0} map={:.1} tps={:.1} lambda={:.4} clt={:.1}\n",
+            frame.timestamp_ms, frame.rpm, frame.map_kpa, frame.tps_pct, frame.lambda, frame.coolant_c
+        );
+        self.append_log_bytes(line.as_bytes());
+    }
+
+    fn read_log_block(&self, block_index: usize) -> Option<Vec<u8>> {
+        if block_index < self.log_blocks.len() {
+            return Some(self.log_blocks[block_index].clone());
+        }
+        if self.log_active
+            && block_index == self.log_blocks.len()
+            && !self.log_staging_block.is_empty()
+        {
+            return Some(self.log_staging_block.clone());
+        }
+        None
     }
 
     fn build_live_data_frame(&mut self) -> LiveDataFrame {
@@ -667,6 +748,7 @@ impl FirmwareRuntime {
         frame.transmission_state_code = tcu.state_code;
         frame.transmission_request_age_cs = tcu.request_age_cs;
         frame.transmission_ack_counter = tcu.ack_counter;
+        self.append_log_sample(&frame);
         frame
     }
 
@@ -706,6 +788,67 @@ impl FirmwareRuntime {
                 Cmd::TriggerToothLog,
                 encode_trigger_tooth_log_payload(&sample_trigger_tooth_log()),
             ),
+            Cmd::LogStart => {
+                self.log_active = true;
+                self.log_session_id = self.log_session_id.wrapping_add(1);
+                if self.log_session_id == 0 {
+                    self.log_session_id = 1;
+                }
+                self.log_started_sample_counter = self.live_sample_counter;
+                self.log_elapsed_ms_latched = 0;
+                self.log_bytes_written = 0;
+                self.log_blocks.clear();
+                self.log_staging_block.clear();
+                let header = format!(
+                    "session={} start_ms={}\n",
+                    self.log_session_id,
+                    self.live_sample_counter.saturating_mul(20)
+                );
+                self.append_log_bytes(header.as_bytes());
+                Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::LogStop => {
+                if self.log_active {
+                    self.log_elapsed_ms_latched = self.current_log_elapsed_ms();
+                    self.log_active = false;
+                    if !self.log_staging_block.is_empty() {
+                        self.log_blocks.push(std::mem::take(&mut self.log_staging_block));
+                    }
+                    self.logbook_entries = self.logbook_entries.saturating_add(1);
+                }
+                Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::LogStatus => Packet::new(
+                Cmd::LogStatusResponse,
+                encode_log_status_payload(&LogStatusPayload {
+                    active: self.log_active,
+                    storage_present: self.log_storage_present,
+                    rtc_synced: self.log_rtc_synced,
+                    logbook_entries: self.logbook_entries,
+                    session_id: self.log_session_id,
+                    elapsed_ms: self.current_log_elapsed_ms(),
+                    bytes_written: self.log_bytes_written,
+                    block_count: self.current_log_block_count(),
+                    block_size: self.log_block_size,
+                }),
+            ),
+            Cmd::ReadLogBlock => {
+                if packet.payload.len() != 2 {
+                    return nack(RuntimeNackCode::MalformedPayload, "bad read-log-block payload");
+                }
+                let block_index = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
+                let total_blocks = self.current_log_block_count();
+                if block_index >= total_blocks {
+                    return nack(RuntimeNackCode::MalformedPayload, "invalid log block index");
+                }
+                let Some(block_data) = self.read_log_block(block_index as usize) else {
+                    return nack(RuntimeNackCode::MalformedPayload, "log block unavailable");
+                };
+                Packet::new(
+                    Cmd::LogBlockData,
+                    encode_log_block_payload(block_index, total_blocks, &block_data),
+                )
+            }
             Cmd::GetPageDirectory => {
                 Packet::new(Cmd::PageDirectory, encode_page_directory_payload())
             }
@@ -969,8 +1112,9 @@ mod tests {
     use crate::network::{MessageClass, ProductTrack, TransportLinkKind};
     use crate::protocol::{
         decode_ack_payload, decode_capabilities_payload, decode_freeze_frames_payload,
-        decode_identity_payload, decode_nack_payload, decode_network_profile_payload,
-        decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
+        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
+        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
+        decode_page_payload, decode_page_statuses_payload,
         decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
@@ -1544,6 +1688,51 @@ mod tests {
         assert_eq!(decoded_tooth_log.reference_event_index, 2);
         assert_eq!(decoded_tooth_log.tooth_intervals_us.len(), 12);
         assert!(decoded_tooth_log.secondary_event_indexes.contains(&8));
+    }
+
+    #[test]
+    fn runtime_datalog_lifecycle_exposes_status_and_blocks() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let start = runtime.handle_packet(Packet::new(Cmd::LogStart, vec![]));
+        assert_eq!(start.cmd, Cmd::Ack);
+
+        for _ in 0..12 {
+            let _ = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        }
+
+        let status = runtime.handle_packet(Packet::new(Cmd::LogStatus, vec![]));
+        let decoded_status = decode_log_status_payload(&status.payload).unwrap();
+        assert_eq!(status.cmd, Cmd::LogStatusResponse);
+        assert!(decoded_status.active);
+        assert!(decoded_status.storage_present);
+        assert!(decoded_status.block_count >= 1);
+        assert_eq!(decoded_status.block_size, 256);
+
+        let read_block = runtime.handle_packet(Packet::new(Cmd::ReadLogBlock, vec![0x00, 0x00]));
+        let decoded_block = decode_log_block_payload(&read_block.payload).unwrap();
+        assert_eq!(read_block.cmd, Cmd::LogBlockData);
+        assert_eq!(decoded_block.block_index, 0);
+        assert_eq!(decoded_block.total_blocks, decoded_status.block_count);
+        assert!(!decoded_block.payload.is_empty());
+
+        let stop = runtime.handle_packet(Packet::new(Cmd::LogStop, vec![]));
+        assert_eq!(stop.cmd, Cmd::Ack);
+
+        let status_after = runtime.handle_packet(Packet::new(Cmd::LogStatus, vec![]));
+        let decoded_after = decode_log_status_payload(&status_after.payload).unwrap();
+        assert!(!decoded_after.active);
+        assert!(decoded_after.logbook_entries >= 1);
+    }
+
+    #[test]
+    fn runtime_rejects_invalid_log_block_request() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let response = runtime.handle_packet(Packet::new(Cmd::ReadLogBlock, vec![0x00]));
+        assert_eq!(response.cmd, Cmd::Nack);
+        let (code, reason) = decode_nack_payload(&response.payload).unwrap();
+        assert_eq!(code, 2);
+        assert!(reason.contains("read-log-block"));
     }
 
     #[test]

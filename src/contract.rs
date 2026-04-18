@@ -29,6 +29,10 @@ pub enum Capability {
     ExternalTcu,
     TorqueIntervention,
     WidebandController,
+    DatalogStorage,
+    Logbook,
+    RtcClock,
+    LogBlockRead,
     DisplayLink,
     DashboardFrames,
     Simulator,
@@ -71,6 +75,10 @@ impl Capability {
             Self::ExternalTcu => 0x1E,
             Self::TorqueIntervention => 0x1F,
             Self::WidebandController => 0x20,
+            Self::DatalogStorage => 0x21,
+            Self::Logbook => 0x22,
+            Self::RtcClock => 0x23,
+            Self::LogBlockRead => 0x24,
             Self::DisplayLink => 0x15,
             Self::DashboardFrames => 0x16,
             Self::Simulator => 0x17,
@@ -108,6 +116,10 @@ impl Capability {
             Self::ExternalTcu => "external_tcu",
             Self::TorqueIntervention => "torque_intervention",
             Self::WidebandController => "wideband_controller",
+            Self::DatalogStorage => "datalog_storage",
+            Self::Logbook => "logbook",
+            Self::RtcClock => "rtc_clock",
+            Self::LogBlockRead => "log_block_read",
             Self::DisplayLink => "display_link",
             Self::DashboardFrames => "dashboard_frames",
             Self::Simulator => "simulator",
@@ -149,6 +161,10 @@ impl TryFrom<u8> for Capability {
             0x1E => Ok(Self::ExternalTcu),
             0x1F => Ok(Self::TorqueIntervention),
             0x20 => Ok(Self::WidebandController),
+            0x21 => Ok(Self::DatalogStorage),
+            0x22 => Ok(Self::Logbook),
+            0x23 => Ok(Self::RtcClock),
+            0x24 => Ok(Self::LogBlockRead),
             0x15 => Ok(Self::DisplayLink),
             0x16 => Ok(Self::DashboardFrames),
             0x17 => Ok(Self::Simulator),
@@ -389,7 +405,7 @@ pub const TABLE_DIRECTORY: [TableDirectoryEntry; 8] = [
     },
 ];
 
-const BASE_CAPABILITIES: [Capability; 29] = [
+const BASE_CAPABILITIES: [Capability; 33] = [
     Capability::LiveData,
     Capability::PageRead,
     Capability::PageWrite,
@@ -419,6 +435,10 @@ const BASE_CAPABILITIES: [Capability; 29] = [
     Capability::ExternalTcu,
     Capability::TorqueIntervention,
     Capability::WidebandController,
+    Capability::DatalogStorage,
+    Capability::Logbook,
+    Capability::RtcClock,
+    Capability::LogBlockRead,
 ];
 
 pub fn base_capabilities(simulator: bool) -> Vec<Capability> {
