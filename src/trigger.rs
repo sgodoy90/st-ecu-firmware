@@ -55,7 +55,7 @@ pub struct TriggerToothLog {
     pub secondary_event_indexes: Vec<u16>,
 }
 
-pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 20] = [
+pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 21] = [
     TriggerDecoderPreset {
         key: "generic_60_2",
         label: "Generic 60-2 + Home",
@@ -92,6 +92,26 @@ pub const SUPPORTED_TRIGGER_DECODERS: [TriggerDecoderPreset; 20] = [
         secondary_pattern_hint: Some("Single home or cam-sync event every 720 deg"),
         reference_description:
             "Missing-tooth lock from a 36-1 crank pattern with phase confirmation from home input.",
+        expected_engine_cycle_deg: 720,
+        requires_secondary: true,
+        supports_sequential: true,
+    },
+    TriggerDecoderPreset {
+        key: "dual_wheel",
+        label: "Dual Wheel + Home",
+        family: "Universal Dual-Wheel",
+        decoder: "dual_wheel_phase",
+        pattern_kind: "oem_pattern",
+        primary_input_label: "Crank Wheel",
+        secondary_input_label: Some("Cam Home"),
+        primary_sensor_kind: "vr_or_hall",
+        secondary_sensor_kind: Some("hall_or_optical"),
+        edge_policy: "configurable",
+        sync_strategy: "dual_wheel_phase",
+        primary_pattern_hint: "Evenly spaced crank wheel events on primary input",
+        secondary_pattern_hint: Some("Single or dual cam-home events per 720 deg cycle"),
+        reference_description:
+            "Dual-wheel phase decoder using crank spacing with cam-home validation for full-cycle sync.",
         expected_engine_cycle_deg: 720,
         requires_secondary: true,
         supports_sequential: true,
@@ -517,6 +537,7 @@ mod tests {
         let expected_keys = [
             "generic_60_2",
             "generic_36_1",
+            "dual_wheel",
             "distributor_basic_4",
             "distributor_basic_6",
             "distributor_basic_8",
@@ -551,6 +572,7 @@ mod tests {
             ("mitsubishi_4g63", "oem_mitsubishi_4g63"),
             ("subaru_ej_36_2_2_2", "oem_subaru_ej_36_2_2_2"),
             ("mazda_bp_4_1", "oem_mazda_bp_4_1"),
+            ("dual_wheel", "dual_wheel_phase"),
         ];
         for (key, decoder) in expected_pairs {
             let preset = SUPPORTED_TRIGGER_DECODERS

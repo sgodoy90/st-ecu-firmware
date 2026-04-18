@@ -23,9 +23,8 @@ use crate::protocol::{
 };
 use crate::rotational_idle::RotationalIdleRuntime;
 use crate::tcu::ExternalTcuRuntime;
-use crate::trigger::{
-    sample_trigger_capture, sample_trigger_tooth_log, SUPPORTED_TRIGGER_DECODERS,
-};
+use crate::trigger::SUPPORTED_TRIGGER_DECODERS;
+use crate::trigger_runtime::TriggerRuntime;
 use crate::wideband::WidebandRuntime;
 use crate::ConfigPage;
 use crc::{Crc, CRC_32_ISO_HDLC};
@@ -84,6 +83,7 @@ pub struct FirmwareRuntime {
     dtc_entries: Vec<RuntimeDtcEntry>,
     live_sample_counter: u32,
     sync_loss_counter: u8,
+    trigger_runtime: TriggerRuntime,
     tcu_runtime: ExternalTcuRuntime,
     rotational_idle_runtime: RotationalIdleRuntime,
     wideband_runtime: WidebandRuntime,
@@ -183,6 +183,129 @@ const FLASH_BLOCK_MAX_BYTES: usize = 1024;
 const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
 static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 const LOG_BLOCK_SIZE_BYTES: u16 = 256;
+const PAGE0_MAGIC: [u8; 4] = *b"STC2";
+const PAGE0_VERSION: u8 = 1;
+const PAGE0_OFFSET_ENGINE_CYLINDERS: usize = 5;
+const PAGE0_OFFSET_INJECTOR_FLOW_CC_MIN: usize = 26;
+const PAGE0_OFFSET_DEADTIME_14V_MS: usize = 28;
+const PAGE0_OFFSET_DWELL_MODE: usize = 33;
+const PAGE0_OFFSET_DWELL_FIXED_MS: usize = 34;
+const PAGE0_OFFSET_DWELL_MAX_MS: usize = 36;
+const PAGE0_OFFSET_DWELL_MIN_MS: usize = 38;
+const ACTUATOR_DEADTIME_BOUNDS_MS: (f32, f32) = (0.05, 8.0);
+const ACTUATOR_DWELL_BOUNDS_MS: (f32, f32) = (0.5, 10.0);
+const ACTUATOR_PULSEWIDTH_BOUNDS_MS: (f32, f32) = (0.2, 22.0);
+
+#[derive(Debug, Clone, Copy)]
+struct ActuatorRuntimeConfig {
+    cylinders: u8,
+    injector_flow_cc_min: f32,
+    injector_deadtime_14v_ms: f32,
+    dwell_mode_table: bool,
+    dwell_fixed_ms: f32,
+    dwell_min_ms: f32,
+    dwell_max_ms: f32,
+}
+
+impl Default for ActuatorRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            cylinders: 4,
+            injector_flow_cc_min: 440.0,
+            injector_deadtime_14v_ms: 0.9,
+            dwell_mode_table: false,
+            dwell_fixed_ms: 3.2,
+            dwell_min_ms: 0.8,
+            dwell_max_ms: 5.0,
+        }
+    }
+}
+
+fn read_be_u16(payload: &[u8], offset: usize) -> Option<u16> {
+    payload
+        .get(offset..offset + 2)
+        .map(|window| u16::from_be_bytes([window[0], window[1]]))
+}
+
+fn parse_page0_actuator_config(payload: &[u8]) -> ActuatorRuntimeConfig {
+    let mut config = ActuatorRuntimeConfig::default();
+    if payload.len() <= PAGE0_OFFSET_DWELL_MIN_MS + 1 {
+        return config;
+    }
+    if payload.get(0..4) != Some(&PAGE0_MAGIC) || payload.get(4).copied() != Some(PAGE0_VERSION) {
+        return config;
+    }
+
+    let cylinders = payload[PAGE0_OFFSET_ENGINE_CYLINDERS];
+    config.cylinders = if cylinders == 0 { 4 } else { cylinders.min(16) };
+
+    if let Some(flow_cc) = read_be_u16(payload, PAGE0_OFFSET_INJECTOR_FLOW_CC_MIN) {
+        let flow = flow_cc as f32;
+        if flow >= 50.0 {
+            config.injector_flow_cc_min = flow;
+        }
+    }
+
+    if let Some(deadtime_raw) = read_be_u16(payload, PAGE0_OFFSET_DEADTIME_14V_MS) {
+        config.injector_deadtime_14v_ms =
+            (deadtime_raw as f32 / 1000.0).clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1);
+    }
+
+    config.dwell_mode_table = payload[PAGE0_OFFSET_DWELL_MODE] == 1;
+
+    let mut dwell_fixed_ms = read_be_u16(payload, PAGE0_OFFSET_DWELL_FIXED_MS)
+        .map(|value| value as f32 / 1000.0)
+        .unwrap_or(config.dwell_fixed_ms)
+        .clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
+    let mut dwell_max_ms = read_be_u16(payload, PAGE0_OFFSET_DWELL_MAX_MS)
+        .map(|value| value as f32 / 1000.0)
+        .unwrap_or(config.dwell_max_ms)
+        .clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
+    let mut dwell_min_ms = read_be_u16(payload, PAGE0_OFFSET_DWELL_MIN_MS)
+        .map(|value| value as f32 / 1000.0)
+        .unwrap_or(config.dwell_min_ms)
+        .clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
+
+    if dwell_max_ms < dwell_min_ms {
+        std::mem::swap(&mut dwell_max_ms, &mut dwell_min_ms);
+    }
+    if (dwell_max_ms - dwell_min_ms) < 0.1 {
+        dwell_max_ms = (dwell_min_ms + 0.1).clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
+        if dwell_max_ms <= dwell_min_ms {
+            dwell_min_ms = (dwell_max_ms - 0.1).max(ACTUATOR_DWELL_BOUNDS_MS.0);
+        }
+    }
+    dwell_fixed_ms = dwell_fixed_ms.clamp(dwell_min_ms, dwell_max_ms);
+
+    config.dwell_fixed_ms = dwell_fixed_ms;
+    config.dwell_min_ms = dwell_min_ms;
+    config.dwell_max_ms = dwell_max_ms;
+
+    config
+}
+
+fn injector_deadtime_for_conditions_ms(deadtime_14v_ms: f32, vbatt: f32, fuel_temp_c: f32) -> f32 {
+    let voltage_comp_ms = (14.0 - vbatt).clamp(-6.0, 6.0) * 0.06;
+    let temperature_scale = (1.0 + ((20.0 - fuel_temp_c).clamp(-60.0, 60.0) * 0.0025)).clamp(0.85, 1.2);
+    ((deadtime_14v_ms + voltage_comp_ms).max(0.01) * temperature_scale)
+        .clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1)
+}
+
+fn dwell_for_conditions_ms(config: &ActuatorRuntimeConfig, vbatt: f32, coolant_c: f32) -> (f32, f32) {
+    let voltage_exponent = if config.dwell_mode_table { 0.55 } else { 0.40 };
+    let voltage_scale = (14.0 / vbatt.max(8.0)).powf(voltage_exponent).clamp(0.65, 1.7);
+    let coolant_bias_ms = if coolant_c < 40.0 {
+        ((40.0 - coolant_c).min(40.0)) * 0.01
+    } else {
+        0.0
+    };
+
+    let requested = config.dwell_fixed_ms * voltage_scale + coolant_bias_ms;
+    let bounded = requested
+        .clamp(config.dwell_min_ms, config.dwell_max_ms)
+        .clamp(ACTUATOR_DWELL_BOUNDS_MS.0, ACTUATOR_DWELL_BOUNDS_MS.1);
+    (requested, bounded)
+}
 
 fn default_dtc_entries() -> Vec<RuntimeDtcEntry> {
     vec![
@@ -409,6 +532,7 @@ fn sensor_raw_sample(channel: u8) -> (u16, f32) {
 impl FirmwareRuntime {
     pub fn new(identity: FirmwareIdentity, simulator: bool) -> Self {
         let mut store = ConfigStore::new_zeroed();
+        let mut trigger_runtime = TriggerRuntime::default();
         let pin_assignments = validate_assignment_set(&default_pin_assignments())
             .expect("default pin assignments must be valid for board definition");
         let page_len = store
@@ -422,6 +546,9 @@ impl FirmwareRuntime {
         store
             .burn_page(ConfigPage::PinAssignment as u8)
             .expect("pin assignment page seed must burn");
+        if let Some(page0) = store.read_page(ConfigPage::BaseEngineFuelComm as u8) {
+            trigger_runtime.apply_page0_payload(page0);
+        }
         Self {
             identity,
             transport: TransportCapabilities::default(),
@@ -433,6 +560,7 @@ impl FirmwareRuntime {
             dtc_entries: default_dtc_entries(),
             live_sample_counter: 0,
             sync_loss_counter: 0,
+            trigger_runtime,
             tcu_runtime: ExternalTcuRuntime::default(),
             rotational_idle_runtime: RotationalIdleRuntime::default(),
             wideband_runtime: WidebandRuntime::default(),
@@ -501,6 +629,12 @@ impl FirmwareRuntime {
             .ok_or(AssignmentError::InvalidPayload)?;
         self.pin_assignments = deserialize_assignments_from_page(payload)?;
         Ok(())
+    }
+
+    fn sync_trigger_runtime_from_page0(&mut self) {
+        if let Some(payload) = self.store.read_page(ConfigPage::BaseEngineFuelComm as u8) {
+            self.trigger_runtime.apply_page0_payload(payload);
+        }
     }
 
     fn table_index(&self, table_id: u8) -> Option<usize> {
@@ -586,6 +720,7 @@ impl FirmwareRuntime {
 
     fn build_live_data_frame(&mut self) -> LiveDataFrame {
         self.live_sample_counter = self.live_sample_counter.wrapping_add(1);
+        self.trigger_runtime.observe_tick(self.live_sample_counter);
         if self.live_sample_counter % 190 == 0 {
             self.sync_loss_counter = self.sync_loss_counter.wrapping_add(1);
         }
@@ -594,6 +729,11 @@ impl FirmwareRuntime {
         frame.timestamp_ms = self.live_sample_counter.saturating_mul(20);
         let tcu = self.tcu_runtime.tick(self.live_sample_counter);
         let shift_in_progress = self.tcu_runtime.shift_in_progress();
+        let actuator_config = self
+            .store
+            .read_page(ConfigPage::BaseEngineFuelComm as u8)
+            .map(parse_page0_actuator_config)
+            .unwrap_or_default();
 
         frame.sync_loss_counter = self.sync_loss_counter;
         frame.rpm = if shift_in_progress { 2_150.0 } else { 980.0 };
@@ -606,15 +746,66 @@ impl FirmwareRuntime {
         frame.fuel_pressure_kpa = 392.0;
         frame.coolant_c = 88.5;
         frame.intake_c = 43.0;
+        frame.oil_temp_c = 92.0;
+        frame.fuel_temp_c = 37.0;
         frame.aux_temp1_c = 805.0 + ((self.live_sample_counter % 8) as f32);
         frame.aux_temp2_c = 790.0 + ((self.live_sample_counter % 6) as f32);
         frame.afr_target = 14.7;
+        frame.vbatt = (13.8 + ((self.live_sample_counter % 11) as f32 * 0.03) - 0.12)
+            .clamp(11.5, 15.2);
+        frame.vref_mv = 5.0;
+        frame.advance_deg = if shift_in_progress { 8.0 } else { 13.5 };
+        frame.fuel_load = ((frame.map_kpa / frame.baro_kpa.max(1.0)) * 100.0).clamp(10.0, 250.0);
+        frame.ign_load = frame.fuel_load;
+        frame.ve_pct = (52.0 + frame.fuel_load * 0.21).clamp(35.0, 120.0);
         frame.idle_target_rpm = 980;
         frame.idle_valve_pct = 34;
         frame.status_flags =
             status::RUNNING | status::CAN_ACTIVE | status::USB_CONNECTED | status::CLOSED_LOOP;
         if shift_in_progress {
             frame.status_flags |= status::FLAT_SHIFT;
+        }
+        frame.correction_iat = ((frame.intake_c - 25.0) * -0.12).clamp(-8.0, 8.0);
+        frame.correction_clt = if frame.coolant_c < 80.0 {
+            ((80.0 - frame.coolant_c) * 0.12).clamp(0.0, 8.0)
+        } else {
+            0.0
+        };
+        frame.correction_baro = ((frame.baro_kpa - 101.3) * 0.08).clamp(-5.0, 5.0);
+        frame.correction_flex = 0.0;
+
+        let flow_scale = (460.0 / actuator_config.injector_flow_cc_min.max(50.0)).clamp(0.35, 2.4);
+        let base_pulsewidth_ms = (if shift_in_progress {
+            2.9
+        } else {
+            1.65 + frame.tps_pct * 0.011 + (frame.map_kpa - 30.0).max(0.0) * 0.006
+        }) * flow_scale;
+        let deadtime_ms = injector_deadtime_for_conditions_ms(
+            actuator_config.injector_deadtime_14v_ms,
+            frame.vbatt,
+            frame.fuel_temp_c,
+        );
+        let requested_pulsewidth_ms = base_pulsewidth_ms + deadtime_ms;
+        frame.actual_pulsewidth_ms = requested_pulsewidth_ms.clamp(
+            ACTUATOR_PULSEWIDTH_BOUNDS_MS.0,
+            ACTUATOR_PULSEWIDTH_BOUNDS_MS.1,
+        );
+        if (frame.actual_pulsewidth_ms - requested_pulsewidth_ms).abs() > 0.001 {
+            frame.error_flags |= error::INJECTOR;
+            frame.status_flags |= status::CHECK_ENGINE;
+        }
+        let event_cycle_ms = (120_000.0 / frame.rpm.max(1.0)).max(1.0);
+        frame.injector_duty_pct = ((frame.actual_pulsewidth_ms / event_cycle_ms) * 100.0).clamp(0.0, 99.5);
+        if frame.injector_duty_pct > 95.0 {
+            frame.error_flags |= error::INJECTOR;
+            frame.status_flags |= status::CHECK_ENGINE;
+        }
+        let (requested_dwell_ms, bounded_dwell_ms) =
+            dwell_for_conditions_ms(&actuator_config, frame.vbatt, frame.coolant_c);
+        frame.dwell_ms = bounded_dwell_ms;
+        if (bounded_dwell_ms - requested_dwell_ms).abs() > 0.001 {
+            frame.error_flags |= error::IGNITION;
+            frame.status_flags |= status::CHECK_ENGINE;
         }
 
         let wideband = self
@@ -698,15 +889,23 @@ impl FirmwareRuntime {
             }
             ProtectionAction::FuelCut => {
                 frame.status_flags |= status::BOOST_CUT_FUEL;
+                frame.actual_pulsewidth_ms = 0.0;
+                frame.injector_duty_pct = 0.0;
             }
             ProtectionAction::SparkAndFuelCut => {
                 frame.status_flags |= status::BOOST_CUT_SPARK | status::BOOST_CUT_FUEL;
                 frame.status_flags |= status::OVERREV;
+                frame.actual_pulsewidth_ms = 0.0;
+                frame.injector_duty_pct = 0.0;
+                frame.dwell_ms = 0.0;
             }
             ProtectionAction::LimpMode => {
                 frame.status_flags |= status::BOOST_CUT_SPARK | status::BOOST_CUT_FUEL;
                 frame.rpm = frame.rpm.min(2_500.0);
                 frame.tps_pct = frame.tps_pct.min(30.0);
+                frame.actual_pulsewidth_ms = frame.actual_pulsewidth_ms.min(4.5);
+                frame.injector_duty_pct = frame.injector_duty_pct.min(35.0);
+                frame.dwell_ms = frame.dwell_ms.min(2.4);
             }
             ProtectionAction::Shutdown => {
                 frame.status_flags |= status::BOOST_CUT_SPARK | status::BOOST_CUT_FUEL;
@@ -715,6 +914,9 @@ impl FirmwareRuntime {
                 frame.rpm = 0.0;
                 frame.tps_pct = 0.0;
                 frame.map_kpa = frame.baro_kpa;
+                frame.actual_pulsewidth_ms = 0.0;
+                frame.injector_duty_pct = 0.0;
+                frame.dwell_ms = 0.0;
             }
         }
 
@@ -776,18 +978,18 @@ impl FirmwareRuntime {
                 Cmd::FreezeFrames,
                 encode_freeze_frames_payload(&SAMPLE_FREEZE_FRAMES),
             ),
-            Cmd::GetTriggerCapture => Packet::new(
-                Cmd::TriggerCapture,
-                encode_trigger_capture_payload(&sample_trigger_capture()),
-            ),
+            Cmd::GetTriggerCapture => {
+                let capture = self.trigger_runtime.trigger_capture(self.live_sample_counter);
+                Packet::new(Cmd::TriggerCapture, encode_trigger_capture_payload(&capture))
+            }
             Cmd::GetTriggerDecoderDirectory => Packet::new(
                 Cmd::TriggerDecoderDirectory,
                 encode_trigger_decoder_directory_payload(&SUPPORTED_TRIGGER_DECODERS),
             ),
-            Cmd::GetTriggerToothLog => Packet::new(
-                Cmd::TriggerToothLog,
-                encode_trigger_tooth_log_payload(&sample_trigger_tooth_log()),
-            ),
+            Cmd::GetTriggerToothLog => {
+                let tooth_log = self.trigger_runtime.trigger_tooth_log(self.live_sample_counter);
+                Packet::new(Cmd::TriggerToothLog, encode_trigger_tooth_log_payload(&tooth_log))
+            }
             Cmd::LogStart => {
                 self.log_active = true;
                 self.log_session_id = self.log_session_id.wrapping_add(1);
@@ -992,6 +1194,10 @@ impl FirmwareRuntime {
                         );
                     }
 
+                    if page.page_id == ConfigPage::BaseEngineFuelComm as u8 {
+                        self.sync_trigger_runtime_from_page0();
+                    }
+
                     Packet::new(
                         Cmd::Ack,
                         encode_ack_payload(
@@ -1004,7 +1210,12 @@ impl FirmwareRuntime {
             },
             Cmd::BurnPage => match decode_page_request(&packet.payload) {
                 Ok(page_id) => match self.store.burn_page(page_id) {
-                    Ok(()) => Packet::new(Cmd::Ack, encode_ack_payload(page_id, false)),
+                    Ok(()) => {
+                        if page_id == ConfigPage::BaseEngineFuelComm as u8 {
+                            self.sync_trigger_runtime_from_page0();
+                        }
+                        Packet::new(Cmd::Ack, encode_ack_payload(page_id, false))
+                    }
                     Err(_) => nack(RuntimeNackCode::StorageFailure, "page burn failed"),
                 },
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad burn-page payload"),
@@ -1123,7 +1334,10 @@ mod tests {
     use crate::ConfigPage;
     use serde_json::Value;
 
-    use super::FirmwareRuntime;
+    use super::{
+        parse_page0_actuator_config, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
+        ACTUATOR_PULSEWIDTH_BOUNDS_MS,
+    };
 
     fn decode_live_frame(payload: &[u8]) -> LiveDataFrame {
         assert_eq!(payload.len(), LIVE_DATA_SIZE);
@@ -1150,6 +1364,59 @@ mod tests {
 
         assert_eq!(response.cmd, Cmd::Capabilities);
         assert!(!capabilities.is_empty());
+    }
+
+    #[test]
+    fn page0_actuator_parser_sanitizes_extreme_values() {
+        let mut payload = vec![0u8; 512];
+        payload[0..4].copy_from_slice(b"STC2");
+        payload[4] = 1;
+        payload[5] = 0; // cylinder count zero should fall back to sane value
+        payload[26..28].copy_from_slice(&20u16.to_be_bytes()); // unrealistically small injector flow
+        payload[28..30].copy_from_slice(&40_000u16.to_be_bytes()); // deadtime too high
+        payload[33] = 1; // dwell table mode
+        payload[34..36].copy_from_slice(&12_000u16.to_be_bytes()); // fixed dwell too high
+        payload[36..38].copy_from_slice(&300u16.to_be_bytes()); // max dwell too low
+        payload[38..40].copy_from_slice(&9_500u16.to_be_bytes()); // min dwell > max dwell
+
+        let parsed = parse_page0_actuator_config(&payload);
+        assert_eq!(parsed.cylinders, 4);
+        assert!(parsed.injector_flow_cc_min >= 100.0);
+        assert!((0.05..=8.0).contains(&parsed.injector_deadtime_14v_ms));
+        assert!(parsed.dwell_mode_table);
+        assert!(parsed.dwell_max_ms >= parsed.dwell_min_ms);
+        assert!(parsed.dwell_fixed_ms >= parsed.dwell_min_ms);
+        assert!(parsed.dwell_fixed_ms <= parsed.dwell_max_ms);
+    }
+
+    #[test]
+    fn runtime_live_data_binds_pulsewidth_and_dwell_to_guardrails() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let page_id = ConfigPage::BaseEngineFuelComm as u8;
+        let mut page = vec![0u8; runtime.store.page_length(page_id).unwrap()];
+        page[0..4].copy_from_slice(b"STC2");
+        page[4] = 1;
+        page[5] = 4;
+        page[26..28].copy_from_slice(&100u16.to_be_bytes());
+        page[28..30].copy_from_slice(&40_000u16.to_be_bytes());
+        page[33] = 0;
+        page[34..36].copy_from_slice(&11_000u16.to_be_bytes());
+        page[36..38].copy_from_slice(&11_000u16.to_be_bytes());
+        page[38..40].copy_from_slice(&200u16.to_be_bytes());
+
+        let write = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(page_id, &page),
+        ));
+        assert_eq!(write.cmd, Cmd::Ack);
+
+        let response = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        let frame = decode_live_frame(&response.payload);
+        assert!(frame.actual_pulsewidth_ms >= ACTUATOR_PULSEWIDTH_BOUNDS_MS.0);
+        assert!(frame.actual_pulsewidth_ms <= ACTUATOR_PULSEWIDTH_BOUNDS_MS.1);
+        assert!(frame.dwell_ms >= ACTUATOR_DWELL_BOUNDS_MS.0);
+        assert!(frame.dwell_ms <= ACTUATOR_DWELL_BOUNDS_MS.1);
+        assert!(frame.injector_duty_pct <= 99.5);
     }
 
     #[test]
@@ -1663,7 +1930,7 @@ mod tests {
         let capture = runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
         let decoded_capture = decode_trigger_capture_payload(&capture.payload).unwrap();
         assert_eq!(capture.cmd, Cmd::TriggerCapture);
-        assert_eq!(decoded_capture.preset_key, "honda_k20_12_1");
+        assert_eq!(decoded_capture.preset_key, "generic_60_2");
         assert_eq!(decoded_capture.sync_state, "locked");
         assert_eq!(
             decoded_capture.primary_samples.len(),
@@ -1677,6 +1944,7 @@ mod tests {
         assert!(presets.iter().any(|preset| preset.key == "honda_k20_12_1"));
         assert!(presets.iter().any(|preset| preset.key == "subaru_6_7"));
         assert!(presets.iter().any(|preset| preset.key == "mitsubishi_4g63"));
+        assert!(presets.iter().any(|preset| preset.key == "dual_wheel"));
         assert!(presets
             .iter()
             .any(|preset| preset.pattern_kind == "missing_tooth"));
@@ -1684,10 +1952,62 @@ mod tests {
         let tooth_log = runtime.handle_packet(Packet::new(Cmd::GetTriggerToothLog, vec![]));
         let decoded_tooth_log = decode_trigger_tooth_log_payload(&tooth_log.payload).unwrap();
         assert_eq!(tooth_log.cmd, Cmd::TriggerToothLog);
-        assert_eq!(decoded_tooth_log.preset_key, "honda_k20_12_1");
-        assert_eq!(decoded_tooth_log.reference_event_index, 2);
-        assert_eq!(decoded_tooth_log.tooth_intervals_us.len(), 12);
-        assert!(decoded_tooth_log.secondary_event_indexes.contains(&8));
+        assert_eq!(decoded_tooth_log.preset_key, "generic_60_2");
+        assert!(!decoded_tooth_log.tooth_intervals_us.is_empty());
+        assert!(decoded_tooth_log.reference_event_index < decoded_tooth_log.tooth_intervals_us.len() as u16);
+        assert!(decoded_tooth_log.dominant_gap_ratio >= 1.0);
+    }
+
+    #[test]
+    fn writing_page0_reconfigures_runtime_trigger_decoder() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let page_id = ConfigPage::BaseEngineFuelComm as u8;
+        let page_len = runtime.store.page_length(page_id).unwrap();
+        let mut page = vec![0u8; page_len];
+        page[0..4].copy_from_slice(b"STC2");
+        page[4] = 1;
+        page[5] = 8; // engine cylinders
+
+        // Distributor type should map by cylinder count (4/6/8 dynamic mapping).
+        page[44] = 11;
+        let distributor_write = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(page_id, &page),
+        ));
+        assert_eq!(distributor_write.cmd, Cmd::Ack);
+        let distributor_capture = runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
+        let decoded_distributor = decode_trigger_capture_payload(&distributor_capture.payload).unwrap();
+        assert_eq!(decoded_distributor.preset_key, "distributor_basic_8");
+
+        // Single-tooth + secondary should map into dual-wheel runtime mode.
+        page[44] = 13;
+        page[46..48].copy_from_slice(&24u16.to_be_bytes());
+        page[48..50].copy_from_slice(&0u16.to_be_bytes());
+        page[57] = 1; // secondary enabled
+        let dual_write = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(page_id, &page),
+        ));
+        assert_eq!(dual_write.cmd, Cmd::Ack);
+        let dual_capture = runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
+        let decoded_dual = decode_trigger_capture_payload(&dual_capture.payload).unwrap();
+        assert_eq!(decoded_dual.preset_key, "dual_wheel");
+        assert!(decoded_dual.secondary_edge_count > 0);
+
+        // Missing-tooth 36-1 should map to generic_36_1.
+        page[44] = 0;
+        page[46..48].copy_from_slice(&36u16.to_be_bytes());
+        page[48..50].copy_from_slice(&1u16.to_be_bytes());
+        page[57] = 0;
+        let mt_write = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(page_id, &page),
+        ));
+        assert_eq!(mt_write.cmd, Cmd::Ack);
+        let mt_capture = runtime.handle_packet(Packet::new(Cmd::GetTriggerCapture, vec![]));
+        let decoded_mt = decode_trigger_capture_payload(&mt_capture.payload).unwrap();
+        assert_eq!(decoded_mt.preset_key, "generic_36_1");
+        assert!(decoded_mt.sync_gap_tooth_count >= 1);
     }
 
     #[test]
