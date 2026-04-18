@@ -69,6 +69,9 @@ pub enum Cmd {
     FlashBlockAck = 0x52,
     FlashVerify = 0x53,
     FlashComplete = 0x54,
+    GetUpdateStatus = 0x55,
+    UpdateStatus = 0x56,
+    ConfirmBootHealthy = 0x57,
     LogStart = 0x60,
     LogStop = 0x61,
     LogStatus = 0x62,
@@ -149,6 +152,9 @@ impl TryFrom<u8> for Cmd {
             0x52 => Ok(Self::FlashBlockAck),
             0x53 => Ok(Self::FlashVerify),
             0x54 => Ok(Self::FlashComplete),
+            0x55 => Ok(Self::GetUpdateStatus),
+            0x56 => Ok(Self::UpdateStatus),
+            0x57 => Ok(Self::ConfirmBootHealthy),
             0x60 => Ok(Self::LogStart),
             0x61 => Ok(Self::LogStop),
             0x62 => Ok(Self::LogStatus),
@@ -546,6 +552,19 @@ pub struct DecodedPageStatus {
     pub needs_burn: bool,
     pub flash_generation: u32,
     pub flash_valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwareUpdateStatusPayload {
+    pub state: u8,
+    pub active_bank: u8,
+    pub last_good_bank: u8,
+    pub pending_bank: Option<u8>,
+    pub boot_attempts: u8,
+    pub rollback_counter: u16,
+    pub candidate_size: u32,
+    pub candidate_crc: u32,
+    pub health_window_remaining_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1646,6 +1665,45 @@ pub fn decode_page_statuses_payload(
     Ok(statuses)
 }
 
+pub fn encode_firmware_update_status_payload(status: &FirmwareUpdateStatusPayload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(19);
+    out.push(status.state);
+    out.push(status.active_bank);
+    out.push(status.last_good_bank);
+    out.push(status.pending_bank.unwrap_or(u8::MAX));
+    out.push(status.boot_attempts);
+    out.extend_from_slice(&status.rollback_counter.to_be_bytes());
+    out.extend_from_slice(&status.candidate_size.to_be_bytes());
+    out.extend_from_slice(&status.candidate_crc.to_be_bytes());
+    out.extend_from_slice(&status.health_window_remaining_ms.to_be_bytes());
+    out
+}
+
+pub fn decode_firmware_update_status_payload(
+    payload: &[u8],
+) -> Result<FirmwareUpdateStatusPayload, ProtocolError> {
+    if payload.len() != 19 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(FirmwareUpdateStatusPayload {
+        state: payload[0],
+        active_bank: payload[1],
+        last_good_bank: payload[2],
+        pending_bank: (payload[3] != u8::MAX).then_some(payload[3]),
+        boot_attempts: payload[4],
+        rollback_counter: u16::from_be_bytes([payload[5], payload[6]]),
+        candidate_size: u32::from_be_bytes([payload[7], payload[8], payload[9], payload[10]]),
+        candidate_crc: u32::from_be_bytes([payload[11], payload[12], payload[13], payload[14]]),
+        health_window_remaining_ms: u32::from_be_bytes([
+            payload[15],
+            payload[16],
+            payload[17],
+            payload[18],
+        ]),
+    })
+}
+
 pub fn encode_network_profile_payload(profile: &NetworkProfile) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(profile.product_track.code());
@@ -2046,27 +2104,29 @@ mod tests {
     use super::{
         decode_ack_payload, decode_can_signal_directory_payload,
         decode_can_template_directory_payload, decode_capabilities_payload,
-        decode_freeze_frames_payload, decode_identity_payload, decode_log_block_payload,
-        decode_log_status_payload, decode_logbook_summary_payload, decode_nack_payload,
-        decode_network_profile_payload, decode_output_test_directory_payload, decode_page_payload,
-        decode_page_request, decode_page_statuses_payload, decode_pin_assignments_payload,
-        decode_pin_directory_payload, decode_raw_table_payload,
-        decode_sensor_raw_directory_payload, decode_sensor_raw_payload, decode_sync_rtc_payload,
-        decode_table_metadata_payload, decode_trigger_capture_payload,
+        decode_firmware_update_status_payload, decode_freeze_frames_payload,
+        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
+        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
+        decode_output_test_directory_payload, decode_page_payload, decode_page_request,
+        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
+        decode_sync_rtc_payload, decode_table_metadata_payload, decode_trigger_capture_payload,
         decode_trigger_decoder_directory_payload, decode_trigger_tooth_log_payload,
         encode_ack_payload, encode_can_signal_directory_payload,
         encode_can_template_directory_payload, encode_capabilities_payload,
-        encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
-        encode_log_status_payload, encode_logbook_summary_payload, encode_nack_payload,
-        encode_network_profile_payload, encode_output_test_directory_payload,
-        encode_page_directory_payload, encode_page_payload, encode_page_request,
-        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
-        encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_sync_rtc_payload,
-        encode_table_directory_payload, encode_table_metadata_payload,
-        encode_trigger_capture_payload, encode_trigger_decoder_directory_payload,
-        encode_trigger_tooth_log_payload, CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd,
-        DecodedPinAssignment, LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry,
-        Packet, ProtocolError, RawTablePayload, SensorRawDirectoryEntry,
+        encode_firmware_update_status_payload, encode_freeze_frames_payload,
+        encode_identity_payload, encode_log_block_payload, encode_log_status_payload,
+        encode_logbook_summary_payload, encode_nack_payload, encode_network_profile_payload,
+        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
+        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
+        encode_pin_directory_payload, encode_sensor_raw_directory_payload,
+        encode_sensor_raw_payload, encode_sync_rtc_payload, encode_table_directory_payload,
+        encode_table_metadata_payload, encode_trigger_capture_payload,
+        encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload,
+        CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, DecodedPinAssignment,
+        FirmwareUpdateStatusPayload, LogStatusPayload, LogbookSummaryPayload,
+        OutputTestDirectoryEntry, Packet, ProtocolError, RawTablePayload,
+        SensorRawDirectoryEntry,
     };
 
     #[test]
@@ -2206,6 +2266,28 @@ mod tests {
             decode_nack_payload(&payload).unwrap(),
             (2, "bad page".to_string())
         );
+    }
+
+    #[test]
+    fn firmware_update_status_payload_roundtrip() {
+        let payload = encode_firmware_update_status_payload(&FirmwareUpdateStatusPayload {
+            state: 4,
+            active_bank: 1,
+            last_good_bank: 1,
+            pending_bank: Some(2),
+            boot_attempts: 1,
+            rollback_counter: 2,
+            candidate_size: 182_144,
+            candidate_crc: 0x12AB34CD,
+            health_window_remaining_ms: 28_500,
+        });
+        let decoded = decode_firmware_update_status_payload(&payload).unwrap();
+        assert_eq!(decoded.state, 4);
+        assert_eq!(decoded.active_bank, 1);
+        assert_eq!(decoded.pending_bank, Some(2));
+        assert_eq!(decoded.candidate_size, 182_144);
+        assert_eq!(decoded.candidate_crc, 0x12AB34CD);
+        assert_eq!(decoded.health_window_remaining_ms, 28_500);
     }
 
     #[test]
@@ -2695,6 +2777,9 @@ mod tests {
         assert_eq!(Cmd::FlashBlockAck as u8, 0x52);
         assert_eq!(Cmd::FlashVerify as u8, 0x53);
         assert_eq!(Cmd::FlashComplete as u8, 0x54);
+        assert_eq!(Cmd::GetUpdateStatus as u8, 0x55);
+        assert_eq!(Cmd::UpdateStatus as u8, 0x56);
+        assert_eq!(Cmd::ConfirmBootHealthy as u8, 0x57);
 
         assert_eq!(Cmd::LogStart as u8, 0x60);
         assert_eq!(Cmd::LogStop as u8, 0x61);

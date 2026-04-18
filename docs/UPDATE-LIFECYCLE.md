@@ -93,6 +93,11 @@ Already present:
 - ordered-block validation
 - optional verify CRC handling
 - `FlashComplete` gated by successful verify in the same session
+- runtime update state machine with status reporting:
+  - `GetUpdateStatus` -> `UpdateStatus`
+  - `ConfirmBootHealthy` for commit handshake
+  - explicit `Idle/Receiving/Verified/PendingCommit/HealthWindow/Committed/RolledBack` states
+- health-window timeout rollback in runtime path with rollback counter tracking
 - config page image/header CRC and dirty-state tracking
 - config image CRC validation that respects image header schema/format versions
 - persisted config import path with explicit schema/format migration executor baseline

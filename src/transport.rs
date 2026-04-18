@@ -13,6 +13,7 @@ use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, decode_sync_rtc_payload,
     encode_ack_payload, encode_can_signal_directory_payload, encode_can_template_directory_payload,
     encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
+    encode_firmware_update_status_payload,
     encode_log_block_payload, encode_log_status_payload, encode_logbook_summary_payload,
     encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
@@ -20,8 +21,8 @@ use crate::protocol::{
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
     encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload,
-    CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, LogStatusPayload,
-    LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, RawTablePayload,
+    CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, FirmwareUpdateStatusPayload,
+    LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, RawTablePayload,
     SensorRawDirectoryEntry,
 };
 use crate::rotational_idle::RotationalIdleRuntime;
@@ -32,6 +33,7 @@ use crate::wideband::WidebandRuntime;
 use crate::ConfigPage;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use serde::Serialize;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
@@ -74,6 +76,17 @@ struct RuntimeDtcEntry {
     confirmed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirmwareUpdateState {
+    Idle = 0,
+    Receiving = 1,
+    Verified = 2,
+    PendingCommit = 3,
+    HealthWindow = 4,
+    Committed = 5,
+    RolledBack = 6,
+}
+
 #[derive(Debug, Clone)]
 pub struct FirmwareRuntime {
     pub identity: FirmwareIdentity,
@@ -98,6 +111,16 @@ pub struct FirmwareRuntime {
     flash_verified: bool,
     flash_verified_crc: Option<u32>,
     flash_verified_len: usize,
+    update_state: FirmwareUpdateState,
+    update_active_bank: u8,
+    update_last_good_bank: u8,
+    update_pending_bank: Option<u8>,
+    update_candidate_crc: Option<u32>,
+    update_candidate_size: usize,
+    update_boot_attempts: u8,
+    update_health_window_remaining_ms: u32,
+    update_last_tick: Option<Instant>,
+    update_rollback_counter: u16,
     log_active: bool,
     log_storage_present: bool,
     log_rtc_synced: bool,
@@ -195,6 +218,9 @@ const FLASH_BLOCK_HEADER_LEN: usize = 4;
 const FLASH_BLOCK_MAX_BYTES: usize = 1024;
 const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
 static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+const UPDATE_BANK_A: u8 = 1;
+const UPDATE_BANK_B: u8 = 2;
+const UPDATE_HEALTH_WINDOW_MS: u32 = 30_000;
 const LOG_BLOCK_SIZE_BYTES: u16 = 256;
 const PAGE0_MAGIC: [u8; 4] = *b"STC2";
 const PAGE0_VERSION: u8 = 1;
@@ -883,6 +909,16 @@ impl FirmwareRuntime {
             flash_verified: false,
             flash_verified_crc: None,
             flash_verified_len: 0,
+            update_state: FirmwareUpdateState::Idle,
+            update_active_bank: UPDATE_BANK_A,
+            update_last_good_bank: UPDATE_BANK_A,
+            update_pending_bank: None,
+            update_candidate_crc: None,
+            update_candidate_size: 0,
+            update_boot_attempts: 0,
+            update_health_window_remaining_ms: 0,
+            update_last_tick: None,
+            update_rollback_counter: 0,
             log_active: false,
             log_storage_present: true,
             log_rtc_synced: false,
@@ -955,6 +991,94 @@ impl FirmwareRuntime {
     fn sync_trigger_runtime_from_page0(&mut self) {
         if let Some(payload) = self.store.read_page(ConfigPage::BaseEngineFuelComm as u8) {
             self.trigger_runtime.apply_page0_payload(payload);
+        }
+    }
+
+    fn reset_flash_transfer_state(&mut self) {
+        self.flash_session_active = false;
+        self.flash_next_block = 0;
+        self.flash_buffer.clear();
+        self.flash_verified = false;
+        self.flash_verified_crc = None;
+        self.flash_verified_len = 0;
+    }
+
+    fn next_update_bank(&self) -> u8 {
+        if self.update_active_bank == UPDATE_BANK_A {
+            UPDATE_BANK_B
+        } else {
+            UPDATE_BANK_A
+        }
+    }
+
+    fn begin_update_health_window(&mut self, crc: u32, image_size: usize) {
+        self.update_state = FirmwareUpdateState::PendingCommit;
+        self.update_pending_bank = Some(self.next_update_bank());
+        self.update_candidate_crc = Some(crc);
+        self.update_candidate_size = image_size;
+        self.update_boot_attempts = 1;
+        self.update_health_window_remaining_ms = UPDATE_HEALTH_WINDOW_MS;
+        self.update_state = FirmwareUpdateState::HealthWindow;
+        self.update_last_tick = Some(Instant::now());
+    }
+
+    fn rollback_pending_update(&mut self) {
+        self.update_state = FirmwareUpdateState::RolledBack;
+        self.update_active_bank = self.update_last_good_bank;
+        self.update_pending_bank = None;
+        self.update_health_window_remaining_ms = 0;
+        self.update_last_tick = None;
+        self.update_rollback_counter = self.update_rollback_counter.saturating_add(1);
+    }
+
+    fn confirm_pending_update(&mut self) -> bool {
+        if self.update_state != FirmwareUpdateState::HealthWindow {
+            return false;
+        }
+        let Some(target_bank) = self.update_pending_bank else {
+            return false;
+        };
+        self.update_active_bank = target_bank;
+        self.update_last_good_bank = target_bank;
+        self.update_pending_bank = None;
+        self.update_state = FirmwareUpdateState::Committed;
+        self.update_health_window_remaining_ms = 0;
+        self.update_last_tick = None;
+        true
+    }
+
+    fn tick_update_health_window(&mut self) {
+        if self.update_state != FirmwareUpdateState::HealthWindow {
+            return;
+        }
+        let now = Instant::now();
+        let last_tick = self.update_last_tick.unwrap_or(now);
+        let elapsed_ms = now
+            .saturating_duration_since(last_tick)
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        self.update_last_tick = Some(now);
+        if elapsed_ms == 0 {
+            return;
+        }
+        if elapsed_ms >= self.update_health_window_remaining_ms {
+            self.rollback_pending_update();
+        } else {
+            self.update_health_window_remaining_ms -= elapsed_ms;
+        }
+    }
+
+    fn firmware_update_status_payload(&self) -> FirmwareUpdateStatusPayload {
+        FirmwareUpdateStatusPayload {
+            state: self.update_state as u8,
+            active_bank: self.update_active_bank,
+            last_good_bank: self.update_last_good_bank,
+            pending_bank: self.update_pending_bank,
+            boot_attempts: self.update_boot_attempts,
+            rollback_counter: self.update_rollback_counter,
+            candidate_size: self.update_candidate_size as u32,
+            candidate_crc: self.update_candidate_crc.unwrap_or(0),
+            health_window_remaining_ms: self.update_health_window_remaining_ms,
         }
     }
 
@@ -1317,6 +1441,7 @@ impl FirmwareRuntime {
     }
 
     pub fn handle_packet(&mut self, packet: Packet) -> Packet {
+        self.tick_update_health_window();
         match packet.cmd {
             Cmd::Ping => Packet::new(Cmd::Pong, vec![]),
             Cmd::GetVersion => Packet::new(
@@ -1637,12 +1762,15 @@ impl FirmwareRuntime {
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad burn-page payload"),
             },
             Cmd::EnterBootloader => {
+                self.reset_flash_transfer_state();
                 self.flash_session_active = true;
-                self.flash_next_block = 0;
-                self.flash_buffer.clear();
-                self.flash_verified = false;
-                self.flash_verified_crc = None;
-                self.flash_verified_len = 0;
+                self.update_state = FirmwareUpdateState::Receiving;
+                self.update_pending_bank = None;
+                self.update_candidate_crc = None;
+                self.update_candidate_size = 0;
+                self.update_boot_attempts = 0;
+                self.update_health_window_remaining_ms = 0;
+                self.update_last_tick = None;
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashBlock => {
@@ -1679,6 +1807,7 @@ impl FirmwareRuntime {
                 self.flash_verified = false;
                 self.flash_verified_crc = None;
                 self.flash_verified_len = 0;
+                self.update_state = FirmwareUpdateState::Receiving;
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashVerify => {
@@ -1709,6 +1838,7 @@ impl FirmwareRuntime {
                 self.flash_verified = true;
                 self.flash_verified_crc = Some(actual_crc);
                 self.flash_verified_len = self.flash_buffer.len();
+                self.update_state = FirmwareUpdateState::Verified;
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashComplete => {
@@ -1737,13 +1867,23 @@ impl FirmwareRuntime {
                         "flash image changed after verify",
                     );
                 }
-                self.flash_session_active = false;
-                self.flash_next_block = 0;
-                self.flash_buffer.clear();
-                self.flash_verified = false;
-                self.flash_verified_crc = None;
-                self.flash_verified_len = 0;
+                self.begin_update_health_window(final_crc, self.flash_buffer.len());
+                self.reset_flash_transfer_state();
                 Packet::new(Cmd::Ack, vec![])
+            }
+            Cmd::GetUpdateStatus => Packet::new(
+                Cmd::UpdateStatus,
+                encode_firmware_update_status_payload(&self.firmware_update_status_payload()),
+            ),
+            Cmd::ConfirmBootHealthy => {
+                if self.confirm_pending_update() {
+                    Packet::new(Cmd::Ack, vec![])
+                } else {
+                    nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "no pending health-window update to confirm",
+                    )
+                }
             }
             _ => nack(
                 RuntimeNackCode::UnsupportedCommand,
@@ -1771,17 +1911,19 @@ mod tests {
     use crate::protocol::{
         decode_ack_payload, decode_can_signal_directory_payload,
         decode_can_template_directory_payload, decode_capabilities_payload,
-        decode_freeze_frames_payload, decode_identity_payload, decode_log_block_payload,
-        decode_log_status_payload, decode_logbook_summary_payload, decode_nack_payload,
-        decode_network_profile_payload, decode_output_test_directory_payload, decode_page_payload,
-        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
+        decode_firmware_update_status_payload, decode_freeze_frames_payload,
+        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
+        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
+        decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
+        decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
+        decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
         decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request,
         encode_sync_rtc_payload, Cmd, Packet,
     };
     use crate::ConfigPage;
     use serde_json::Value;
+    use std::time::{Duration, Instant};
 
     use super::{
         parse_page0_actuator_config, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
@@ -2327,6 +2469,97 @@ mod tests {
         assert_eq!(verify_again.cmd, Cmd::Ack);
         let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
         assert_eq!(complete.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_flash_reports_health_window_and_commits_when_confirmed() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![])).cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![])).cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![])).cmd,
+            Cmd::Ack
+        );
+
+        let status = runtime.handle_packet(Packet::new(Cmd::GetUpdateStatus, vec![]));
+        let decoded = decode_firmware_update_status_payload(&status.payload).unwrap();
+        assert_eq!(status.cmd, Cmd::UpdateStatus);
+        assert_eq!(decoded.state, 4);
+        assert_eq!(decoded.active_bank, 1);
+        assert_eq!(decoded.last_good_bank, 1);
+        assert_eq!(decoded.pending_bank, Some(2));
+        assert!(decoded.candidate_crc > 0);
+        assert!(decoded.health_window_remaining_ms <= super::UPDATE_HEALTH_WINDOW_MS);
+
+        let confirm = runtime.handle_packet(Packet::new(Cmd::ConfirmBootHealthy, vec![]));
+        assert_eq!(confirm.cmd, Cmd::Ack);
+
+        let committed = runtime.handle_packet(Packet::new(Cmd::GetUpdateStatus, vec![]));
+        let committed_decoded = decode_firmware_update_status_payload(&committed.payload).unwrap();
+        assert_eq!(committed.cmd, Cmd::UpdateStatus);
+        assert_eq!(committed_decoded.state, 5);
+        assert_eq!(committed_decoded.active_bank, 2);
+        assert_eq!(committed_decoded.last_good_bank, 2);
+        assert_eq!(committed_decoded.pending_bank, None);
+        assert_eq!(committed_decoded.health_window_remaining_ms, 0);
+    }
+
+    #[test]
+    fn runtime_flash_rolls_back_when_health_window_expires() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![])).cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 0, 0xFA, 0xCE]))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![])).cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![])).cmd,
+            Cmd::Ack
+        );
+
+        runtime.update_health_window_remaining_ms = 1;
+        runtime.update_last_tick = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(5))
+                .unwrap_or_else(Instant::now),
+        );
+
+        let rolled = runtime.handle_packet(Packet::new(Cmd::GetUpdateStatus, vec![]));
+        let decoded = decode_firmware_update_status_payload(&rolled.payload).unwrap();
+        assert_eq!(rolled.cmd, Cmd::UpdateStatus);
+        assert_eq!(decoded.state, 6);
+        assert_eq!(decoded.active_bank, 1);
+        assert_eq!(decoded.last_good_bank, 1);
+        assert_eq!(decoded.pending_bank, None);
+        assert_eq!(decoded.rollback_counter, 1);
+
+        let confirm_after_timeout =
+            runtime.handle_packet(Packet::new(Cmd::ConfirmBootHealthy, vec![]));
+        assert_eq!(confirm_after_timeout.cmd, Cmd::Nack);
     }
 
     #[test]
