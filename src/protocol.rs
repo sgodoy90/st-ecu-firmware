@@ -2139,6 +2139,7 @@ mod tests {
     use crate::network::{display_network_profile, MessageClass, ProductTrack, TransportLinkKind};
     use crate::pinmux::PinFunctionClass;
     use crate::trigger::{sample_trigger_capture, sample_trigger_tooth_log, TriggerDecoderPreset};
+    use std::collections::BTreeMap;
 
     use super::{
         decode_ack_payload, decode_can_signal_directory_payload,
@@ -2902,6 +2903,44 @@ mod tests {
         assert_eq!(Cmd::Ack as u8, 0xA0);
         assert_eq!(Cmd::Nack as u8, 0xA1);
         assert_eq!(Cmd::Error as u8, 0xFF);
+    }
+
+    #[test]
+    fn runtime_cmd_enum_codepoints_are_unique() {
+        let source = include_str!("protocol.rs");
+        let enum_block = source
+            .split("pub enum Cmd {")
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("Cmd enum block should exist");
+
+        let mut seen = BTreeMap::<u8, String>::new();
+        for raw_line in enum_block.lines() {
+            let line = raw_line.split("//").next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name_part, value_part)) = line.split_once('=') else {
+                continue;
+            };
+            let name = name_part.trim().trim_end_matches(',');
+            let value = value_part.trim().trim_end_matches(',');
+            let Some(hex) = value.strip_prefix("0x") else {
+                continue;
+            };
+            let code = u8::from_str_radix(hex, 16).expect("hex codepoint");
+            if let Some(previous) = seen.insert(code, name.to_string()) {
+                panic!(
+                    "duplicate Cmd codepoint 0x{code:02X}: {previous} and {name}"
+                );
+            }
+        }
+
+        assert!(
+            seen.len() >= 55,
+            "expected complete runtime Cmd coverage, got only {} entries",
+            seen.len()
+        );
     }
 
     #[test]
