@@ -73,6 +73,7 @@ pub struct TuneEncryptionState {
 }
 
 /// Tune encryption controller
+#[derive(Debug, Clone)]
 pub struct TuneEncryption {
     pub key: TuneKey,
     pub state: TuneEncryptionState,

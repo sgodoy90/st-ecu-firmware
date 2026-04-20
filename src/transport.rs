@@ -1,5 +1,6 @@
 use crate::config::ConfigStore;
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
+use crate::crypto::TuneEncryption;
 use crate::diagnostics::SAMPLE_FREEZE_FRAMES;
 use crate::io::{
     apply_assignment_overrides, default_pin_assignments, deserialize_assignments_from_page,
@@ -10,7 +11,8 @@ use crate::live_data::{error, protect, status, LiveDataFrame};
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, ProtectionState};
 use crate::protocol::{
-    decode_page_payload, decode_page_request, decode_raw_table_payload, decode_sync_rtc_payload,
+    decode_page_payload, decode_page_request, decode_pin_assignments_payload,
+    decode_raw_table_payload, decode_sync_rtc_payload,
     encode_ack_payload, encode_can_signal_directory_payload, encode_can_template_directory_payload,
     encode_capabilities_payload, encode_firmware_update_status_payload,
     encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
@@ -30,6 +32,8 @@ use crate::tcu::ExternalTcuRuntime;
 use crate::trigger::SUPPORTED_TRIGGER_DECODERS;
 use crate::trigger_runtime::TriggerRuntime;
 use crate::wideband::WidebandRuntime;
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use crate::ConfigPage;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use serde::Serialize;
@@ -96,6 +100,9 @@ pub struct FirmwareRuntime {
     pub pin_assignments: Vec<ResolvedPinAssignment>,
     pub network_profile: &'static NetworkProfile,
     pub tables: Vec<RawTablePayload>,
+    page_crypto_enabled: bool,
+    tune_encryption: Option<TuneEncryption>,
+    page_crypto_next_persist_counter: u64,
     dtc_entries: Vec<RuntimeDtcEntry>,
     live_sample_counter: u32,
     sync_loss_counter: u8,
@@ -217,7 +224,166 @@ const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
 const FLASH_BLOCK_HEADER_LEN: usize = 4;
 const FLASH_BLOCK_MAX_BYTES: usize = 1024;
 const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
+const FLASH_VERIFY_CRC_LEN: usize = 4;
+const FLASH_VERIFY_AUTH_TAG_LEN: usize = 16;
+const FLASH_VERIFY_CRC_AND_TAG_LEN: usize = FLASH_VERIFY_CRC_LEN + FLASH_VERIFY_AUTH_TAG_LEN;
+const FLASH_AUTH_DOMAIN: &[u8] = b"ST-FLASH-AUTH-V1";
+const PAGE_CRYPTO_KEY_DOMAIN: &[u8] = b"ST-PAGE-CRYPTO-V1";
+const PAGE_CRYPTO_ECU_DOMAIN: &[u8] = b"ST-PAGE-ECU-ID-V1";
+const PAGE_CRYPTO_NONCE_PERSIST_STRIDE: u64 = 1024;
+const PAGE_CRYPTO_NONCE_MAGIC: [u8; 4] = *b"STNC";
+const PAGE_CRYPTO_NONCE_VERSION: u8 = 1;
+const PAGE_CRYPTO_NONCE_RECORD_LEN: usize = 16;
+const PAGE_CRYPTO_NONCE_PAGE_ID: u8 = ConfigPage::UiDefaults as u8;
 static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+
+fn append_flash_auth_field(material: &mut Vec<u8>, value: &str) {
+    material.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    material.extend_from_slice(value.as_bytes());
+}
+
+fn append_page_crypto_field(material: &mut Vec<u8>, value: &str) {
+    material.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    material.extend_from_slice(value.as_bytes());
+}
+
+fn derive_page_crypto_bytes(identity: &FirmwareIdentity, domain: &[u8]) -> [u8; 32] {
+    let mut material = Vec::with_capacity(256);
+    material.extend_from_slice(domain);
+    append_page_crypto_field(&mut material, identity.firmware_id);
+    append_page_crypto_field(&mut material, identity.firmware_semver);
+    append_page_crypto_field(&mut material, identity.board_id);
+    append_page_crypto_field(&mut material, identity.serial);
+    append_page_crypto_field(&mut material, identity.signature);
+
+    let mut out = [0u8; 32];
+    for (index, chunk) in out.chunks_exact_mut(4).enumerate() {
+        material.push(index as u8);
+        let crc = FLASH_CRC32.checksum(&material).to_be_bytes();
+        material.pop();
+        chunk.copy_from_slice(&crc);
+    }
+    out
+}
+
+fn page_crypto_enabled_for_identity(identity: &FirmwareIdentity) -> bool {
+    identity
+        .board_id
+        .to_ascii_lowercase()
+        .contains("h743")
+}
+
+fn initialize_page_crypto(identity: &FirmwareIdentity) -> Option<TuneEncryption> {
+    if !page_crypto_enabled_for_identity(identity) {
+        return None;
+    }
+
+    let ecu_id = derive_page_crypto_bytes(identity, PAGE_CRYPTO_ECU_DOMAIN);
+    let key = derive_page_crypto_bytes(identity, PAGE_CRYPTO_KEY_DOMAIN);
+    let mut encryption = TuneEncryption::new_h743(ecu_id);
+    if encryption.generate_key(key).is_err() {
+        return None;
+    }
+    let _ = encryption.lock_tune();
+    Some(encryption)
+}
+
+fn read_persisted_page_crypto_counter(store: &ConfigStore) -> Option<u64> {
+    let page = store
+        .read_flash_page(PAGE_CRYPTO_NONCE_PAGE_ID)
+        .or_else(|| store.read_page(PAGE_CRYPTO_NONCE_PAGE_ID))?;
+    if page.len() < PAGE_CRYPTO_NONCE_RECORD_LEN {
+        return None;
+    }
+    let start = page.len().saturating_sub(PAGE_CRYPTO_NONCE_RECORD_LEN);
+    let record = &page[start..];
+    if record[0..4] != PAGE_CRYPTO_NONCE_MAGIC {
+        return None;
+    }
+    if record[4] != PAGE_CRYPTO_NONCE_VERSION {
+        return None;
+    }
+    let mut counter = [0u8; 8];
+    counter.copy_from_slice(&record[8..16]);
+    Some(u64::from_be_bytes(counter))
+}
+
+fn persist_page_crypto_counter(store: &mut ConfigStore, counter: u64) -> Result<(), RuntimeNackCode> {
+    let page_len = store
+        .page_length(PAGE_CRYPTO_NONCE_PAGE_ID)
+        .ok_or(RuntimeNackCode::StorageFailure)?;
+    if page_len < PAGE_CRYPTO_NONCE_RECORD_LEN {
+        return Err(RuntimeNackCode::StorageFailure);
+    }
+
+    let mut page = store
+        .read_page(PAGE_CRYPTO_NONCE_PAGE_ID)
+        .map(|payload| payload.to_vec())
+        .unwrap_or_else(|| vec![0u8; page_len]);
+    let start = page.len().saturating_sub(PAGE_CRYPTO_NONCE_RECORD_LEN);
+    page[start..start + 4].copy_from_slice(&PAGE_CRYPTO_NONCE_MAGIC);
+    page[start + 4] = PAGE_CRYPTO_NONCE_VERSION;
+    page[start + 5] = 0;
+    page[start + 6] = 0;
+    page[start + 7] = 0;
+    page[start + 8..start + 16].copy_from_slice(&counter.to_be_bytes());
+
+    store
+        .write_page(PAGE_CRYPTO_NONCE_PAGE_ID, &page)
+        .map_err(|_| RuntimeNackCode::StorageFailure)?;
+    store
+        .burn_page(PAGE_CRYPTO_NONCE_PAGE_ID)
+        .map_err(|_| RuntimeNackCode::StorageFailure)?;
+    Ok(())
+}
+
+fn derive_flash_auth_key(identity: &FirmwareIdentity) -> [u8; 32] {
+    let mut material = Vec::with_capacity(256);
+    material.extend_from_slice(FLASH_AUTH_DOMAIN);
+    append_flash_auth_field(&mut material, identity.firmware_id);
+    append_flash_auth_field(&mut material, identity.firmware_semver);
+    append_flash_auth_field(&mut material, identity.board_id);
+    append_flash_auth_field(&mut material, identity.serial);
+    append_flash_auth_field(&mut material, identity.signature);
+
+    let mut key = [0u8; 32];
+    for (index, chunk) in key.chunks_exact_mut(4).enumerate() {
+        material.push(index as u8);
+        let crc = FLASH_CRC32.checksum(&material).to_be_bytes();
+        material.pop();
+        chunk.copy_from_slice(&crc);
+    }
+    key
+}
+
+fn flash_auth_nonce(image_len: usize, image_crc: u32, key: &[u8; 32]) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[0..4].copy_from_slice(&(image_len as u32).to_be_bytes());
+    nonce[4..8].copy_from_slice(&image_crc.to_be_bytes());
+    nonce[8..12].copy_from_slice(&FLASH_CRC32.checksum(key).to_be_bytes());
+    nonce
+}
+
+fn compute_flash_auth_tag(identity: &FirmwareIdentity, image: &[u8], image_crc: u32) -> Option<[u8; 16]> {
+    let key = derive_flash_auth_key(identity);
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    let nonce_bytes = flash_auth_nonce(image.len(), image_crc, &key);
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: b"",
+                aad: image,
+            },
+        )
+        .ok()?;
+    if encrypted.len() != FLASH_VERIFY_AUTH_TAG_LEN {
+        return None;
+    }
+    let mut tag = [0u8; FLASH_VERIFY_AUTH_TAG_LEN];
+    tag.copy_from_slice(&encrypted);
+    Some(tag)
+}
 const UPDATE_BANK_A: u8 = 1;
 const UPDATE_BANK_B: u8 = 2;
 const UPDATE_HEALTH_WINDOW_MS: u32 = 30_000;
@@ -871,8 +1037,29 @@ fn sensor_raw_sample(channel: u8) -> (u16, f32) {
 
 impl FirmwareRuntime {
     pub fn new(identity: FirmwareIdentity, simulator: bool) -> Self {
-        let mut store = ConfigStore::new_zeroed();
+        Self::new_with_store(identity, simulator, ConfigStore::new_zeroed())
+    }
+
+    pub fn new_with_store(identity: FirmwareIdentity, simulator: bool, mut store: ConfigStore) -> Self {
         let mut trigger_runtime = TriggerRuntime::default();
+        let page_crypto_enabled = !simulator && page_crypto_enabled_for_identity(&identity);
+        let mut tune_encryption = if page_crypto_enabled {
+            initialize_page_crypto(&identity)
+        } else {
+            None
+        };
+        let mut page_crypto_next_persist_counter = u64::MAX;
+
+        if let Some(encryption) = tune_encryption.as_mut() {
+            if let Some(persisted) = read_persisted_page_crypto_counter(&store) {
+                encryption.state.nonce_counter =
+                    persisted.saturating_add(PAGE_CRYPTO_NONCE_PERSIST_STRIDE);
+            }
+            let boot_counter = encryption.state.nonce_counter;
+            let _ = persist_page_crypto_counter(&mut store, boot_counter);
+            page_crypto_next_persist_counter =
+                boot_counter.saturating_add(PAGE_CRYPTO_NONCE_PERSIST_STRIDE);
+        }
         let pin_assignments = validate_assignment_set(&default_pin_assignments())
             .expect("default pin assignments must be valid for board definition");
         let page_len = store
@@ -897,6 +1084,9 @@ impl FirmwareRuntime {
             pin_assignments,
             network_profile: headless_network_profile(),
             tables: default_tables(),
+            page_crypto_enabled,
+            tune_encryption,
+            page_crypto_next_persist_counter,
             dtc_entries: default_dtc_entries(),
             live_sample_counter: 0,
             sync_loss_counter: 0,
@@ -995,6 +1185,46 @@ impl FirmwareRuntime {
         if let Some(payload) = self.store.read_page(ConfigPage::BaseEngineFuelComm as u8) {
             self.trigger_runtime.apply_page0_payload(payload);
         }
+    }
+
+    fn maybe_persist_page_crypto_counter(&mut self, current_counter: u64) {
+        if !self.page_crypto_enabled {
+            return;
+        }
+        if current_counter < self.page_crypto_next_persist_counter {
+            return;
+        }
+        if persist_page_crypto_counter(&mut self.store, current_counter).is_ok() {
+            self.page_crypto_next_persist_counter =
+                current_counter.saturating_add(PAGE_CRYPTO_NONCE_PERSIST_STRIDE);
+        }
+    }
+
+    fn encrypt_page_for_transport(&mut self, page: &[u8]) -> Result<Vec<u8>, RuntimeNackCode> {
+        if !self.page_crypto_enabled {
+            return Ok(page.to_vec());
+        }
+        let Some(encryption) = self.tune_encryption.as_mut() else {
+            return Err(RuntimeNackCode::StorageFailure);
+        };
+        let encrypted = encryption
+            .encrypt_page(page)
+            .map_err(|_| RuntimeNackCode::StorageFailure)?;
+        let current_counter = encryption.state.nonce_counter;
+        self.maybe_persist_page_crypto_counter(current_counter);
+        Ok(encrypted)
+    }
+
+    fn decrypt_page_from_transport(&self, payload: &[u8]) -> Result<Vec<u8>, RuntimeNackCode> {
+        if !self.page_crypto_enabled {
+            return Ok(payload.to_vec());
+        }
+        let Some(encryption) = self.tune_encryption.as_ref() else {
+            return Err(RuntimeNackCode::StorageFailure);
+        };
+        encryption
+            .decrypt_page(payload)
+            .map_err(|_| RuntimeNackCode::MalformedPayload)
     }
 
     fn reset_flash_transfer_state(&mut self) {
@@ -1644,6 +1874,36 @@ impl FirmwareRuntime {
                 Cmd::PinAssignments,
                 encode_pin_assignments_payload(&self.pin_assignments),
             ),
+            Cmd::PinAssign => match decode_pin_assignments_payload(&packet.payload) {
+                Ok(assignments) if assignments.is_empty() => {
+                    nack(RuntimeNackCode::MalformedPayload, "empty pin-assignment payload")
+                }
+                Ok(assignments) => {
+                    let mut requests = Vec::with_capacity(assignments.len());
+                    for assignment in &assignments {
+                        requests.push(PinAssignmentRequest {
+                            function: assignment.function,
+                            pin_id: assignment.pin_id.as_str(),
+                        });
+                    }
+                    match self.apply_pin_assignment_overrides(&requests) {
+                        Ok(()) => Packet::new(
+                            Cmd::Ack,
+                            encode_ack_payload(
+                                ConfigPage::PinAssignment as u8,
+                                self.store
+                                    .needs_burn(ConfigPage::PinAssignment as u8)
+                                    .unwrap_or(false),
+                            ),
+                        ),
+                        Err(error) => nack(
+                            RuntimeNackCode::MalformedPayload,
+                            &format!("pin-assignment rejected: {error:?}"),
+                        ),
+                    }
+                }
+                Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad pin-assignment payload"),
+            },
             Cmd::GetDtc => {
                 let payload =
                     serde_json::to_vec(&self.dtc_entries).unwrap_or_else(|_| b"[]".to_vec());
@@ -1705,15 +1965,28 @@ impl FirmwareRuntime {
             ),
             Cmd::ReadPage => match decode_page_request(&packet.payload) {
                 Ok(page_id) => match self.store.read_page(page_id) {
-                    Some(page) => Packet::new(Cmd::PageData, encode_page_payload(page_id, page)),
+                    Some(page) => {
+                        let plain = page.to_vec();
+                        match self.encrypt_page_for_transport(&plain) {
+                            Ok(payload) => Packet::new(Cmd::PageData, encode_page_payload(page_id, &payload)),
+                            Err(_) => nack(RuntimeNackCode::StorageFailure, "page encryption failed"),
+                        }
+                    }
                     None => nack(RuntimeNackCode::InvalidPage, "invalid page id"),
                 },
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad read-page payload"),
             },
             Cmd::WritePage => match decode_page_payload(&packet.payload) {
                 Ok(page) => {
+                    let decrypted_payload = match self.decrypt_page_from_transport(&page.payload) {
+                        Ok(payload) => payload,
+                        Err(RuntimeNackCode::MalformedPayload) => {
+                            return nack(RuntimeNackCode::MalformedPayload, "bad encrypted page payload");
+                        }
+                        Err(_) => return nack(RuntimeNackCode::StorageFailure, "page decryption unavailable"),
+                    };
                     let previous_assignments = self.pin_assignments.clone();
-                    let write_result = self.store.write_page(page.page_id, &page.payload);
+                    let write_result = self.store.write_page(page.page_id, &decrypted_payload);
                     if write_result.is_err() {
                         return nack(RuntimeNackCode::StorageFailure, "page write failed");
                     }
@@ -1727,9 +2000,9 @@ impl FirmwareRuntime {
                                 &previous_assignments,
                                 self.store
                                     .page_length(ConfigPage::PinAssignment as u8)
-                                    .unwrap_or(page.payload.len()),
+                                    .unwrap_or(decrypted_payload.len()),
                             )
-                            .unwrap_or_else(|_| vec![0u8; page.payload.len()]),
+                            .unwrap_or_else(|_| vec![0u8; decrypted_payload.len()]),
                         );
                         self.pin_assignments = previous_assignments;
                         return nack(
@@ -1817,7 +2090,11 @@ impl FirmwareRuntime {
                 if !self.flash_session_active || self.flash_buffer.is_empty() {
                     return nack(RuntimeNackCode::MalformedPayload, "nothing to verify");
                 }
-                if !packet.payload.is_empty() && packet.payload.len() != 4 {
+                if !packet.payload.is_empty()
+                    && packet.payload.len() != FLASH_VERIFY_CRC_LEN
+                    && packet.payload.len() != FLASH_VERIFY_AUTH_TAG_LEN
+                    && packet.payload.len() != FLASH_VERIFY_CRC_AND_TAG_LEN
+                {
                     return nack(
                         RuntimeNackCode::MalformedPayload,
                         "bad flash-verify payload",
@@ -1827,17 +2104,36 @@ impl FirmwareRuntime {
                     return nack(RuntimeNackCode::MalformedPayload, "flash image is blank");
                 }
                 let actual_crc = FLASH_CRC32.checksum(&self.flash_buffer);
-                if packet.payload.len() == 4 {
-                    let expected_crc = u32::from_be_bytes([
-                        packet.payload[0],
-                        packet.payload[1],
-                        packet.payload[2],
-                        packet.payload[3],
-                    ]);
+
+                if packet.payload.len() == FLASH_VERIFY_CRC_LEN
+                    || packet.payload.len() == FLASH_VERIFY_CRC_AND_TAG_LEN
+                {
+                    let expected_crc = u32::from_be_bytes(packet.payload[0..4].try_into().unwrap());
                     if expected_crc != actual_crc {
                         return nack(RuntimeNackCode::MalformedPayload, "flash crc mismatch");
                     }
                 }
+
+                if packet.payload.len() == FLASH_VERIFY_AUTH_TAG_LEN
+                    || packet.payload.len() == FLASH_VERIFY_CRC_AND_TAG_LEN
+                {
+                    let expected_tag_slice = if packet.payload.len() == FLASH_VERIFY_AUTH_TAG_LEN {
+                        &packet.payload[..]
+                    } else {
+                        &packet.payload[FLASH_VERIFY_CRC_LEN..]
+                    };
+                    let mut expected_tag = [0u8; FLASH_VERIFY_AUTH_TAG_LEN];
+                    expected_tag.copy_from_slice(expected_tag_slice);
+                    let Some(actual_tag) =
+                        compute_flash_auth_tag(&self.identity, &self.flash_buffer, actual_crc)
+                    else {
+                        return nack(RuntimeNackCode::StorageFailure, "flash auth unavailable");
+                    };
+                    if actual_tag != expected_tag {
+                        return nack(RuntimeNackCode::MalformedPayload, "flash auth mismatch");
+                    }
+                }
+
                 self.flash_verified = true;
                 self.flash_verified_crc = Some(actual_crc);
                 self.flash_verified_len = self.flash_buffer.len();
@@ -1902,7 +2198,7 @@ fn nack(code: RuntimeNackCode, reason: &str) -> Packet {
 
 #[cfg(test)]
 mod tests {
-    use crate::contract::Capability;
+    use crate::contract::{Capability, FirmwareIdentity};
     use crate::io::{
         apply_assignment_overrides, deserialize_assignments_from_page,
         serialize_assignments_to_page, EcuFunction, PinAssignmentRequest,
@@ -1922,6 +2218,7 @@ mod tests {
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
         decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request,
+        encode_pin_assignments_payload,
         encode_sync_rtc_payload, Cmd, Packet,
     };
     use crate::ConfigPage;
@@ -1929,9 +2226,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        parse_page0_actuator_config, ActuatorRuntimeConfig, FirmwareRuntime,
-        ACTUATOR_DWELL_BOUNDS_MS,
-        ACTUATOR_PULSEWIDTH_BOUNDS_MS,
+        compute_flash_auth_tag, initialize_page_crypto, parse_page0_actuator_config,
+        ActuatorRuntimeConfig, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
+        ACTUATOR_PULSEWIDTH_BOUNDS_MS, FLASH_CRC32, PAGE_CRYPTO_NONCE_PERSIST_STRIDE,
+        read_persisted_page_crypto_counter,
     };
 
     fn decode_live_frame(payload: &[u8]) -> LiveDataFrame {
@@ -1939,6 +2237,14 @@ mod tests {
         let mut bytes = [0u8; LIVE_DATA_SIZE];
         bytes.copy_from_slice(payload);
         LiveDataFrame::decode(&bytes)
+    }
+
+    fn h743_identity() -> FirmwareIdentity {
+        FirmwareIdentity {
+            board_id: "st-ecu-h743-v1",
+            signature: "ST-ECU-H743",
+            ..FirmwareIdentity::ecu_v1()
+        }
     }
 
     #[test]
@@ -2235,6 +2541,80 @@ mod tests {
     }
 
     #[test]
+    fn runtime_h743_page_crypto_rejects_plaintext_write_payload() {
+        let identity = h743_identity();
+        let mut runtime = FirmwareRuntime::new(identity, false);
+        let page_id = 0u8;
+        let data = vec![0xA5; runtime.store.page_length(page_id).unwrap()];
+
+        let write_plain =
+            runtime.handle_packet(Packet::new(Cmd::WritePage, encode_page_payload(page_id, &data)));
+        let (code, reason) = decode_nack_payload(&write_plain.payload).unwrap();
+        assert_eq!(write_plain.cmd, Cmd::Nack);
+        assert_eq!(code, 2);
+        assert!(reason.contains("encrypted"));
+    }
+
+    #[test]
+    fn runtime_h743_page_crypto_roundtrip_uses_encrypted_wire_payloads() {
+        let identity = h743_identity();
+        let mut runtime = FirmwareRuntime::new(identity.clone(), false);
+        let page_id = 0u8;
+        let plain = vec![0x5A; runtime.store.page_length(page_id).unwrap()];
+        let mut host_crypto = initialize_page_crypto(&identity).expect("h743 must enable crypto");
+
+        let encrypted_write = host_crypto.encrypt_page(&plain).expect("encrypt");
+        let write = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(page_id, &encrypted_write),
+        ));
+        assert_eq!(write.cmd, Cmd::Ack);
+
+        let read = runtime.handle_packet(Packet::new(Cmd::ReadPage, encode_page_request(page_id)));
+        let decoded = decode_page_payload(&read.payload).unwrap();
+        assert_eq!(read.cmd, Cmd::PageData);
+        assert_ne!(decoded.payload, plain);
+
+        let decrypted = host_crypto.decrypt_page(&decoded.payload).expect("decrypt");
+        assert_eq!(decrypted, plain);
+    }
+
+    #[test]
+    fn runtime_h743_page_crypto_persists_nonce_counter_across_reboot() {
+        let identity = h743_identity();
+        let mut runtime = FirmwareRuntime::new(identity.clone(), false);
+        let baseline_counter = runtime
+            .tune_encryption
+            .as_ref()
+            .expect("h743 runtime must initialize page crypto")
+            .state
+            .nonce_counter;
+
+        for _ in 0..(PAGE_CRYPTO_NONCE_PERSIST_STRIDE as usize + 8) {
+            let response = runtime.handle_packet(Packet::new(Cmd::ReadPage, encode_page_request(0)));
+            assert_eq!(response.cmd, Cmd::PageData);
+        }
+
+        let persisted_counter = read_persisted_page_crypto_counter(&runtime.store)
+            .expect("nonce counter must persist into config flash page");
+        assert!(persisted_counter >= baseline_counter);
+
+        let reboot_store = runtime.store.clone();
+        let rebooted = FirmwareRuntime::new_with_store(identity, false, reboot_store);
+        let reboot_counter = rebooted
+            .tune_encryption
+            .as_ref()
+            .expect("h743 runtime must initialize page crypto after reboot")
+            .state
+            .nonce_counter;
+
+        assert_eq!(
+            reboot_counter,
+            persisted_counter.saturating_add(PAGE_CRYPTO_NONCE_PERSIST_STRIDE)
+        );
+    }
+
+    #[test]
     fn write_read_and_burn_page_flow_is_consistent() {
         let mut runtime = FirmwareRuntime::new_ecu_v1();
         let data = vec![0xCC; runtime.store.page_length(0).unwrap()];
@@ -2443,6 +2823,61 @@ mod tests {
         assert_eq!(verify.cmd, Cmd::Ack);
         let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
         assert_eq!(complete.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_flash_verify_accepts_crc_plus_auth_tag() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0x10, 0x20, 0x30, 0x40],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+        let crc = FLASH_CRC32.checksum(&runtime.flash_buffer);
+        let tag = compute_flash_auth_tag(&runtime.identity, &runtime.flash_buffer, crc).unwrap();
+        let mut verify_payload = crc.to_be_bytes().to_vec();
+        verify_payload.extend_from_slice(&tag);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, verify_payload));
+        assert_eq!(verify.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_flash_verify_rejects_bad_auth_tag() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+        let crc = FLASH_CRC32.checksum(&runtime.flash_buffer);
+        let mut verify_payload = crc.to_be_bytes().to_vec();
+        verify_payload.extend_from_slice(&[0x5Au8; 16]);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, verify_payload));
+        assert_eq!(verify.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&verify.payload).unwrap();
+        assert!(reason.contains("auth"));
     }
 
     #[test]
@@ -2964,6 +3399,31 @@ mod tests {
             encode_page_payload(ConfigPage::PinAssignment as u8, &page),
         ));
 
+        assert_eq!(response.cmd, Cmd::Ack);
+        assert_eq!(
+            runtime
+                .pin_assignment(EcuFunction::BoostControl)
+                .unwrap()
+                .pin_id,
+            "PC8"
+        );
+        assert_eq!(
+            runtime.store.needs_burn(ConfigPage::PinAssignment as u8),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn runtime_pin_assign_command_updates_runtime_and_marks_page_dirty() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let payload = encode_pin_assignments_payload(&[crate::io::ResolvedPinAssignment {
+            function: EcuFunction::BoostControl,
+            pin_id: "PC8",
+            pin_label: "BOOST_ALT",
+            required_function: crate::pinmux::PinFunctionClass::PwmOutput,
+        }]);
+
+        let response = runtime.handle_packet(Packet::new(Cmd::PinAssign, payload));
         assert_eq!(response.cmd, Cmd::Ack);
         assert_eq!(
             runtime
