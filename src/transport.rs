@@ -12,8 +12,8 @@ use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, ProtectionState};
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_pin_assignments_payload,
-    decode_raw_table_payload, decode_sync_rtc_payload,
-    encode_ack_payload, encode_can_signal_directory_payload, encode_can_template_directory_payload,
+    decode_raw_table_payload, decode_sync_rtc_payload, encode_ack_payload,
+    encode_can_signal_directory_payload, encode_can_template_directory_payload,
     encode_capabilities_payload, encode_firmware_update_status_payload,
     encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
     encode_log_status_payload, encode_logbook_summary_payload, encode_nack_payload,
@@ -32,10 +32,11 @@ use crate::tcu::ExternalTcuRuntime;
 use crate::trigger::SUPPORTED_TRIGGER_DECODERS;
 use crate::trigger_runtime::TriggerRuntime;
 use crate::wideband::WidebandRuntime;
+use crate::ConfigPage;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use crate::ConfigPage;
 use crc::{Crc, CRC_32_ISO_HDLC};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Serialize;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -113,6 +114,7 @@ pub struct FirmwareRuntime {
     protection_manager: ProtectionManager,
     protection_state: ProtectionState,
     bootloader_auth_required: bool,
+    flash_signature_required: bool,
     bootloader_auth_pending_challenge: Option<[u8; BOOTLOADER_CHALLENGE_LEN]>,
     bootloader_auth_counter: u64,
     flash_session_active: bool,
@@ -230,7 +232,12 @@ const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
 const FLASH_VERIFY_CRC_LEN: usize = 4;
 const FLASH_VERIFY_AUTH_TAG_LEN: usize = 16;
 const FLASH_VERIFY_CRC_AND_TAG_LEN: usize = FLASH_VERIFY_CRC_LEN + FLASH_VERIFY_AUTH_TAG_LEN;
+const FLASH_VERIFY_SIGNATURE_LEN: usize = 64;
+const FLASH_VERIFY_CRC_AND_SIGNATURE_LEN: usize = FLASH_VERIFY_CRC_LEN + FLASH_VERIFY_SIGNATURE_LEN;
+const FLASH_VERIFY_CRC_TAG_AND_SIGNATURE_LEN: usize =
+    FLASH_VERIFY_CRC_AND_TAG_LEN + FLASH_VERIFY_SIGNATURE_LEN;
 const FLASH_AUTH_DOMAIN: &[u8] = b"ST-FLASH-AUTH-V1";
+const FLASH_SIGNATURE_DOMAIN: &[u8] = b"ST-FLASH-SIGN-V1";
 const BOOTLOADER_AUTH_DOMAIN: &[u8] = b"ST-BOOT-AUTH-V1";
 const BOOTLOADER_CHALLENGE_LEN: usize = 16;
 const BOOTLOADER_RESPONSE_LEN: usize = 16;
@@ -242,6 +249,10 @@ const PAGE_CRYPTO_NONCE_VERSION: u8 = 1;
 const PAGE_CRYPTO_NONCE_RECORD_LEN: usize = 16;
 const PAGE_CRYPTO_NONCE_PAGE_ID: u8 = ConfigPage::UiDefaults as u8;
 static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+const FLASH_SIGNING_PUBKEY: [u8; 32] = [
+    0xD7, 0x5A, 0x98, 0x01, 0x82, 0xB1, 0x0A, 0xB7, 0xD5, 0x4B, 0xFE, 0xD3, 0xC9, 0x64, 0x07, 0x3A,
+    0x0E, 0xE1, 0x72, 0xF3, 0xDA, 0xA6, 0x23, 0x25, 0xAF, 0x02, 0x1A, 0x68, 0xF7, 0x07, 0x51, 0x1A,
+];
 
 fn append_flash_auth_field(material: &mut Vec<u8>, value: &str) {
     material.extend_from_slice(&(value.len() as u16).to_be_bytes());
@@ -273,10 +284,11 @@ fn derive_page_crypto_bytes(identity: &FirmwareIdentity, domain: &[u8]) -> [u8; 
 }
 
 fn page_crypto_enabled_for_identity(identity: &FirmwareIdentity) -> bool {
-    identity
-        .board_id
-        .to_ascii_lowercase()
-        .contains("h743")
+    identity.board_id.to_ascii_lowercase().contains("h743")
+}
+
+fn flash_signature_required_for_identity(identity: &FirmwareIdentity) -> bool {
+    identity.board_id.to_ascii_lowercase().contains("h743")
 }
 
 fn initialize_page_crypto(identity: &FirmwareIdentity) -> Option<TuneEncryption> {
@@ -314,7 +326,10 @@ fn read_persisted_page_crypto_counter(store: &ConfigStore) -> Option<u64> {
     Some(u64::from_be_bytes(counter))
 }
 
-fn persist_page_crypto_counter(store: &mut ConfigStore, counter: u64) -> Result<(), RuntimeNackCode> {
+fn persist_page_crypto_counter(
+    store: &mut ConfigStore,
+    counter: u64,
+) -> Result<(), RuntimeNackCode> {
     let page_len = store
         .page_length(PAGE_CRYPTO_NONCE_PAGE_ID)
         .ok_or(RuntimeNackCode::StorageFailure)?;
@@ -414,7 +429,11 @@ fn compute_bootloader_auth_tag(
     Some(tag)
 }
 
-fn compute_flash_auth_tag(identity: &FirmwareIdentity, image: &[u8], image_crc: u32) -> Option<[u8; 16]> {
+fn compute_flash_auth_tag(
+    identity: &FirmwareIdentity,
+    image: &[u8],
+    image_crc: u32,
+) -> Option<[u8; 16]> {
     let key = derive_flash_auth_key(identity);
     let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
     let nonce_bytes = flash_auth_nonce(image.len(), image_crc, &key);
@@ -433,6 +452,30 @@ fn compute_flash_auth_tag(identity: &FirmwareIdentity, image: &[u8], image_crc: 
     let mut tag = [0u8; FLASH_VERIFY_AUTH_TAG_LEN];
     tag.copy_from_slice(&encrypted);
     Some(tag)
+}
+
+fn build_flash_signature_message(image: &[u8], image_crc: u32) -> Vec<u8> {
+    let mut message = Vec::with_capacity(FLASH_SIGNATURE_DOMAIN.len() + 8 + image.len());
+    message.extend_from_slice(FLASH_SIGNATURE_DOMAIN);
+    message.extend_from_slice(&(image.len() as u32).to_be_bytes());
+    message.extend_from_slice(&image_crc.to_be_bytes());
+    message.extend_from_slice(image);
+    message
+}
+
+fn verify_flash_signature(image: &[u8], image_crc: u32, signature_bytes: &[u8]) -> bool {
+    if signature_bytes.len() != FLASH_VERIFY_SIGNATURE_LEN {
+        return false;
+    }
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&FLASH_SIGNING_PUBKEY) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature_bytes) else {
+        return false;
+    };
+    verifying_key
+        .verify(&build_flash_signature_message(image, image_crc), &signature)
+        .is_ok()
 }
 const UPDATE_BANK_A: u8 = 1;
 const UPDATE_BANK_B: u8 = 2;
@@ -1090,10 +1133,16 @@ impl FirmwareRuntime {
         Self::new_with_store(identity, simulator, ConfigStore::new_zeroed())
     }
 
-    pub fn new_with_store(identity: FirmwareIdentity, simulator: bool, mut store: ConfigStore) -> Self {
+    pub fn new_with_store(
+        identity: FirmwareIdentity,
+        simulator: bool,
+        mut store: ConfigStore,
+    ) -> Self {
         let mut trigger_runtime = TriggerRuntime::default();
         let page_crypto_enabled = !simulator && page_crypto_enabled_for_identity(&identity);
         let bootloader_auth_required = !simulator && page_crypto_enabled_for_identity(&identity);
+        let flash_signature_required =
+            !simulator && flash_signature_required_for_identity(&identity);
         let mut tune_encryption = if page_crypto_enabled {
             initialize_page_crypto(&identity)
         } else {
@@ -1148,6 +1197,7 @@ impl FirmwareRuntime {
             protection_manager: ProtectionManager::new(ProtectionConfig::default()),
             protection_state: ProtectionState::default(),
             bootloader_auth_required,
+            flash_signature_required,
             bootloader_auth_pending_challenge: None,
             bootloader_auth_counter: 0,
             flash_session_active: false,
@@ -1973,9 +2023,10 @@ impl FirmwareRuntime {
                 encode_pin_assignments_payload(&self.pin_assignments),
             ),
             Cmd::PinAssign => match decode_pin_assignments_payload(&packet.payload) {
-                Ok(assignments) if assignments.is_empty() => {
-                    nack(RuntimeNackCode::MalformedPayload, "empty pin-assignment payload")
-                }
+                Ok(assignments) if assignments.is_empty() => nack(
+                    RuntimeNackCode::MalformedPayload,
+                    "empty pin-assignment payload",
+                ),
                 Ok(assignments) => {
                     let mut requests = Vec::with_capacity(assignments.len());
                     for assignment in &assignments {
@@ -2000,7 +2051,10 @@ impl FirmwareRuntime {
                         ),
                     }
                 }
-                Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad pin-assignment payload"),
+                Err(_) => nack(
+                    RuntimeNackCode::MalformedPayload,
+                    "bad pin-assignment payload",
+                ),
             },
             Cmd::GetDtc => {
                 let payload =
@@ -2066,8 +2120,12 @@ impl FirmwareRuntime {
                     Some(page) => {
                         let plain = page.to_vec();
                         match self.encrypt_page_for_transport(&plain) {
-                            Ok(payload) => Packet::new(Cmd::PageData, encode_page_payload(page_id, &payload)),
-                            Err(_) => nack(RuntimeNackCode::StorageFailure, "page encryption failed"),
+                            Ok(payload) => {
+                                Packet::new(Cmd::PageData, encode_page_payload(page_id, &payload))
+                            }
+                            Err(_) => {
+                                nack(RuntimeNackCode::StorageFailure, "page encryption failed")
+                            }
                         }
                     }
                     None => nack(RuntimeNackCode::InvalidPage, "invalid page id"),
@@ -2079,9 +2137,17 @@ impl FirmwareRuntime {
                     let decrypted_payload = match self.decrypt_page_from_transport(&page.payload) {
                         Ok(payload) => payload,
                         Err(RuntimeNackCode::MalformedPayload) => {
-                            return nack(RuntimeNackCode::MalformedPayload, "bad encrypted page payload");
+                            return nack(
+                                RuntimeNackCode::MalformedPayload,
+                                "bad encrypted page payload",
+                            );
                         }
-                        Err(_) => return nack(RuntimeNackCode::StorageFailure, "page decryption unavailable"),
+                        Err(_) => {
+                            return nack(
+                                RuntimeNackCode::StorageFailure,
+                                "page decryption unavailable",
+                            )
+                        }
                     };
                     let previous_assignments = self.pin_assignments.clone();
                     let write_result = self.store.write_page(page.page_id, &decrypted_payload);
@@ -2167,7 +2233,10 @@ impl FirmwareRuntime {
                     );
                 };
                 if expected_tag.as_slice() != packet.payload.as_slice() {
-                    return nack(RuntimeNackCode::MalformedPayload, "bootloader auth mismatch");
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "bootloader auth mismatch",
+                    );
                 }
 
                 self.begin_flash_session();
@@ -2214,38 +2283,61 @@ impl FirmwareRuntime {
                 if !self.flash_session_active || self.flash_buffer.is_empty() {
                     return nack(RuntimeNackCode::MalformedPayload, "nothing to verify");
                 }
-                if !packet.payload.is_empty()
-                    && packet.payload.len() != FLASH_VERIFY_CRC_LEN
-                    && packet.payload.len() != FLASH_VERIFY_AUTH_TAG_LEN
-                    && packet.payload.len() != FLASH_VERIFY_CRC_AND_TAG_LEN
-                {
-                    return nack(
-                        RuntimeNackCode::MalformedPayload,
-                        "bad flash-verify payload",
-                    );
-                }
+                let (crc_field, auth_tag_field, signature_field): (
+                    Option<&[u8]>,
+                    Option<&[u8]>,
+                    Option<&[u8]>,
+                ) = match packet.payload.len() {
+                    0 => (None, None, None),
+                    FLASH_VERIFY_CRC_LEN => {
+                        (Some(&packet.payload[..FLASH_VERIFY_CRC_LEN]), None, None)
+                    }
+                    FLASH_VERIFY_AUTH_TAG_LEN => (
+                        None,
+                        Some(&packet.payload[..FLASH_VERIFY_AUTH_TAG_LEN]),
+                        None,
+                    ),
+                    FLASH_VERIFY_CRC_AND_TAG_LEN => (
+                        Some(&packet.payload[..FLASH_VERIFY_CRC_LEN]),
+                        Some(&packet.payload[FLASH_VERIFY_CRC_LEN..FLASH_VERIFY_CRC_AND_TAG_LEN]),
+                        None,
+                    ),
+                    FLASH_VERIFY_CRC_AND_SIGNATURE_LEN => (
+                        Some(&packet.payload[..FLASH_VERIFY_CRC_LEN]),
+                        None,
+                        Some(
+                            &packet.payload
+                                [FLASH_VERIFY_CRC_LEN..FLASH_VERIFY_CRC_AND_SIGNATURE_LEN],
+                        ),
+                    ),
+                    FLASH_VERIFY_CRC_TAG_AND_SIGNATURE_LEN => (
+                        Some(&packet.payload[..FLASH_VERIFY_CRC_LEN]),
+                        Some(&packet.payload[FLASH_VERIFY_CRC_LEN..FLASH_VERIFY_CRC_AND_TAG_LEN]),
+                        Some(
+                            &packet.payload[FLASH_VERIFY_CRC_AND_TAG_LEN
+                                ..FLASH_VERIFY_CRC_TAG_AND_SIGNATURE_LEN],
+                        ),
+                    ),
+                    _ => {
+                        return nack(
+                            RuntimeNackCode::MalformedPayload,
+                            "bad flash-verify payload",
+                        );
+                    }
+                };
                 if self.flash_buffer.iter().all(|byte| *byte == 0) {
                     return nack(RuntimeNackCode::MalformedPayload, "flash image is blank");
                 }
                 let actual_crc = FLASH_CRC32.checksum(&self.flash_buffer);
 
-                if packet.payload.len() == FLASH_VERIFY_CRC_LEN
-                    || packet.payload.len() == FLASH_VERIFY_CRC_AND_TAG_LEN
-                {
-                    let expected_crc = u32::from_be_bytes(packet.payload[0..4].try_into().unwrap());
+                if let Some(crc_field) = crc_field {
+                    let expected_crc = u32::from_be_bytes(crc_field.try_into().unwrap());
                     if expected_crc != actual_crc {
                         return nack(RuntimeNackCode::MalformedPayload, "flash crc mismatch");
                     }
                 }
 
-                if packet.payload.len() == FLASH_VERIFY_AUTH_TAG_LEN
-                    || packet.payload.len() == FLASH_VERIFY_CRC_AND_TAG_LEN
-                {
-                    let expected_tag_slice = if packet.payload.len() == FLASH_VERIFY_AUTH_TAG_LEN {
-                        &packet.payload[..]
-                    } else {
-                        &packet.payload[FLASH_VERIFY_CRC_LEN..]
-                    };
+                if let Some(expected_tag_slice) = auth_tag_field {
                     let mut expected_tag = [0u8; FLASH_VERIFY_AUTH_TAG_LEN];
                     expected_tag.copy_from_slice(expected_tag_slice);
                     let Some(actual_tag) =
@@ -2255,6 +2347,21 @@ impl FirmwareRuntime {
                     };
                     if actual_tag != expected_tag {
                         return nack(RuntimeNackCode::MalformedPayload, "flash auth mismatch");
+                    }
+                }
+
+                if self.flash_signature_required && signature_field.is_none() {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash signature required",
+                    );
+                }
+                if let Some(signature_field) = signature_field {
+                    if !verify_flash_signature(&self.flash_buffer, actual_crc, signature_field) {
+                        return nack(
+                            RuntimeNackCode::MalformedPayload,
+                            "flash signature mismatch",
+                        );
                     }
                 }
 
@@ -2342,20 +2449,25 @@ mod tests {
         decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
         decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request,
-        encode_pin_assignments_payload,
-        encode_sync_rtc_payload, Cmd, Packet,
+        encode_pin_assignments_payload, encode_sync_rtc_payload, Cmd, Packet,
     };
     use crate::ConfigPage;
+    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::Value;
     use std::time::{Duration, Instant};
 
     use super::{
-        compute_bootloader_auth_tag, compute_flash_auth_tag, initialize_page_crypto,
-        parse_page0_actuator_config,
+        build_flash_signature_message, compute_bootloader_auth_tag, compute_flash_auth_tag,
+        initialize_page_crypto, parse_page0_actuator_config, read_persisted_page_crypto_counter,
         ActuatorRuntimeConfig, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
         ACTUATOR_PULSEWIDTH_BOUNDS_MS, FLASH_CRC32, PAGE_CRYPTO_NONCE_PERSIST_STRIDE,
-        read_persisted_page_crypto_counter,
     };
+
+    const TEST_FLASH_SIGNING_KEY_BYTES: [u8; 32] = [
+        0x9D, 0x61, 0xB1, 0x9D, 0xEF, 0xFD, 0x5A, 0x60, 0xBA, 0x84, 0x4A, 0xF4, 0x92, 0xEC, 0x2C,
+        0xC4, 0x44, 0x49, 0xC5, 0x69, 0x7B, 0x32, 0x69, 0x19, 0x70, 0x3B, 0xAC, 0x03, 0x1C, 0xAE,
+        0x7F, 0x60,
+    ];
 
     fn decode_live_frame(payload: &[u8]) -> LiveDataFrame {
         assert_eq!(payload.len(), LIVE_DATA_SIZE);
@@ -2370,6 +2482,29 @@ mod tests {
             signature: "ST-ECU-H743",
             ..FirmwareIdentity::ecu_v1()
         }
+    }
+
+    fn sign_flash_image_for_tests(
+        image: &[u8],
+        image_crc: u32,
+    ) -> [u8; super::FLASH_VERIFY_SIGNATURE_LEN] {
+        let signing_key = SigningKey::from_bytes(&TEST_FLASH_SIGNING_KEY_BYTES);
+        signing_key
+            .sign(&build_flash_signature_message(image, image_crc))
+            .to_bytes()
+    }
+
+    fn start_h743_flash_session(runtime: &mut FirmwareRuntime) {
+        let challenge = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(challenge.cmd, Cmd::Ack);
+        assert_eq!(challenge.payload.len(), super::BOOTLOADER_CHALLENGE_LEN);
+
+        let mut challenge_bytes = [0u8; super::BOOTLOADER_CHALLENGE_LEN];
+        challenge_bytes.copy_from_slice(&challenge.payload);
+        let response =
+            compute_bootloader_auth_tag(&runtime.identity, &challenge_bytes).expect("auth tag");
+        let auth = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, response.to_vec()));
+        assert_eq!(auth.cmd, Cmd::Ack);
     }
 
     #[test]
@@ -2672,8 +2807,10 @@ mod tests {
         let page_id = 0u8;
         let data = vec![0xA5; runtime.store.page_length(page_id).unwrap()];
 
-        let write_plain =
-            runtime.handle_packet(Packet::new(Cmd::WritePage, encode_page_payload(page_id, &data)));
+        let write_plain = runtime.handle_packet(Packet::new(
+            Cmd::WritePage,
+            encode_page_payload(page_id, &data),
+        ));
         let (code, reason) = decode_nack_payload(&write_plain.payload).unwrap();
         assert_eq!(write_plain.cmd, Cmd::Nack);
         assert_eq!(code, 2);
@@ -2716,7 +2853,8 @@ mod tests {
             .nonce_counter;
 
         for _ in 0..(PAGE_CRYPTO_NONCE_PERSIST_STRIDE as usize + 8) {
-            let response = runtime.handle_packet(Packet::new(Cmd::ReadPage, encode_page_request(0)));
+            let response =
+                runtime.handle_packet(Packet::new(Cmd::ReadPage, encode_page_request(0)));
             assert_eq!(response.cmd, Cmd::PageData);
         }
 
@@ -3065,6 +3203,82 @@ mod tests {
         assert_eq!(verify.cmd, Cmd::Nack);
         let (_, reason) = decode_nack_payload(&verify.payload).unwrap();
         assert!(reason.contains("auth"));
+    }
+
+    #[test]
+    fn runtime_h743_flash_verify_requires_signature() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+        start_h743_flash_session(&mut runtime);
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+
+        let crc = FLASH_CRC32.checksum(&runtime.flash_buffer);
+        let tag = compute_flash_auth_tag(&runtime.identity, &runtime.flash_buffer, crc).unwrap();
+        let mut verify_payload = crc.to_be_bytes().to_vec();
+        verify_payload.extend_from_slice(&tag);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, verify_payload));
+        assert_eq!(verify.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&verify.payload).unwrap();
+        assert!(reason.contains("signature"));
+    }
+
+    #[test]
+    fn runtime_h743_flash_verify_accepts_crc_tag_and_signature() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+        start_h743_flash_session(&mut runtime);
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0x10, 0x20, 0x30, 0x40],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+
+        let crc = FLASH_CRC32.checksum(&runtime.flash_buffer);
+        let tag = compute_flash_auth_tag(&runtime.identity, &runtime.flash_buffer, crc).unwrap();
+        let signature = sign_flash_image_for_tests(&runtime.flash_buffer, crc);
+        let mut verify_payload = crc.to_be_bytes().to_vec();
+        verify_payload.extend_from_slice(&tag);
+        verify_payload.extend_from_slice(&signature);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, verify_payload));
+        assert_eq!(verify.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_h743_flash_verify_rejects_bad_signature() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+        start_h743_flash_session(&mut runtime);
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+
+        let crc = FLASH_CRC32.checksum(&runtime.flash_buffer);
+        let tag = compute_flash_auth_tag(&runtime.identity, &runtime.flash_buffer, crc).unwrap();
+        let mut verify_payload = crc.to_be_bytes().to_vec();
+        verify_payload.extend_from_slice(&tag);
+        verify_payload.extend_from_slice(&[0x5Au8; super::FLASH_VERIFY_SIGNATURE_LEN]);
+
+        let verify = runtime.handle_packet(Packet::new(Cmd::FlashVerify, verify_payload));
+        assert_eq!(verify.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&verify.payload).unwrap();
+        assert!(reason.contains("signature"));
     }
 
     #[test]
