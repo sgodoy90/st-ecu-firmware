@@ -535,6 +535,8 @@ fn verify_flash_signature(image: &[u8], image_crc: u32, signature_bytes: &[u8]) 
 const UPDATE_BANK_A: u8 = 1;
 const UPDATE_BANK_B: u8 = 2;
 const UPDATE_HEALTH_WINDOW_MS: u32 = 30_000;
+const SYNC_RTC_MIN_EPOCH_MS: u64 = 1_672_531_200_000; // 2023-01-01T00:00:00Z
+const SYNC_RTC_MAX_EPOCH_MS: u64 = 4_102_444_799_999; // 2099-12-31T23:59:59.999Z
 const LOG_BLOCK_SIZE_BYTES: u16 = 256;
 const PAGE0_MAGIC: [u8; 4] = *b"STC2";
 const PAGE0_VERSION: u8 = 1;
@@ -2128,6 +2130,12 @@ impl FirmwareRuntime {
             }
             Cmd::SyncRtc => match decode_sync_rtc_payload(&packet.payload) {
                 Ok(epoch_ms) => {
+                    if !(SYNC_RTC_MIN_EPOCH_MS..=SYNC_RTC_MAX_EPOCH_MS).contains(&epoch_ms) {
+                        return nack(
+                            RuntimeNackCode::RangeOverflow,
+                            "sync-rtc epoch out of supported range",
+                        );
+                    }
                     self.log_rtc_synced = true;
                     self.log_last_rtc_sync_ms = epoch_ms.min(u32::MAX as u64) as u32;
                     Packet::new(Cmd::Ack, vec![])
@@ -4231,6 +4239,26 @@ mod tests {
         assert_eq!(bad_sync.cmd, Cmd::Nack);
         let (_, bad_reason) = decode_nack_payload(&bad_sync.payload).unwrap();
         assert!(bad_reason.contains("sync-rtc"));
+    }
+
+    #[test]
+    fn runtime_rejects_out_of_range_rtc_sync_epoch() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+
+        let out_of_range = runtime.handle_packet(Packet::new(
+            Cmd::SyncRtc,
+            encode_sync_rtc_payload(super::SYNC_RTC_MIN_EPOCH_MS.saturating_sub(1)),
+        ));
+        assert_eq!(out_of_range.cmd, Cmd::Nack);
+        let (code, reason) = decode_nack_payload(&out_of_range.payload).unwrap();
+        assert_eq!(code, super::RuntimeNackCode::RangeOverflow as u8);
+        assert!(reason.contains("out of supported range"));
+
+        let valid = runtime.handle_packet(Packet::new(
+            Cmd::SyncRtc,
+            encode_sync_rtc_payload(super::SYNC_RTC_MIN_EPOCH_MS),
+        ));
+        assert_eq!(valid.cmd, Cmd::Ack);
     }
 
     #[test]
