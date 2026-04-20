@@ -26,4 +26,4 @@ aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "ae
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-# No extra dev dependencies — all tests use std alloc only
+proptest = "1"

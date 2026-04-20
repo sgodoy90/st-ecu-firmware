@@ -90,6 +90,7 @@ pub enum Cmd {
     CanSignalDirectory = 0x75,
     GetPinAssignments = 0x6A,
     PinAssignments = 0x6B,
+    PinAssign = 0x6C,
     Ack = 0xA0,
     Nack = 0xA1,
     Error = 0xFF,
@@ -173,6 +174,7 @@ impl TryFrom<u8> for Cmd {
             0x75 => Ok(Self::CanSignalDirectory),
             0x6A => Ok(Self::GetPinAssignments),
             0x6B => Ok(Self::PinAssignments),
+            0x6C => Ok(Self::PinAssign),
             0xA0 => Ok(Self::Ack),
             0xA1 => Ok(Self::Nack),
             0xFF => Ok(Self::Error),
@@ -2125,9 +2127,9 @@ mod tests {
         encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload,
         CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, DecodedPinAssignment,
         FirmwareUpdateStatusPayload, LogStatusPayload, LogbookSummaryPayload,
-        OutputTestDirectoryEntry, Packet, ProtocolError, RawTablePayload,
-        SensorRawDirectoryEntry,
+        OutputTestDirectoryEntry, Packet, ProtocolError, RawTablePayload, SensorRawDirectoryEntry,
     };
+    use proptest::prelude::*;
 
     #[test]
     fn packet_roundtrip() {
@@ -2135,6 +2137,44 @@ mod tests {
         let bytes = packet.to_bytes();
         let parsed = Packet::from_bytes(&bytes).unwrap().unwrap();
         assert_eq!(parsed.0, packet);
+    }
+
+    proptest! {
+        #[test]
+        fn packet_roundtrip_property(
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+            cmd in prop_oneof![
+                Just(Cmd::Ping),
+                Just(Cmd::GetLiveData),
+                Just(Cmd::ReadPage),
+                Just(Cmd::WritePage),
+                Just(Cmd::ReadTable),
+                Just(Cmd::WriteTable),
+                Just(Cmd::GetTriggerCapture),
+            ],
+        ) {
+            let packet = Packet::new(cmd, payload.clone());
+            let bytes = packet.to_bytes();
+            let parsed = Packet::from_bytes(&bytes)
+                .expect("parse result")
+                .expect("complete packet");
+            prop_assert_eq!(parsed.0.cmd, cmd);
+            prop_assert_eq!(parsed.0.payload, payload);
+            prop_assert_eq!(parsed.1, bytes.len());
+        }
+
+        #[test]
+        fn page_payload_decode_rejects_crc_corruption(
+            page_id in any::<u8>(),
+            payload_bytes in prop::collection::vec(any::<u8>(), 0..384),
+        ) {
+            let mut payload = encode_page_payload(page_id, &payload_bytes);
+            prop_assume!(!payload.is_empty());
+            let last = payload.len() - 1;
+            payload[last] ^= 0xA5;
+            let result = decode_page_payload(&payload);
+            prop_assert!(matches!(result, Err(ProtocolError::MalformedPayload)));
+        }
     }
 
     #[test]
@@ -2794,6 +2834,7 @@ mod tests {
 
         assert_eq!(Cmd::GetPinAssignments as u8, 0x6A);
         assert_eq!(Cmd::PinAssignments as u8, 0x6B);
+        assert_eq!(Cmd::PinAssign as u8, 0x6C);
         assert_eq!(Cmd::GetTriggerToothLog as u8, 0x70);
         assert_eq!(Cmd::TriggerToothLog as u8, 0x71);
         assert_eq!(Cmd::GetCanTemplateDirectory as u8, 0x72);
