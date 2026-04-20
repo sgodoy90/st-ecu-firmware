@@ -70,6 +70,7 @@ pub enum RuntimeNackCode {
     MalformedPayload = 2,
     InvalidPage = 3,
     StorageFailure = 4,
+    UnsafeState = 12,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1586,6 +1587,10 @@ impl FirmwareRuntime {
         self.log_staging_block.clear();
     }
 
+    fn record_logbook_audit_marker(&mut self) {
+        self.logbook_entries = self.logbook_entries.saturating_add(1);
+    }
+
     fn build_live_data_frame(&mut self) -> LiveDataFrame {
         self.live_sample_counter = self.live_sample_counter.wrapping_add(1);
         self.trigger_runtime.observe_tick(self.live_sample_counter);
@@ -2076,9 +2081,11 @@ impl FirmwareRuntime {
                 if packet.payload.len() < 2 {
                     return nack(RuntimeNackCode::MalformedPayload, "bad output-test payload");
                 }
+                let flags = packet.payload[1];
+                let force_on = (flags & 0x01) != 0;
                 if self.flash_session_active {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::UnsafeState,
                         "output-test blocked during flash session",
                     );
                 }
@@ -2090,14 +2097,14 @@ impl FirmwareRuntime {
                     || self.protection_state.egt_protect;
                 if protection_active {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::UnsafeState,
                         "output-test blocked by active protection",
                     );
                 }
                 let force_unsafe = packet.payload.get(4).copied().unwrap_or(0) != 0;
                 if self.last_reported_rpm > 100.0 && !force_unsafe {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::UnsafeState,
                         "output test blocked while engine running",
                     );
                 }
@@ -2110,6 +2117,9 @@ impl FirmwareRuntime {
                         RuntimeNackCode::MalformedPayload,
                         "unknown output-test channel",
                     );
+                }
+                if force_on && force_unsafe && self.last_reported_rpm > 100.0 {
+                    self.record_logbook_audit_marker();
                 }
                 Packet::new(Cmd::Ack, vec![])
             }
@@ -3077,7 +3087,8 @@ mod tests {
         let blocked =
             runtime.handle_packet(Packet::new(Cmd::RunOutputTest, vec![25, 0x01, 0x00, 0x00]));
         assert_eq!(blocked.cmd, Cmd::Nack);
-        let (_, reason) = decode_nack_payload(&blocked.payload).unwrap();
+        let (code, reason) = decode_nack_payload(&blocked.payload).unwrap();
+        assert_eq!(code, super::RuntimeNackCode::UnsafeState as u8);
         assert!(reason.contains("engine running"));
     }
 
@@ -3086,12 +3097,21 @@ mod tests {
         let mut runtime = FirmwareRuntime::new_ecu_v1();
         let live = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
         assert_eq!(live.cmd, Cmd::LiveData);
+        let before_summary = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let before_entries = decode_logbook_summary_payload(&before_summary.payload)
+            .expect("valid logbook summary")
+            .entries;
 
         let forced = runtime.handle_packet(Packet::new(
             Cmd::RunOutputTest,
             vec![25, 0x01, 0x00, 0x00, 0x01],
         ));
         assert_eq!(forced.cmd, Cmd::Ack);
+        let after_summary = runtime.handle_packet(Packet::new(Cmd::GetLogbookSummary, vec![]));
+        let after_entries = decode_logbook_summary_payload(&after_summary.payload)
+            .expect("valid logbook summary")
+            .entries;
+        assert_eq!(after_entries, before_entries.saturating_add(1));
     }
 
     #[test]
