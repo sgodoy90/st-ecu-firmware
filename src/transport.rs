@@ -12,10 +12,10 @@ use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, P
 use crate::protocol::{
     decode_page_payload, decode_page_request, decode_raw_table_payload, decode_sync_rtc_payload,
     encode_ack_payload, encode_can_signal_directory_payload, encode_can_template_directory_payload,
-    encode_capabilities_payload, encode_freeze_frames_payload, encode_identity_payload,
-    encode_firmware_update_status_payload,
-    encode_log_block_payload, encode_log_status_payload, encode_logbook_summary_payload,
-    encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
+    encode_capabilities_payload, encode_firmware_update_status_payload,
+    encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
+    encode_log_status_payload, encode_logbook_summary_payload, encode_nack_payload,
+    encode_network_profile_payload, encode_output_test_directory_payload,
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
     encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
@@ -286,8 +286,11 @@ fn parse_page0_actuator_config(payload: &[u8]) -> ActuatorRuntimeConfig {
     }
 
     if let Some(deadtime_raw) = read_be_u16(payload, PAGE0_OFFSET_DEADTIME_14V_MS) {
-        config.injector_deadtime_14v_ms = (deadtime_raw as f32 / 1000.0)
-            .clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1);
+        // deadtime_raw == 0 is treated as "unset" so defaults remain stable.
+        if deadtime_raw > 0 {
+            config.injector_deadtime_14v_ms = (deadtime_raw as f32 / 1000.0)
+                .clamp(ACTUATOR_DEADTIME_BOUNDS_MS.0, ACTUATOR_DEADTIME_BOUNDS_MS.1);
+        }
     }
 
     config.dwell_mode_table = payload[PAGE0_OFFSET_DWELL_MODE] == 1;
@@ -1926,7 +1929,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        parse_page0_actuator_config, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
+        parse_page0_actuator_config, ActuatorRuntimeConfig, FirmwareRuntime,
+        ACTUATOR_DWELL_BOUNDS_MS,
         ACTUATOR_PULSEWIDTH_BOUNDS_MS,
     };
 
@@ -2001,6 +2005,23 @@ mod tests {
         assert!(parsed.dwell_max_ms >= parsed.dwell_min_ms);
         assert!(parsed.dwell_fixed_ms >= parsed.dwell_min_ms);
         assert!(parsed.dwell_fixed_ms <= parsed.dwell_max_ms);
+    }
+
+    #[test]
+    fn page0_deadtime_zero_keeps_default_deadtime() {
+        let mut payload = vec![0u8; 512];
+        payload[0..4].copy_from_slice(b"STC2");
+        payload[4] = 1;
+        payload[5] = 4;
+        payload[28..30].copy_from_slice(&0u16.to_be_bytes());
+
+        let parsed = parse_page0_actuator_config(&payload);
+        assert!(
+            (parsed.injector_deadtime_14v_ms
+                - ActuatorRuntimeConfig::default().injector_deadtime_14v_ms)
+                .abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]
@@ -2475,7 +2496,9 @@ mod tests {
     fn runtime_flash_reports_health_window_and_commits_when_confirmed() {
         let mut runtime = FirmwareRuntime::new_ecu_v1();
         assert_eq!(
-            runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![])).cmd,
+            runtime
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
             Cmd::Ack
         );
         assert_eq!(
@@ -2488,11 +2511,15 @@ mod tests {
             Cmd::Ack
         );
         assert_eq!(
-            runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![])).cmd,
+            runtime
+                .handle_packet(Packet::new(Cmd::FlashVerify, vec![]))
+                .cmd,
             Cmd::Ack
         );
         assert_eq!(
-            runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![])).cmd,
+            runtime
+                .handle_packet(Packet::new(Cmd::FlashComplete, vec![]))
+                .cmd,
             Cmd::Ack
         );
 
@@ -2523,7 +2550,9 @@ mod tests {
     fn runtime_flash_rolls_back_when_health_window_expires() {
         let mut runtime = FirmwareRuntime::new_ecu_v1();
         assert_eq!(
-            runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![])).cmd,
+            runtime
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
             Cmd::Ack
         );
         assert_eq!(
@@ -2533,11 +2562,15 @@ mod tests {
             Cmd::Ack
         );
         assert_eq!(
-            runtime.handle_packet(Packet::new(Cmd::FlashVerify, vec![])).cmd,
+            runtime
+                .handle_packet(Packet::new(Cmd::FlashVerify, vec![]))
+                .cmd,
             Cmd::Ack
         );
         assert_eq!(
-            runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![])).cmd,
+            runtime
+                .handle_packet(Packet::new(Cmd::FlashComplete, vec![]))
+                .cmd,
             Cmd::Ack
         );
 

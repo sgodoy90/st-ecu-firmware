@@ -87,34 +87,36 @@ impl Default for VeTable {
     fn default() -> Self {
         // 48 RPM breakpoints: 500..9000 RPM (dense at low end, sparse at high)
         let rpm_axis: [f32; VE_TABLE_SIZE] = [
-            500.,  600.,  700.,  800.,  900., 1000., 1100., 1200.,
-           1300., 1400., 1500., 1600., 1700., 1800., 1900., 2000.,
-           2200., 2400., 2600., 2800., 3000., 3200., 3400., 3600.,
-           3800., 4000., 4200., 4400., 4600., 4800., 5000., 5200.,
-           5400., 5600., 5800., 6000., 6200., 6400., 6600., 6800.,
-           7000., 7200., 7400., 7600., 7800., 8000., 8500., 9000.,
+            500., 600., 700., 800., 900., 1000., 1100., 1200., 1300., 1400., 1500., 1600., 1700.,
+            1800., 1900., 2000., 2200., 2400., 2600., 2800., 3000., 3200., 3400., 3600., 3800.,
+            4000., 4200., 4400., 4600., 4800., 5000., 5200., 5400., 5600., 5800., 6000., 6200.,
+            6400., 6600., 6800., 7000., 7200., 7400., 7600., 7800., 8000., 8500., 9000.,
         ];
         // 48 load breakpoints: 20..310 kPa absolute
         let load_axis: [f32; VE_TABLE_SIZE] = [
-            20.,  25.,  30.,  35.,  40.,  45.,  50.,  55.,
-            60.,  65.,  70.,  75.,  80.,  85.,  90.,  95.,
-           100., 105., 110., 115., 120., 125., 130., 135.,
-           140., 145., 150., 155., 160., 165., 170., 175.,
-           180., 185., 190., 195., 200., 210., 220., 230.,
-           240., 250., 260., 270., 280., 290., 300., 310.,
+            20., 25., 30., 35., 40., 45., 50., 55., 60., 65., 70., 75., 80., 85., 90., 95., 100.,
+            105., 110., 115., 120., 125., 130., 135., 140., 145., 150., 155., 160., 165., 170.,
+            175., 180., 185., 190., 195., 200., 210., 220., 230., 240., 250., 260., 270., 280.,
+            290., 300., 310.,
         ];
         // Realistic VE shape: peak around 70% RPM + 80% load, drops at extremes
         let mut cells = [[80.0f32; VE_TABLE_SIZE]; VE_TABLE_SIZE];
         for r in 0..VE_TABLE_SIZE {
             for l in 0..VE_TABLE_SIZE {
-                let rpm_norm  = r as f32 / (VE_TABLE_SIZE - 1) as f32;
+                let rpm_norm = r as f32 / (VE_TABLE_SIZE - 1) as f32;
                 let load_norm = l as f32 / (VE_TABLE_SIZE - 1) as f32;
-                let rpm_factor  = 1.0 - (rpm_norm - 0.70).powi(2) * 0.5;
+                let rpm_factor = 1.0 - (rpm_norm - 0.70).powi(2) * 0.5;
                 let load_factor = 0.5 + load_norm * 0.5;
-                cells[r][l] = (65.0 + 25.0 * rpm_factor * load_factor).max(40.0).min(100.0);
+                cells[r][l] = (65.0 + 25.0 * rpm_factor * load_factor)
+                    .max(40.0)
+                    .min(100.0);
             }
         }
-        Self { cells, rpm_axis, load_axis }
+        Self {
+            cells,
+            rpm_axis,
+            load_axis,
+        }
     }
 }
 
@@ -123,51 +125,70 @@ impl VeTable {
     pub fn interpolate(&self, rpm: f32, map_kpa: f32) -> f32 {
         let ri = axis_index(&self.rpm_axis, rpm);
         let li = axis_index(&self.load_axis, map_kpa);
-        bilinear(
-            ri.0, ri.1, ri.2,
-            li.0, li.1, li.2,
-            &self.cells,
-        )
+        bilinear(ri.0, ri.1, ri.2, li.0, li.1, li.2, &self.cells)
     }
 }
 
 /// Find surrounding axis indices and interpolation fraction.
 fn axis_index(axis: &[f32], value: f32) -> (usize, usize, f32) {
     let n = axis.len();
-    if value <= axis[0] { return (0, 0, 0.0); }
-    if value >= axis[n-1] { return (n-1, n-1, 0.0); }
-    for i in 0..n-1 {
-        if value >= axis[i] && value < axis[i+1] {
-            let frac = (value - axis[i]) / (axis[i+1] - axis[i]);
-            return (i, i+1, frac);
+    if value <= axis[0] {
+        return (0, 0, 0.0);
+    }
+    if value >= axis[n - 1] {
+        return (n - 1, n - 1, 0.0);
+    }
+    for i in 0..n - 1 {
+        if value >= axis[i] && value < axis[i + 1] {
+            let frac = (value - axis[i]) / (axis[i + 1] - axis[i]);
+            return (i, i + 1, frac);
         }
     }
-    (n-1, n-1, 0.0)
+    (n - 1, n - 1, 0.0)
 }
 
 fn bilinear(
-    ri: usize, ri1: usize, rf: f32,
-    li: usize, li1: usize, lf: f32,
+    ri: usize,
+    ri1: usize,
+    rf: f32,
+    li: usize,
+    li1: usize,
+    lf: f32,
     cells: &[[f32; VE_TABLE_SIZE]; VE_TABLE_SIZE],
 ) -> f32 {
-    bilinear_4(cells[ri][li], cells[ri1][li], cells[ri][li1], cells[ri1][li1], rf, lf)
+    bilinear_4(
+        cells[ri][li],
+        cells[ri1][li],
+        cells[ri][li1],
+        cells[ri1][li1],
+        rf,
+        lf,
+    )
 }
 
 /// Slice-based bilinear — works for any table size (used by LtftMap 16×16).
 fn bilinear_slice(
     cells: &[[f32; LTFT_SIZE]; LTFT_SIZE],
-    ri: usize, ri1: usize, rf: f32,
-    li: usize, li1: usize, lf: f32,
+    ri: usize,
+    ri1: usize,
+    rf: f32,
+    li: usize,
+    li1: usize,
+    lf: f32,
 ) -> f32 {
-    bilinear_4(cells[ri][li], cells[ri1][li], cells[ri][li1], cells[ri1][li1], rf, lf)
+    bilinear_4(
+        cells[ri][li],
+        cells[ri1][li],
+        cells[ri][li1],
+        cells[ri1][li1],
+        rf,
+        lf,
+    )
 }
 
 #[inline(always)]
 fn bilinear_4(c00: f32, c10: f32, c01: f32, c11: f32, rf: f32, lf: f32) -> f32 {
-    c00 * (1.0 - rf) * (1.0 - lf)
-        + c10 * rf * (1.0 - lf)
-        + c01 * (1.0 - rf) * lf
-        + c11 * rf * lf
+    c00 * (1.0 - rf) * (1.0 - lf) + c10 * rf * (1.0 - lf) + c01 * (1.0 - rf) * lf + c11 * rf * lf
 }
 
 // ─── LTFT storage layout in BBSRAM (H743) ────────────────────────────────────
@@ -177,7 +198,7 @@ fn bilinear_4(c00: f32, c10: f32, c01: f32, c11: f32, rf: f32, lf: f32) -> f32 {
 // Offset 1024: Knock map   (KnockLearningMap::serialize) = 2,080 bytes
 // Total: 3,104 bytes / 4,096 bytes BBSRAM used.
 
-pub const LTFT_SIZE: usize = 16;          // 16×16 — BBSRAM-limited
+pub const LTFT_SIZE: usize = 16; // 16×16 — BBSRAM-limited
 pub const LTFT_BBSRAM_OFFSET: usize = 0;
 pub const KNOCK_BBSRAM_OFFSET: usize = 1024;
 
@@ -195,10 +216,14 @@ impl Default for LtftMap {
     fn default() -> Self {
         Self {
             cells: [[1.0f32; LTFT_SIZE]; LTFT_SIZE],
-            rpm_axis: [500., 1000., 1500., 2000., 2500., 3000., 3500., 4000.,
-                       4500., 5000., 5500., 6000., 6500., 7000., 7500., 8000.],
-            load_axis: [20., 40., 60., 80., 100., 120., 140., 160.,
-                        180., 200., 220., 240., 260., 280., 300., 310.],
+            rpm_axis: [
+                500., 1000., 1500., 2000., 2500., 3000., 3500., 4000., 4500., 5000., 5500., 6000.,
+                6500., 7000., 7500., 8000.,
+            ],
+            load_axis: [
+                20., 40., 60., 80., 100., 120., 140., 160., 180., 200., 220., 240., 260., 280.,
+                300., 310.,
+            ],
         }
     }
 }
@@ -209,7 +234,7 @@ impl LtftMap {
         let mut o = 0;
         for row in &self.cells {
             for &v in row {
-                buf[o..o+4].copy_from_slice(&v.to_be_bytes());
+                buf[o..o + 4].copy_from_slice(&v.to_be_bytes());
                 o += 4;
             }
         }
@@ -221,7 +246,7 @@ impl LtftMap {
         let mut o = 0;
         for row in &mut map.cells {
             for v in row.iter_mut() {
-                *v = f32::from_be_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]);
+                *v = f32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
                 o += 4;
             }
         }
@@ -260,7 +285,7 @@ impl WallWettingState {
         // film_dot = x_evap * film - (1-x) * m_inj
         // Where x_evap = 1/tau
         let m_inj = base_pw_ms; // treat pw as proxy for injected mass
-        // SAFETY: tau_ms guaranteed ≥ 0.25 by wall_wetting_tau(). Extra clamp for direct calls.
+                                // SAFETY: tau_ms guaranteed ≥ 0.25 by wall_wetting_tau(). Extra clamp for direct calls.
         let safe_tau = tau_ms.max(0.25);
         let evap = self.film_mass_mg / safe_tau * dt_ms;
         let deposit = (1.0 - x.clamp(0.0, 1.0)) * m_inj;
@@ -284,8 +309,8 @@ pub struct FuelState {
     pub base_pw_ms: f32,
     pub final_pw_ms: f32,
     pub duty_pct: f32,
-    pub stft: f32,      // current STFT value (multiplicative)
-    pub ltft: f32,      // current LTFT value
+    pub stft: f32, // current STFT value (multiplicative)
+    pub ltft: f32, // current LTFT value
     pub accel_enrich: f32,
     pub dfco_active: bool,
     pub correction_iat: f32,
@@ -344,7 +369,9 @@ impl FuelCalculator {
         // Base pulse width (speed-density)
         // PW = (VE × MAP × displacement) / (rpm × cylinders × stoich × injector_flow)
         let air_charge_g = (state.ve / 100.0) * map_kpa * self.config.displacement_cc * 1e-6
-            / (8.314 * (iat_c + 273.15)) * 28.97 * 1000.0; // air mass in grams per event
+            / (8.314 * (iat_c + 273.15))
+            * 28.97
+            * 1000.0; // air mass in grams per event
         let fuel_mass_g = air_charge_g / (self.config.stoich_afr * self.config.target_lambda);
         // Injector flow in g/ms at reference pressure
         let injector_flow_g_ms = (self.config.injector_flow_cc_min * 0.745) / 60000.0; // density ~0.745 g/cc
@@ -363,15 +390,22 @@ impl FuelCalculator {
             state.stft = (state.stft + stft_delta)
                 .max(1.0 - self.config.stft_limit_pct / 100.0)
                 .min(1.0 + self.config.stft_limit_pct / 100.0);
-            // Update LTFT slowly
-            self.ltft_map.update(rpm, map_kpa, state.stft, 0.001);
+            // Update LTFT slowly only when STFT is valid and meaningfully away from unity.
+            // This blocks pathological updates (e.g. sensor fault driving STFT to 0).
+            let stft_valid = state.stft.is_finite() && state.stft >= 0.5 && state.stft <= 1.5;
+            let stft_delta_from_unity = (state.stft - 1.0).abs();
+            if stft_valid && stft_delta_from_unity > 0.05 {
+                self.ltft_map.update(rpm, map_kpa, state.stft, 0.001);
+            }
         }
         state.ltft = self.ltft_map.get(rpm, map_kpa);
 
         // Wall wetting correction
         let tau = wall_wetting_tau(clt_c, self.config.wall_wetting_tau_ms);
         let corrected_pw = if self.config.wall_wetting_enabled {
-            state.wall_state.update(state.base_pw_ms, tau, self.config.wall_wetting_x, dt_ms)
+            state
+                .wall_state
+                .update(state.base_pw_ms, tau, self.config.wall_wetting_x, dt_ms)
         } else {
             state.base_pw_ms
         };
@@ -392,8 +426,24 @@ impl FuelCalculator {
         state.final_pw_ms = state.final_pw_ms.max(0.0);
 
         // Duty cycle
-        let cycle_ms = if rpm > 0.0 { 60000.0 / (rpm * self.config.cylinders as f32) } else { 100.0 };
-        state.duty_pct = (state.final_pw_ms / cycle_ms * 100.0).min(100.0);
+        let safe_rpm = if rpm.is_finite() { rpm.max(0.0) } else { 0.0 };
+        let safe_cylinders = self.config.cylinders.max(1) as f32;
+        let cycle_ms = if safe_rpm > 0.0 {
+            60000.0 / (safe_rpm * safe_cylinders)
+        } else {
+            100.0
+        };
+        let safe_cycle_ms = if cycle_ms.is_finite() && cycle_ms > 0.0 {
+            cycle_ms
+        } else {
+            100.0
+        };
+        let duty = (state.final_pw_ms / safe_cycle_ms) * 100.0;
+        state.duty_pct = if duty.is_finite() {
+            duty.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
     }
 }
 
@@ -409,7 +459,9 @@ fn iat_correction(iat_c: f32) -> f32 {
 
 /// CLT warmup correction (additive enrichment during warmup)
 fn clt_correction(clt_c: f32) -> f32 {
-    if clt_c >= 80.0 { return 1.0; }
+    if clt_c >= 80.0 {
+        return 1.0;
+    }
     // Linear enrichment: 40% extra at -40°C, 0% extra at 80°C
     let enrich = ((80.0 - clt_c) / 120.0 * 0.4).max(0.0);
     1.0 + enrich
@@ -464,7 +516,10 @@ mod tests {
     #[test]
     fn iat_correction_at_reference_temp() {
         let corr = iat_correction(25.0);
-        assert!((corr - 1.0).abs() < 0.02, "IAT correction at 25°C should be ~1.0, got {corr}");
+        assert!(
+            (corr - 1.0).abs() < 0.02,
+            "IAT correction at 25°C should be ~1.0, got {corr}"
+        );
     }
 
     #[test]
@@ -524,14 +579,20 @@ mod tests {
         // At -40°C, factor = 1 + (20-(-40))/20 = 4.0 → tau = 80*4 = 320ms — no issue
         let tau = wall_wetting_tau(-40.0, 80.0);
         assert!(tau >= 0.25, "tau should never go below 0.25ms, got {tau}");
-        assert!(tau > 100.0, "at -40°C tau should be large (>100ms), got {tau}");
+        assert!(
+            tau > 100.0,
+            "at -40°C tau should be large (>100ms), got {tau}"
+        );
     }
 
     #[test]
     fn wall_wetting_tau_extreme_hot_clamped() {
         // At 200°C (beyond engine range), factor could go very low — must be clamped
         let tau = wall_wetting_tau(200.0, 80.0);
-        assert!(tau >= 0.25, "tau must be >= 0.25ms even at extreme temp, got {tau}");
+        assert!(
+            tau >= 0.25,
+            "tau must be >= 0.25ms even at extreme temp, got {tau}"
+        );
     }
 
     #[test]
@@ -549,9 +610,57 @@ mod tests {
         let mut state = FuelState::default();
         state.stft = 1.0;
         state.ltft = 1.0;
-        calc.calculate(&mut state, 3000.0, 30.0, 101.0, 85.0, 25.0, 0.0, 14.0, 0.5, 1.0, 10.0);
+        calc.calculate(
+            &mut state, 3000.0, 30.0, 101.0, 85.0, 25.0, 0.0, 14.0, 0.5, 1.0, 10.0,
+        );
         // TPS < threshold AND RPM > dfco_min → DFCO active
         assert!(state.dfco_active);
         assert_eq!(state.final_pw_ms, 0.0);
+    }
+
+    #[test]
+    fn calculate_with_zero_rpm_is_finite_and_safe() {
+        let config = FuelConfig::default();
+        let mut calc = FuelCalculator::new(config);
+        let mut state = FuelState::default();
+        calc.calculate(
+            &mut state, 0.0, 95.0, 101.0, 80.0, 30.0, 0.0, 14.0, 0.98, 0.1, 10.0,
+        );
+        assert!(state.final_pw_ms.is_finite());
+        assert!(state.duty_pct.is_finite());
+        assert!((0.0..=100.0).contains(&state.duty_pct));
+    }
+
+    #[test]
+    fn calculate_with_zero_cylinders_does_not_divide_by_zero() {
+        let mut config = FuelConfig::default();
+        config.cylinders = 0;
+        let mut calc = FuelCalculator::new(config);
+        let mut state = FuelState::default();
+        calc.calculate(
+            &mut state, 2500.0, 95.0, 101.0, 80.0, 30.0, 0.0, 14.0, 0.98, 0.1, 10.0,
+        );
+        assert!(state.final_pw_ms.is_finite());
+        assert!(state.duty_pct.is_finite());
+        assert!((0.0..=100.0).contains(&state.duty_pct));
+    }
+
+    #[test]
+    fn ltft_learning_ignores_near_unity_stft() {
+        let mut calc = FuelCalculator::new(FuelConfig::default());
+        let baseline = calc.ltft_map.get(3000.0, 100.0);
+        calc.ltft_map.update(3000.0, 100.0, 1.2, 0.001);
+        let changed = calc.ltft_map.get(3000.0, 100.0);
+        assert!(changed > baseline);
+
+        let mut calc_noop = FuelCalculator::new(FuelConfig::default());
+        let baseline_noop = calc_noop.ltft_map.get(3000.0, 100.0);
+        let mut state = FuelState::default();
+        state.stft = 1.0;
+        calc_noop.calculate(
+            &mut state, 3000.0, 100.0, 101.0, 80.0, 30.0, 0.0, 14.0, 20.0, 1.0, 10.0,
+        );
+        let after_noop = calc_noop.ltft_map.get(3000.0, 100.0);
+        assert!((after_noop - baseline_noop).abs() < 1e-6);
     }
 }

@@ -13,9 +13,9 @@ pub const IGN_TABLE_SIZE: usize = 48; // 48×48 — matches protocol.ts TABLE_SI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IgnitionMode {
     #[default]
-    WastedSpark,    // pairs of cylinders, 360° apart
-    CoilOnPlug,     // sequential, one coil per cylinder
-    HrtimCop,       // H743 only: COP with 217ps HRTIM scheduling
+    WastedSpark, // pairs of cylinders, 360° apart
+    CoilOnPlug, // sequential, one coil per cylinder
+    HrtimCop,   // H743 only: COP with 217ps HRTIM scheduling
 }
 
 /// 48×48 Ignition timing table (RPM × load) — matches protocol.ts TABLE_SIZE=48
@@ -31,34 +31,35 @@ impl Default for IgnitionTable {
     fn default() -> Self {
         // Same 48-bin axes as VeTable for consistent cursor mapping in MapEditor
         let rpm_axis: [f32; IGN_TABLE_SIZE] = [
-            500.,  600.,  700.,  800.,  900., 1000., 1100., 1200.,
-           1300., 1400., 1500., 1600., 1700., 1800., 1900., 2000.,
-           2200., 2400., 2600., 2800., 3000., 3200., 3400., 3600.,
-           3800., 4000., 4200., 4400., 4600., 4800., 5000., 5200.,
-           5400., 5600., 5800., 6000., 6200., 6400., 6600., 6800.,
-           7000., 7200., 7400., 7600., 7800., 8000., 8500., 9000.,
+            500., 600., 700., 800., 900., 1000., 1100., 1200., 1300., 1400., 1500., 1600., 1700.,
+            1800., 1900., 2000., 2200., 2400., 2600., 2800., 3000., 3200., 3400., 3600., 3800.,
+            4000., 4200., 4400., 4600., 4800., 5000., 5200., 5400., 5600., 5800., 6000., 6200.,
+            6400., 6600., 6800., 7000., 7200., 7400., 7600., 7800., 8000., 8500., 9000.,
         ];
         let load_axis: [f32; IGN_TABLE_SIZE] = [
-            20.,  25.,  30.,  35.,  40.,  45.,  50.,  55.,
-            60.,  65.,  70.,  75.,  80.,  85.,  90.,  95.,
-           100., 105., 110., 115., 120., 125., 130., 135.,
-           140., 145., 150., 155., 160., 165., 170., 175.,
-           180., 185., 190., 195., 200., 210., 220., 230.,
-           240., 250., 260., 270., 280., 290., 300., 310.,
+            20., 25., 30., 35., 40., 45., 50., 55., 60., 65., 70., 75., 80., 85., 90., 95., 100.,
+            105., 110., 115., 120., 125., 130., 135., 140., 145., 150., 155., 160., 165., 170.,
+            175., 180., 185., 190., 195., 200., 210., 220., 230., 240., 250., 260., 270., 280.,
+            290., 300., 310.,
         ];
         // Realistic ignition map: peak advance at light load + mid-RPM, drops at high load
         let mut cells = [[20.0f32; IGN_TABLE_SIZE]; IGN_TABLE_SIZE];
         for r in 0..IGN_TABLE_SIZE {
             for l in 0..IGN_TABLE_SIZE {
-                let rpm_norm  = r as f32 / (IGN_TABLE_SIZE - 1) as f32;
+                let rpm_norm = r as f32 / (IGN_TABLE_SIZE - 1) as f32;
                 let load_norm = l as f32 / (IGN_TABLE_SIZE - 1) as f32;
                 // Peak ~32° at 40% RPM light load → 10° at WOT high RPM
-                cells[r][l] = (15.0 + 20.0 * (1.0 - load_norm)
-                    * (1.0 - (rpm_norm - 0.4).powi(2) * 2.5))
-                    .max(5.0).min(40.0);
+                cells[r][l] = (15.0
+                    + 20.0 * (1.0 - load_norm) * (1.0 - (rpm_norm - 0.4).powi(2) * 2.5))
+                    .max(5.0)
+                    .min(40.0);
             }
         }
-        Self { cells, rpm_axis, load_axis }
+        Self {
+            cells,
+            rpm_axis,
+            load_axis,
+        }
     }
 }
 
@@ -72,30 +73,35 @@ impl IgnitionTable {
 
 fn axis_index(axis: &[f32], value: f32) -> (usize, usize, f32) {
     let n = axis.len();
-    if value <= axis[0] { return (0, 0, 0.0); }
-    if value >= axis[n-1] { return (n-1, n-1, 0.0); }
-    for i in 0..n-1 {
-        if value >= axis[i] && value < axis[i+1] {
-            let frac = (value - axis[i]) / (axis[i+1] - axis[i]);
-            return (i, i+1, frac);
+    if value <= axis[0] {
+        return (0, 0, 0.0);
+    }
+    if value >= axis[n - 1] {
+        return (n - 1, n - 1, 0.0);
+    }
+    for i in 0..n - 1 {
+        if value >= axis[i] && value < axis[i + 1] {
+            let frac = (value - axis[i]) / (axis[i + 1] - axis[i]);
+            return (i, i + 1, frac);
         }
     }
-    (n-1, n-1, 0.0)
+    (n - 1, n - 1, 0.0)
 }
 
 fn bilinear(
-    ri: usize, ri1: usize, rf: f32,
-    li: usize, li1: usize, lf: f32,
+    ri: usize,
+    ri1: usize,
+    rf: f32,
+    li: usize,
+    li1: usize,
+    lf: f32,
     cells: &[[f32; IGN_TABLE_SIZE]; IGN_TABLE_SIZE],
 ) -> f32 {
     let c00 = cells[ri][li];
     let c10 = cells[ri1][li];
     let c01 = cells[ri][li1];
     let c11 = cells[ri1][li1];
-    c00 * (1.0 - rf) * (1.0 - lf)
-        + c10 * rf * (1.0 - lf)
-        + c01 * (1.0 - rf) * lf
-        + c11 * rf * lf
+    c00 * (1.0 - rf) * (1.0 - lf) + c10 * rf * (1.0 - lf) + c01 * (1.0 - rf) * lf + c11 * rf * lf
 }
 
 /// Dwell table: coil charge time vs battery voltage
@@ -117,15 +123,23 @@ impl Default for DwellTable {
 impl DwellTable {
     pub fn lookup(&self, vbatt: f32) -> f32 {
         let n = self.voltage.len();
-        if vbatt <= self.voltage[0] { return self.dwell_ms[0]; }
-        if vbatt >= self.voltage[n-1] { return self.dwell_ms[n-1]; }
-        for i in 0..n-1 {
-            if vbatt >= self.voltage[i] && vbatt < self.voltage[i+1] {
-                let frac = (vbatt - self.voltage[i]) / (self.voltage[i+1] - self.voltage[i]);
-                return self.dwell_ms[i] * (1.0 - frac) + self.dwell_ms[i+1] * frac;
+        if vbatt <= self.voltage[0] {
+            return self.dwell_ms[0];
+        }
+        if vbatt >= self.voltage[n - 1] {
+            return self.dwell_ms[n - 1];
+        }
+        for i in 0..n - 1 {
+            if vbatt >= self.voltage[i] && vbatt < self.voltage[i + 1] {
+                let span = self.voltage[i + 1] - self.voltage[i];
+                if span <= f32::EPSILON {
+                    return self.dwell_ms[i];
+                }
+                let frac = (vbatt - self.voltage[i]) / span;
+                return self.dwell_ms[i] * (1.0 - frac) + self.dwell_ms[i + 1] * frac;
             }
         }
-        self.dwell_ms[n-1]
+        self.dwell_ms[n - 1]
     }
 }
 
@@ -164,7 +178,7 @@ pub struct IgnitionState {
     pub advance_deg: f32,
     pub dwell_ms: f32,
     pub injection_offset_deg: f32,
-    pub knock_retard_deg: f32,     // total applied across all cylinders
+    pub knock_retard_deg: f32, // total applied across all cylinders
     pub idle_ign_correction_deg: f32,
     pub per_cyl_retard: [f32; 8], // individual per-cylinder knock retard
     pub cranking_mode: bool,
@@ -208,10 +222,16 @@ impl IgnitionScheduler {
             let base = self.advance_table.interpolate(rpm, load_kpa);
             let corr_clt = ign_clt_correction(clt_c);
             let corr_iat = ign_iat_correction(iat_c);
-            let flat_shift_retard = if flat_shift_active { self.config.flat_shift_retard_deg } else { 0.0 };
+            let flat_shift_retard = if flat_shift_active {
+                self.config.flat_shift_retard_deg
+            } else {
+                0.0
+            };
 
             state.advance_deg = (base + corr_clt + corr_iat - knock_retard - flat_shift_retard
-                + idle_ign_correction).max(0.0).min(60.0);
+                + idle_ign_correction)
+                .max(0.0)
+                .min(60.0);
         }
 
         state.knock_retard_deg = knock_retard;
@@ -229,7 +249,9 @@ impl IgnitionScheduler {
 
     /// Convert degrees-before-TDC to timer nanoseconds for a given RPM.
     pub fn deg_to_ns(deg: f32, rpm: f32) -> u64 {
-        if rpm < 1.0 { return 0; }
+        if rpm < 1.0 {
+            return 0;
+        }
         let us_per_deg = 1_000_000.0 / (rpm * 6.0); // 6 deg/ms at 1000 RPM
         (deg * us_per_deg * 1000.0) as u64
     }
@@ -237,14 +259,20 @@ impl IgnitionScheduler {
 
 /// CLT-based ignition correction (retard when hot, slight advance when cold)
 fn ign_clt_correction(clt_c: f32) -> f32 {
-    if clt_c >= 80.0 { return 0.0; }
-    if clt_c < 20.0 { return -3.0; } // warm-up retard for stability
+    if clt_c >= 80.0 {
+        return 0.0;
+    }
+    if clt_c < 20.0 {
+        return -3.0;
+    } // warm-up retard for stability
     (80.0 - clt_c) / 60.0 * (-3.0) // linear from -3° at 20°C to 0° at 80°C
 }
 
 /// IAT-based ignition correction (retard when intake air is hot)
 fn ign_iat_correction(iat_c: f32) -> f32 {
-    if iat_c <= 25.0 { return 0.0; }
+    if iat_c <= 25.0 {
+        return 0.0;
+    }
     // -1° per 10°C above 25°C, max -5°
     ((25.0 - iat_c) / 10.0).max(-5.0)
 }
@@ -272,6 +300,14 @@ mod tests {
     }
 
     #[test]
+    fn dwell_table_duplicate_breakpoint_is_safe() {
+        let mut table = DwellTable::default();
+        table.voltage[3] = table.voltage[2];
+        let dwell = table.lookup(table.voltage[2]);
+        assert!(dwell.is_finite());
+    }
+
+    #[test]
     fn ign_clt_correction_warm_engine() {
         assert_eq!(ign_clt_correction(90.0), 0.0);
     }
@@ -292,7 +328,10 @@ mod tests {
         // At 6000 RPM: 1 rev = 10ms, 1 deg = 27.78µs
         let ns = IgnitionScheduler::deg_to_ns(1.0, 6000.0);
         let expected = 27_778; // ns
-        assert!((ns as i64 - expected as i64).abs() < 500, "got {ns}ns, expected ~{expected}ns");
+        assert!(
+            (ns as i64 - expected as i64).abs() < 500,
+            "got {ns}ns, expected ~{expected}ns"
+        );
     }
 
     #[test]
@@ -306,7 +345,10 @@ mod tests {
     fn deg_to_ns_reasonable_range() {
         // At 1000 RPM, 10° BTDC ≈ 1.67ms = 1,666,667 ns
         let ns = IgnitionScheduler::deg_to_ns(10.0, 1000.0);
-        assert!(ns > 1_000_000 && ns < 2_500_000, "1000 RPM 10° should be ~1.67ms, got {ns}ns");
+        assert!(
+            ns > 1_000_000 && ns < 2_500_000,
+            "1000 RPM 10° should be ~1.67ms, got {ns}ns"
+        );
     }
 
     #[test]
@@ -325,8 +367,28 @@ mod tests {
         let sched = IgnitionScheduler::new(config);
         let mut state_no_knock = IgnitionState::default();
         let mut state_knock = IgnitionState::default();
-        sched.calculate(&mut state_no_knock, 3000.0, 90.0, 85.0, 25.0, 14.0, 0.0, 0.0, false);
-        sched.calculate(&mut state_knock, 3000.0, 90.0, 85.0, 25.0, 14.0, 5.0, 0.0, false);
+        sched.calculate(
+            &mut state_no_knock,
+            3000.0,
+            90.0,
+            85.0,
+            25.0,
+            14.0,
+            0.0,
+            0.0,
+            false,
+        );
+        sched.calculate(
+            &mut state_knock,
+            3000.0,
+            90.0,
+            85.0,
+            25.0,
+            14.0,
+            5.0,
+            0.0,
+            false,
+        );
         assert!(state_knock.advance_deg < state_no_knock.advance_deg);
     }
 
@@ -337,7 +399,17 @@ mod tests {
         let mut state = IgnitionState::default();
         let mut state_flat = IgnitionState::default();
         sched.calculate(&mut state, 5000.0, 120.0, 85.0, 30.0, 14.0, 0.0, 0.0, false);
-        sched.calculate(&mut state_flat, 5000.0, 120.0, 85.0, 30.0, 14.0, 0.0, 0.0, true);
+        sched.calculate(
+            &mut state_flat,
+            5000.0,
+            120.0,
+            85.0,
+            30.0,
+            14.0,
+            0.0,
+            0.0,
+            true,
+        );
         assert!(state_flat.advance_deg < state.advance_deg);
     }
 }

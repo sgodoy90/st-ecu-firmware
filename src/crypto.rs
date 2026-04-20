@@ -1,11 +1,18 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
+};
+
 /// Tune encryption — AES-256 per-ECU key + True RNG (H743 only).
 ///
 /// H743: True RNG generates a unique 32-byte key on first startup, stored in OTP.
 ///       Tunes are AES-256-GCM encrypted and bound to the specific ECU ID.
-///       Encrypted config pages have a 16-byte auth tag appended.
+///       Encrypted config pages include a 12-byte nonce prefix + ciphertext + 16-byte auth tag.
 ///
 /// F407: Returns Err(NotSupported) for all crypto operations.
 ///       UI shows a badge indicating H743-only feature.
+const GCM_NONCE_LEN: usize = 12;
+const GCM_TAG_LEN: usize = 16;
 
 /// Crypto error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +69,7 @@ pub struct TuneEncryptionState {
     pub locked: bool,
     pub key_pending: bool,
     pub tune_bound_ecu_id: [u8; 32],
+    pub nonce_counter: u64,
 }
 
 /// Tune encryption controller
@@ -99,31 +107,55 @@ impl TuneEncryption {
         self.key.provisioned = true;
         self.key.generation += 1;
         self.state.key_pending = false;
+        let mut seed = [0u8; 8];
+        seed.copy_from_slice(&rng_bytes[..8]);
+        self.state.nonce_counter = u64::from_be_bytes(seed);
         Ok(())
     }
 
-    /// Encrypt a config page. Returns ciphertext + 16-byte auth tag appended.
-    /// Page must be 512 or 1024 bytes. Output is page.len() + 16 bytes.
-    pub fn encrypt_page(&self, page: &[u8]) -> CryptoResult<Vec<u8>> {
+    fn next_nonce_bytes(&mut self) -> [u8; GCM_NONCE_LEN] {
+        let counter = self.state.nonce_counter;
+        self.state.nonce_counter = self.state.nonce_counter.wrapping_add(1);
+
+        // 96-bit nonce = key-generation epoch (u32) + monotonic counter (u64)
+        let mut nonce = [0u8; GCM_NONCE_LEN];
+        nonce[..4].copy_from_slice(&self.key.generation.to_be_bytes());
+        nonce[4..].copy_from_slice(&counter.to_be_bytes());
+        nonce
+    }
+
+    /// Encrypt a config page. Returns nonce prefix + ciphertext + 16-byte GCM tag.
+    /// Output length is page.len() + 12 + 16.
+    pub fn encrypt_page(&mut self, page: &[u8]) -> CryptoResult<Vec<u8>> {
         if !self.target_supports_crypto {
             return Err(CryptoError::NotSupported);
         }
         if !self.key.provisioned {
             return Err(CryptoError::KeyNotLoaded);
         }
-        // Stub: XOR with key + append fake auth tag
-        // Real implementation: AES-256-GCM via H743 hardware CRYP peripheral
-        let mut out = Vec::with_capacity(page.len() + 16);
-        for (i, &b) in page.iter().enumerate() {
-            out.push(b ^ self.key.key[i % 32]);
-        }
-        // Fake 16-byte auth tag (real: GCM tag from hardware)
-        let tag: u8 = self.key.key.iter().fold(0u8, |a, &b| a.wrapping_add(b));
-        out.extend_from_slice(&[tag; 16]);
+        self.verify_ecu_binding()?;
+
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key.key).map_err(|_| CryptoError::InvalidInput)?;
+        let nonce_bytes = self.next_nonce_bytes();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: page,
+                    aad: &self.key.ecu_id,
+                },
+            )
+            .map_err(|_| CryptoError::AuthFailed)?;
+
+        let mut out = Vec::with_capacity(GCM_NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
         Ok(out)
     }
 
-    /// Decrypt a config page. Input must be page.len() + 16 (with auth tag).
+    /// Decrypt a config page produced by encrypt_page.
     pub fn decrypt_page(&self, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
         if !self.target_supports_crypto {
             return Err(CryptoError::NotSupported);
@@ -131,18 +163,24 @@ impl TuneEncryption {
         if !self.key.provisioned {
             return Err(CryptoError::KeyNotLoaded);
         }
-        if ciphertext.len() < 16 {
+        self.verify_ecu_binding()?;
+
+        if ciphertext.len() < (GCM_NONCE_LEN + GCM_TAG_LEN) {
             return Err(CryptoError::InvalidInput);
         }
-        let (ct, tag) = ciphertext.split_at(ciphertext.len() - 16);
-        // Verify fake auth tag
-        let expected_tag: u8 = self.key.key.iter().fold(0u8, |a, &b| a.wrapping_add(b));
-        if tag.iter().any(|&b| b != expected_tag) {
-            return Err(CryptoError::AuthFailed);
-        }
-        // Decrypt (XOR is symmetric for stub)
-        let plain: Vec<u8> = ct.iter().enumerate().map(|(i, &b)| b ^ self.key.key[i % 32]).collect();
-        Ok(plain)
+        let (nonce_bytes, body) = ciphertext.split_at(GCM_NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key.key).map_err(|_| CryptoError::InvalidInput)?;
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: body,
+                    aad: &self.key.ecu_id,
+                },
+            )
+            .map_err(|_| CryptoError::AuthFailed)
     }
 
     /// Lock tune to this ECU ID. After locking, tune cannot be used on another ECU.
@@ -157,7 +195,9 @@ impl TuneEncryption {
 
     /// Verify that current ECU ID matches the tune's bound ECU ID.
     pub fn verify_ecu_binding(&self) -> CryptoResult<()> {
-        if !self.state.locked { return Ok(()); } // unlocked tune works on any ECU
+        if !self.state.locked {
+            return Ok(());
+        } // unlocked tune works on any ECU
         if self.state.tune_bound_ecu_id == self.key.ecu_id {
             Ok(())
         } else {
@@ -174,7 +214,10 @@ mod tests {
     fn f407_crypto_not_supported() {
         let mut enc = TuneEncryption::new_f407();
         assert!(enc.generate_key([0u8; 32]).is_err());
-        assert_eq!(enc.encrypt_page(&[0u8; 512]).unwrap_err(), CryptoError::NotSupported);
+        assert_eq!(
+            enc.encrypt_page(&[0u8; 512]).unwrap_err(),
+            CryptoError::NotSupported
+        );
     }
 
     #[test]
@@ -184,8 +227,14 @@ mod tests {
         enc.generate_key([0x42u8; 32]).unwrap();
         let original = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let ciphertext = enc.encrypt_page(&original).unwrap();
-        assert_eq!(ciphertext.len(), original.len() + 16);
-        assert_ne!(ciphertext[..original.len()], original[..]);
+        assert_eq!(
+            ciphertext.len(),
+            original.len() + GCM_NONCE_LEN + GCM_TAG_LEN
+        );
+        assert_ne!(
+            ciphertext[GCM_NONCE_LEN..GCM_NONCE_LEN + original.len()],
+            original[..]
+        );
         let decrypted = enc.decrypt_page(&ciphertext).unwrap();
         assert_eq!(decrypted, original);
     }
@@ -200,7 +249,36 @@ mod tests {
         // Corrupt the auth tag
         let len = ciphertext.len();
         ciphertext[len - 1] ^= 0xFF;
-        assert_eq!(enc.decrypt_page(&ciphertext).unwrap_err(), CryptoError::AuthFailed);
+        assert_eq!(
+            enc.decrypt_page(&ciphertext).unwrap_err(),
+            CryptoError::AuthFailed
+        );
+    }
+
+    #[test]
+    fn gcm_nonce_prefix_changes_between_encryptions() {
+        let ecu_id = [0xAB; 32];
+        let mut enc = TuneEncryption::new_h743(ecu_id);
+        enc.generate_key([0x42u8; 32]).unwrap();
+
+        let payload = vec![0x55u8; 64];
+        let ct_a = enc.encrypt_page(&payload).unwrap();
+        let ct_b = enc.encrypt_page(&payload).unwrap();
+
+        assert_ne!(&ct_a[..GCM_NONCE_LEN], &ct_b[..GCM_NONCE_LEN]);
+        assert_eq!(enc.decrypt_page(&ct_a).unwrap(), payload);
+        assert_eq!(enc.decrypt_page(&ct_b).unwrap(), payload);
+    }
+
+    #[test]
+    fn decrypt_rejects_too_short_payload() {
+        let ecu_id = [0xAB; 32];
+        let mut enc = TuneEncryption::new_h743(ecu_id);
+        enc.generate_key([0x42u8; 32]).unwrap();
+        assert_eq!(
+            enc.decrypt_page(&[0x11u8; 8]).unwrap_err(),
+            CryptoError::InvalidInput
+        );
     }
 
     #[test]
@@ -220,12 +298,18 @@ mod tests {
         enc.lock_tune().unwrap();
         // Simulate different ECU
         enc.key.ecu_id = [0x22; 32]; // different ECU
-        assert_eq!(enc.verify_ecu_binding().unwrap_err(), CryptoError::AuthFailed);
+        assert_eq!(
+            enc.verify_ecu_binding().unwrap_err(),
+            CryptoError::AuthFailed
+        );
     }
 
     #[test]
     fn ecu_id_hex_is_64_chars() {
-        let key = TuneKey { ecu_id: [0xABu8; 32], ..Default::default() };
+        let key = TuneKey {
+            ecu_id: [0xABu8; 32],
+            ..Default::default()
+        };
         let hex = key.ecu_id_hex();
         assert_eq!(hex.len(), 64);
         // 0xAB → "ab"

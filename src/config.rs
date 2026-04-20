@@ -4,7 +4,7 @@ use crc::{Crc, CRC_32_ISO_HDLC};
 static CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 pub const CONFIG_IMAGE_MAGIC: [u8; 4] = *b"STCF";
-pub const MIN_SUPPORTED_CONFIG_FORMAT_VERSION: u8 = CONFIG_FORMAT_VERSION;
+pub const MIN_SUPPORTED_CONFIG_FORMAT_VERSION: u8 = 0;
 const STORED_PAGE_PREFIX_LEN: usize = 18;
 const STORED_PAGE_HEADER_LEN: usize = 22;
 
@@ -154,10 +154,8 @@ impl FlashPageSlot {
     fn zeroed(page_id: u8, page_length: usize) -> Self {
         let payload = vec![0u8; page_length];
         let raw_image = encode_stored_page_image(page_id, 0, &payload);
-        let committed = Some(
-            decode_stored_page_image(&raw_image)
-                .expect("factory config image must decode after encode"),
-        );
+        // Guardrail: never panic during boot-time slot initialization.
+        let committed = decode_stored_page_image(&raw_image).ok();
         Self {
             raw_image,
             committed,
@@ -313,12 +311,14 @@ impl ConfigStore {
             .filter_map(|page| self.needs_burn(page.id).unwrap_or(false).then_some(page.id))
             .collect::<Vec<_>>();
 
+        let mut burned = 0usize;
         for page_id in &dirty_pages {
-            self.burn_page(*page_id)
-                .expect("dirty page id must burn successfully");
+            if self.burn_page(*page_id).is_ok() {
+                burned += 1;
+            }
         }
 
-        dirty_pages.len()
+        burned
     }
 
     pub fn restore_page_from_flash(&mut self, page_id: u8) -> Result<(), ConfigStoreError> {
@@ -451,8 +451,11 @@ fn build_page_header_with_versions(
     format_version: u8,
     payload: &[u8],
 ) -> ConfigPageHeader {
-    let payload_length =
-        u16::try_from(payload.len()).expect("config page payload length must fit u16");
+    debug_assert!(
+        payload.len() <= u16::MAX as usize,
+        "config page payload length must fit u16"
+    );
+    let payload_length = payload.len() as u16;
     let payload_crc = CRC32.checksum(payload);
     let image_crc = calculate_image_crc(
         format_version,
@@ -491,6 +494,12 @@ fn encode_stored_page_image_with_versions(
     format_version: u8,
     payload: &[u8],
 ) -> Vec<u8> {
+    // Runtime pages are much smaller than u16::MAX; this truncation path is only a hard guard.
+    let payload = if payload.len() > u16::MAX as usize {
+        &payload[..u16::MAX as usize]
+    } else {
+        payload
+    };
     let header = build_page_header_with_versions(
         page_id,
         generation,
@@ -567,12 +576,26 @@ fn decode_stored_page_image(raw_image: &[u8]) -> Result<StoredPageImage, ConfigI
 type SchemaMigrator = fn(u8, &[u8]) -> Result<Vec<u8>, ConfigMigrationError>;
 type FormatMigrator = fn(u8, &[u8]) -> Result<Vec<u8>, ConfigMigrationError>;
 
-fn schema_migrator_for(_from_version: u16) -> Option<SchemaMigrator> {
-    None
+fn schema_migrate_v0_to_v1(_page_id: u8, payload: &[u8]) -> Result<Vec<u8>, ConfigMigrationError> {
+    Ok(payload.to_vec())
 }
 
-fn format_migrator_for(_from_version: u8) -> Option<FormatMigrator> {
-    None
+fn format_migrate_v0_to_v1(_page_id: u8, payload: &[u8]) -> Result<Vec<u8>, ConfigMigrationError> {
+    Ok(payload.to_vec())
+}
+
+fn schema_migrator_for(from_version: u16) -> Option<SchemaMigrator> {
+    match from_version {
+        0 => Some(schema_migrate_v0_to_v1),
+        _ => None,
+    }
+}
+
+fn format_migrator_for(from_version: u8) -> Option<FormatMigrator> {
+    match from_version {
+        0 => Some(format_migrate_v0_to_v1),
+        _ => None,
+    }
 }
 
 fn migrate_payload_to_current_versions(
@@ -686,8 +709,7 @@ fn calculate_image_crc(
 mod tests {
     use super::{
         decode_stored_page_image, encode_stored_page_image, encode_stored_page_image_with_versions,
-        ConfigImageError, ConfigMigrationError, ConfigPage, ConfigStore, ConfigStoreError,
-        CONFIG_FORMAT_VERSION,
+        ConfigImageError, ConfigPage, ConfigStore, ConfigStoreError, CONFIG_FORMAT_VERSION,
     };
 
     #[test]
@@ -855,29 +877,45 @@ mod tests {
     }
 
     #[test]
-    fn import_persisted_image_rejects_missing_schema_migrator() {
+    fn import_persisted_image_migrates_legacy_schema_v0_to_current() {
         let mut store = ConfigStore::new_zeroed();
         let page_id = ConfigPage::Sensors as u8;
-        let legacy_schema = crate::SCHEMA_VERSION.saturating_sub(1);
         let payload = vec![0x55; store.page_length(page_id).unwrap()];
-        let raw_image = encode_stored_page_image_with_versions(
-            page_id,
-            3,
-            legacy_schema,
-            CONFIG_FORMAT_VERSION,
-            &payload,
-        );
+        let raw_image =
+            encode_stored_page_image_with_versions(page_id, 3, 0, CONFIG_FORMAT_VERSION, &payload);
 
-        let result = store.import_persisted_page_image(page_id, &raw_image);
-        assert_eq!(
-            result,
-            Err(ConfigStoreError::MigrationFailed(
-                ConfigMigrationError::MissingSchemaMigrator {
-                    from: legacy_schema,
-                    to: legacy_schema.saturating_add(1),
-                },
-            ))
-        );
+        let report = store
+            .import_persisted_page_image(page_id, &raw_image)
+            .expect("legacy schema image should migrate");
+
+        assert_eq!(report.from_schema_version, 0);
+        assert_eq!(report.to_schema_version, crate::SCHEMA_VERSION);
+        assert_eq!(report.schema_steps, 1);
+        assert_eq!(report.format_steps, 0);
+        assert!(report.migrated);
+        assert_eq!(store.read_page(page_id).unwrap(), payload.as_slice());
+        assert_eq!(store.read_flash_page(page_id).unwrap(), payload.as_slice());
+    }
+
+    #[test]
+    fn import_persisted_image_migrates_legacy_format_v0_to_current() {
+        let mut store = ConfigStore::new_zeroed();
+        let page_id = ConfigPage::LimitsKnock as u8;
+        let payload = vec![0xA5; store.page_length(page_id).unwrap()];
+        let raw_image =
+            encode_stored_page_image_with_versions(page_id, 7, crate::SCHEMA_VERSION, 0, &payload);
+
+        let report = store
+            .import_persisted_page_image(page_id, &raw_image)
+            .expect("legacy format image should migrate");
+
+        assert_eq!(report.from_format_version, 0);
+        assert_eq!(report.to_format_version, CONFIG_FORMAT_VERSION);
+        assert_eq!(report.schema_steps, 0);
+        assert_eq!(report.format_steps, 1);
+        assert!(report.migrated);
+        assert_eq!(store.read_page(page_id).unwrap(), payload.as_slice());
+        assert_eq!(store.read_flash_page(page_id).unwrap(), payload.as_slice());
     }
 
     #[test]

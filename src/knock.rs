@@ -85,16 +85,19 @@ impl KnockLearningMap {
         let mut o = 0;
         for row in &self.noise_floor {
             for &v in row {
-                buf[o..o+4].copy_from_slice(&v.to_be_bytes()); o += 4;
+                buf[o..o + 4].copy_from_slice(&v.to_be_bytes());
+                o += 4;
             }
         }
         for row in &self.dam_map {
             for &v in row {
-                buf[o..o+4].copy_from_slice(&v.to_be_bytes()); o += 4;
+                buf[o..o + 4].copy_from_slice(&v.to_be_bytes());
+                o += 4;
             }
         }
         for &v in &self.fkc {
-            buf[o..o+4].copy_from_slice(&v.to_be_bytes()); o += 4;
+            buf[o..o + 4].copy_from_slice(&v.to_be_bytes());
+            o += 4;
         }
         buf
     }
@@ -104,16 +107,19 @@ impl KnockLearningMap {
         let mut o = 0;
         for row in &mut map.noise_floor {
             for v in row.iter_mut() {
-                *v = f32::from_be_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]); o += 4;
+                *v = f32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+                o += 4;
             }
         }
         for row in &mut map.dam_map {
             for v in row.iter_mut() {
-                *v = f32::from_be_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]); o += 4;
+                *v = f32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+                o += 4;
             }
         }
         for v in &mut map.fkc {
-            *v = f32::from_be_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]); o += 4;
+            *v = f32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+            o += 4;
         }
         map
     }
@@ -136,8 +142,10 @@ impl KnockLearningMap {
 /// IIR bandpass filter state for one channel.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IirState {
-    pub x1: f32, pub x2: f32,
-    pub y1: f32, pub y2: f32,
+    pub x1: f32,
+    pub x2: f32,
+    pub y1: f32,
+    pub y2: f32,
 }
 
 /// Software IIR knock detector (F407 and F407-mode fallback).
@@ -150,7 +158,11 @@ pub struct SoftKnockDetector {
     /// Normalized knock level 0–100
     pub level: u8,
     /// Cached IIR coefficients (recomputed when config changes)
-    b0: f32, b1: f32, b2: f32, a1: f32, a2: f32,
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
 }
 
 impl SoftKnockDetector {
@@ -162,7 +174,11 @@ impl SoftKnockDetector {
             retard: [0.0; MAX_CYLINDERS],
             knock_event: [false; MAX_CYLINDERS],
             level: 0,
-            b0: 0.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
+            b0: 0.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
         };
         d.compute_iir_coefficients(44100.0);
         d
@@ -188,10 +204,12 @@ impl SoftKnockDetector {
     /// Returns filtered output.
     pub fn process_sample(&mut self, channel: usize, sample: f32) -> f32 {
         let s = &mut self.iir[channel];
-        let y = self.b0 * sample + self.b1 * s.x1 + self.b2 * s.x2
-            - self.a1 * s.y1 - self.a2 * s.y2;
-        s.x2 = s.x1; s.x1 = sample;
-        s.y2 = s.y1; s.y1 = y;
+        let y =
+            self.b0 * sample + self.b1 * s.x1 + self.b2 * s.x2 - self.a1 * s.y1 - self.a2 * s.y2;
+        s.x2 = s.x1;
+        s.x1 = sample;
+        s.y2 = s.y1;
+        s.y1 = y;
         // Integrate (rectify + decay)
         self.integrator[channel] = self.integrator[channel] * 0.99 + y.abs();
         y
@@ -207,8 +225,8 @@ impl SoftKnockDetector {
             self.retard[channel] = (self.retard[channel] + self.config.retard_step_deg)
                 .min(self.config.retard_max_deg);
         } else {
-            self.retard[channel] = (self.retard[channel] - self.config.recovery_deg_per_cycle)
-                .max(0.0);
+            self.retard[channel] =
+                (self.retard[channel] - self.config.recovery_deg_per_cycle).max(0.0);
         }
         self.knock_event[channel] = knocked;
         // Global level = max across cylinders (normalized 0–100)
@@ -284,6 +302,11 @@ impl FftKnockDetector {
 
     /// Evaluate knock for a cylinder using spectral energy in the knock window.
     pub fn evaluate(&mut self, channel: usize, rpm: f32, load_kpa: f32) -> bool {
+        if channel >= self.retard.len() {
+            self.level = 0;
+            return false;
+        }
+
         let sample_rate = 44100.0f32;
         let bin_hz = sample_rate / 512.0;
         let center_bin = (self.config.center_freq_hz / bin_hz) as usize;
@@ -292,7 +315,11 @@ impl FftKnockDetector {
         let high = (center_bin + bw_bins).min(255);
 
         // Spectral energy in window
-        let energy: f32 = self.mag_buffer[low..=high].iter().sum::<f32>() / (bw_bins * 2 + 1) as f32;
+        let energy = self
+            .mag_buffer
+            .get(low..=high)
+            .map(|window| window.iter().sum::<f32>() / window.len() as f32)
+            .unwrap_or(0.0);
 
         // Get noise floor from learning map for this operating cell
         let r = KnockLearningMap::rpm_bin(rpm);
@@ -317,15 +344,13 @@ impl FftKnockDetector {
                 (self.learning_map.fkc[channel] - self.config.retard_step_deg).max(-10.0);
             // DAM reduction
             if self.config.dam_enabled {
-                self.learning_map.dam_map[r][l] =
-                    (self.learning_map.dam_map[r][l] - 0.01).max(0.0);
+                self.learning_map.dam_map[r][l] = (self.learning_map.dam_map[r][l] - 0.01).max(0.0);
             }
         } else {
-            self.retard[channel] = (self.retard[channel] - self.config.recovery_deg_per_cycle)
-                .max(0.0);
+            self.retard[channel] =
+                (self.retard[channel] - self.config.recovery_deg_per_cycle).max(0.0);
             // FKC slow recovery
-            self.learning_map.fkc[channel] =
-                (self.learning_map.fkc[channel] + 0.01).min(0.0);
+            self.learning_map.fkc[channel] = (self.learning_map.fkc[channel] + 0.01).min(0.0);
         }
 
         self.knock_event[channel] = knocked;
@@ -362,7 +387,11 @@ mod tests {
             det.process_sample(0, 1.0); // strong sustained signal builds integrator
         }
         // Integrator should be well above zero
-        assert!(det.integrator[0] > 0.01, "integrator {} should be positive", det.integrator[0]);
+        assert!(
+            det.integrator[0] > 0.01,
+            "integrator {} should be positive",
+            det.integrator[0]
+        );
     }
 
     #[test]
@@ -413,5 +442,14 @@ mod tests {
         let cfg = KnockConfig::default();
         assert!(cfg.threshold_db > 0.0);
         assert!(cfg.retard_max_deg > 0.0);
+    }
+
+    #[test]
+    fn fft_knock_invalid_channel_is_rejected_without_panic() {
+        let mut det = FftKnockDetector::default();
+        det.compute_spectrum(44100.0);
+        let knocked = det.evaluate(99, 2500.0, 100.0);
+        assert!(!knocked);
+        assert_eq!(det.level, 0);
     }
 }
