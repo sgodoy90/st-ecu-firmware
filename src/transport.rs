@@ -257,7 +257,7 @@ const PAGE_CRYPTO_NONCE_VERSION: u8 = 1;
 const PAGE_CRYPTO_NONCE_RECORD_LEN: usize = 16;
 const PAGE_CRYPTO_NONCE_PAGE_ID: u8 = ConfigPage::UiDefaults as u8;
 static FLASH_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
-const FLASH_SIGNING_PUBKEY: [u8; 32] = [
+const FLASH_DEV_SIGNING_PUBKEY: [u8; 32] = [
     0xD7, 0x5A, 0x98, 0x01, 0x82, 0xB1, 0x0A, 0xB7, 0xD5, 0x4B, 0xFE, 0xD3, 0xC9, 0x64, 0x07, 0x3A,
     0x0E, 0xE1, 0x72, 0xF3, 0xDA, 0xA6, 0x23, 0x25, 0xAF, 0x02, 0x1A, 0x68, 0xF7, 0x07, 0x51, 0x1A,
 ];
@@ -471,11 +471,47 @@ fn build_flash_signature_message(image: &[u8], image_crc: u32) -> Vec<u8> {
     message
 }
 
+fn parse_hex_32_bytes(hex: &str) -> Option<[u8; 32]> {
+    let trimmed = hex.trim();
+    if trimmed.len() != 64 {
+        return None;
+    }
+
+    let mut out = [0u8; 32];
+    for (index, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
+        let chunk_str = std::str::from_utf8(chunk).ok()?;
+        out[index] = u8::from_str_radix(chunk_str, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn flash_signing_pubkey() -> Option<[u8; 32]> {
+    if let Some(raw) = option_env!("ST_ECU_OTA_VERIFY_PUBKEY_HEX") {
+        let parsed = parse_hex_32_bytes(raw)?;
+        if !cfg!(debug_assertions) && parsed == FLASH_DEV_SIGNING_PUBKEY {
+            return None;
+        }
+        return Some(parsed);
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        Some(FLASH_DEV_SIGNING_PUBKEY)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 fn verify_flash_signature(image: &[u8], image_crc: u32, signature_bytes: &[u8]) -> bool {
     if signature_bytes.len() != FLASH_VERIFY_SIGNATURE_LEN {
         return false;
     }
-    let Ok(verifying_key) = VerifyingKey::from_bytes(&FLASH_SIGNING_PUBKEY) else {
+    let Some(pubkey) = flash_signing_pubkey() else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey) else {
         return false;
     };
     let Ok(signature) = Signature::from_slice(signature_bytes) else {
@@ -2559,9 +2595,10 @@ mod tests {
 
     use super::{
         build_flash_signature_message, compute_bootloader_auth_tag, compute_flash_auth_tag,
-        initialize_page_crypto, parse_page0_actuator_config, read_persisted_page_crypto_counter,
-        ActuatorRuntimeConfig, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
-        ACTUATOR_PULSEWIDTH_BOUNDS_MS, FLASH_CRC32, PAGE_CRYPTO_NONCE_PERSIST_STRIDE,
+        flash_signing_pubkey, initialize_page_crypto, parse_hex_32_bytes,
+        parse_page0_actuator_config, read_persisted_page_crypto_counter, ActuatorRuntimeConfig,
+        FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS, ACTUATOR_PULSEWIDTH_BOUNDS_MS, FLASH_CRC32,
+        FLASH_DEV_SIGNING_PUBKEY, PAGE_CRYPTO_NONCE_PERSIST_STRIDE,
     };
 
     const TEST_FLASH_SIGNING_KEY_BYTES: [u8; 32] = [
@@ -2593,6 +2630,24 @@ mod tests {
         signing_key
             .sign(&build_flash_signature_message(image, image_crc))
             .to_bytes()
+    }
+
+    #[test]
+    fn parse_hex_32_bytes_validates_shape() {
+        let valid_pubkey_hex =
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        assert_eq!(
+            parse_hex_32_bytes(valid_pubkey_hex),
+            Some(FLASH_DEV_SIGNING_PUBKEY)
+        );
+        assert!(parse_hex_32_bytes("abcd").is_none());
+        assert!(parse_hex_32_bytes(&"x".repeat(64)).is_none());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn flash_signing_pubkey_available_in_debug_without_env() {
+        assert!(flash_signing_pubkey().is_some());
     }
 
     fn start_h743_flash_session(runtime: &mut FirmwareRuntime) {
