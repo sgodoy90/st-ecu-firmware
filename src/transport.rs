@@ -37,7 +37,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use crate::ConfigPage;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use serde::Serialize;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
@@ -112,6 +112,9 @@ pub struct FirmwareRuntime {
     wideband_runtime: WidebandRuntime,
     protection_manager: ProtectionManager,
     protection_state: ProtectionState,
+    bootloader_auth_required: bool,
+    bootloader_auth_pending_challenge: Option<[u8; BOOTLOADER_CHALLENGE_LEN]>,
+    bootloader_auth_counter: u64,
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
@@ -228,6 +231,9 @@ const FLASH_VERIFY_CRC_LEN: usize = 4;
 const FLASH_VERIFY_AUTH_TAG_LEN: usize = 16;
 const FLASH_VERIFY_CRC_AND_TAG_LEN: usize = FLASH_VERIFY_CRC_LEN + FLASH_VERIFY_AUTH_TAG_LEN;
 const FLASH_AUTH_DOMAIN: &[u8] = b"ST-FLASH-AUTH-V1";
+const BOOTLOADER_AUTH_DOMAIN: &[u8] = b"ST-BOOT-AUTH-V1";
+const BOOTLOADER_CHALLENGE_LEN: usize = 16;
+const BOOTLOADER_RESPONSE_LEN: usize = 16;
 const PAGE_CRYPTO_KEY_DOMAIN: &[u8] = b"ST-PAGE-CRYPTO-V1";
 const PAGE_CRYPTO_ECU_DOMAIN: &[u8] = b"ST-PAGE-ECU-ID-V1";
 const PAGE_CRYPTO_NONCE_PERSIST_STRIDE: u64 = 1024;
@@ -356,12 +362,56 @@ fn derive_flash_auth_key(identity: &FirmwareIdentity) -> [u8; 32] {
     key
 }
 
+fn derive_bootloader_auth_key(identity: &FirmwareIdentity) -> [u8; 32] {
+    let mut material = Vec::with_capacity(256);
+    material.extend_from_slice(BOOTLOADER_AUTH_DOMAIN);
+    append_flash_auth_field(&mut material, identity.firmware_id);
+    append_flash_auth_field(&mut material, identity.firmware_semver);
+    append_flash_auth_field(&mut material, identity.board_id);
+    append_flash_auth_field(&mut material, identity.serial);
+    append_flash_auth_field(&mut material, identity.signature);
+
+    let mut key = [0u8; 32];
+    for (index, chunk) in key.chunks_exact_mut(4).enumerate() {
+        material.push(index as u8);
+        let crc = FLASH_CRC32.checksum(&material).to_be_bytes();
+        material.pop();
+        chunk.copy_from_slice(&crc);
+    }
+    key
+}
+
 fn flash_auth_nonce(image_len: usize, image_crc: u32, key: &[u8; 32]) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[0..4].copy_from_slice(&(image_len as u32).to_be_bytes());
     nonce[4..8].copy_from_slice(&image_crc.to_be_bytes());
     nonce[8..12].copy_from_slice(&FLASH_CRC32.checksum(key).to_be_bytes());
     nonce
+}
+
+fn compute_bootloader_auth_tag(
+    identity: &FirmwareIdentity,
+    challenge: &[u8; BOOTLOADER_CHALLENGE_LEN],
+) -> Option<[u8; BOOTLOADER_RESPONSE_LEN]> {
+    let key = derive_bootloader_auth_key(identity);
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    let challenge_crc = FLASH_CRC32.checksum(challenge);
+    let nonce_bytes = flash_auth_nonce(challenge.len(), challenge_crc, &key);
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: b"",
+                aad: challenge,
+            },
+        )
+        .ok()?;
+    if encrypted.len() != BOOTLOADER_RESPONSE_LEN {
+        return None;
+    }
+    let mut tag = [0u8; BOOTLOADER_RESPONSE_LEN];
+    tag.copy_from_slice(&encrypted);
+    Some(tag)
 }
 
 fn compute_flash_auth_tag(identity: &FirmwareIdentity, image: &[u8], image_crc: u32) -> Option<[u8; 16]> {
@@ -1043,6 +1093,7 @@ impl FirmwareRuntime {
     pub fn new_with_store(identity: FirmwareIdentity, simulator: bool, mut store: ConfigStore) -> Self {
         let mut trigger_runtime = TriggerRuntime::default();
         let page_crypto_enabled = !simulator && page_crypto_enabled_for_identity(&identity);
+        let bootloader_auth_required = !simulator && page_crypto_enabled_for_identity(&identity);
         let mut tune_encryption = if page_crypto_enabled {
             initialize_page_crypto(&identity)
         } else {
@@ -1096,6 +1147,9 @@ impl FirmwareRuntime {
             wideband_runtime: WidebandRuntime::default(),
             protection_manager: ProtectionManager::new(ProtectionConfig::default()),
             protection_state: ProtectionState::default(),
+            bootloader_auth_required,
+            bootloader_auth_pending_challenge: None,
+            bootloader_auth_counter: 0,
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
@@ -1227,8 +1281,52 @@ impl FirmwareRuntime {
             .map_err(|_| RuntimeNackCode::MalformedPayload)
     }
 
+    fn issue_bootloader_challenge(&mut self) -> [u8; BOOTLOADER_CHALLENGE_LEN] {
+        self.bootloader_auth_counter = self.bootloader_auth_counter.wrapping_add(1);
+        let monotonic = self.bootloader_auth_counter;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(monotonic.rotate_left(17));
+
+        let mut material = Vec::with_capacity(256);
+        material.extend_from_slice(BOOTLOADER_AUTH_DOMAIN);
+        append_flash_auth_field(&mut material, self.identity.firmware_id);
+        append_flash_auth_field(&mut material, self.identity.firmware_semver);
+        append_flash_auth_field(&mut material, self.identity.board_id);
+        append_flash_auth_field(&mut material, self.identity.serial);
+        append_flash_auth_field(&mut material, self.identity.signature);
+        material.extend_from_slice(&monotonic.to_be_bytes());
+        material.extend_from_slice(&timestamp.to_be_bytes());
+        material.extend_from_slice(&self.live_sample_counter.to_be_bytes());
+        material.extend_from_slice(&self.flash_next_block.to_be_bytes());
+
+        let mut challenge = [0u8; BOOTLOADER_CHALLENGE_LEN];
+        for (index, chunk) in challenge.chunks_exact_mut(4).enumerate() {
+            material.push(index as u8);
+            let crc = FLASH_CRC32.checksum(&material).to_be_bytes();
+            material.pop();
+            chunk.copy_from_slice(&crc);
+        }
+        self.bootloader_auth_pending_challenge = Some(challenge);
+        challenge
+    }
+
+    fn begin_flash_session(&mut self) {
+        self.reset_flash_transfer_state();
+        self.flash_session_active = true;
+        self.update_state = FirmwareUpdateState::Receiving;
+        self.update_pending_bank = None;
+        self.update_candidate_crc = None;
+        self.update_candidate_size = 0;
+        self.update_boot_attempts = 0;
+        self.update_health_window_remaining_ms = 0;
+        self.update_last_tick = None;
+    }
+
     fn reset_flash_transfer_state(&mut self) {
         self.flash_session_active = false;
+        self.bootloader_auth_pending_challenge = None;
         self.flash_next_block = 0;
         self.flash_buffer.clear();
         self.flash_verified = false;
@@ -2038,15 +2136,41 @@ impl FirmwareRuntime {
                 Err(_) => nack(RuntimeNackCode::MalformedPayload, "bad burn-page payload"),
             },
             Cmd::EnterBootloader => {
-                self.reset_flash_transfer_state();
-                self.flash_session_active = true;
-                self.update_state = FirmwareUpdateState::Receiving;
-                self.update_pending_bank = None;
-                self.update_candidate_crc = None;
-                self.update_candidate_size = 0;
-                self.update_boot_attempts = 0;
-                self.update_health_window_remaining_ms = 0;
-                self.update_last_tick = None;
+                if !self.bootloader_auth_required {
+                    self.begin_flash_session();
+                    return Packet::new(Cmd::Ack, vec![]);
+                }
+
+                if packet.payload.is_empty() {
+                    let challenge = self.issue_bootloader_challenge();
+                    return Packet::new(Cmd::Ack, challenge.to_vec());
+                }
+
+                if packet.payload.len() != BOOTLOADER_RESPONSE_LEN {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "bad bootloader auth payload",
+                    );
+                }
+
+                let Some(challenge) = self.bootloader_auth_pending_challenge.take() else {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "bootloader challenge required",
+                    );
+                };
+                let Some(expected_tag) = compute_bootloader_auth_tag(&self.identity, &challenge)
+                else {
+                    return nack(
+                        RuntimeNackCode::StorageFailure,
+                        "bootloader auth unavailable",
+                    );
+                };
+                if expected_tag.as_slice() != packet.payload.as_slice() {
+                    return nack(RuntimeNackCode::MalformedPayload, "bootloader auth mismatch");
+                }
+
+                self.begin_flash_session();
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashBlock => {
@@ -2226,7 +2350,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        compute_flash_auth_tag, initialize_page_crypto, parse_page0_actuator_config,
+        compute_bootloader_auth_tag, compute_flash_auth_tag, initialize_page_crypto,
+        parse_page0_actuator_config,
         ActuatorRuntimeConfig, FirmwareRuntime, ACTUATOR_DWELL_BOUNDS_MS,
         ACTUATOR_PULSEWIDTH_BOUNDS_MS, FLASH_CRC32, PAGE_CRYPTO_NONCE_PERSIST_STRIDE,
         read_persisted_page_crypto_counter,
@@ -2793,6 +2918,68 @@ mod tests {
         assert_eq!(bad.cmd, Cmd::Nack);
         assert_eq!(code, 2);
         assert!(reason.contains("channel"));
+    }
+
+    #[test]
+    fn runtime_h743_bootloader_requires_challenge_response() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+
+        let challenge = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(challenge.cmd, Cmd::Ack);
+        assert_eq!(challenge.payload.len(), super::BOOTLOADER_CHALLENGE_LEN);
+
+        let without_auth =
+            runtime.handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 0, 0xAA, 0xBB]));
+        assert_eq!(without_auth.cmd, Cmd::Nack);
+        let (_, without_auth_reason) = decode_nack_payload(&without_auth.payload).unwrap();
+        assert!(without_auth_reason.contains("session"));
+
+        let mut challenge_bytes = [0u8; super::BOOTLOADER_CHALLENGE_LEN];
+        challenge_bytes.copy_from_slice(&challenge.payload);
+        let response = compute_bootloader_auth_tag(&runtime.identity, &challenge_bytes).unwrap();
+
+        let auth = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, response.to_vec()));
+        assert_eq!(auth.cmd, Cmd::Ack);
+        assert!(auth.payload.is_empty());
+
+        let block0 = runtime.handle_packet(Packet::new(
+            Cmd::FlashBlock,
+            vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC],
+        ));
+        assert_eq!(block0.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_h743_bootloader_rejects_bad_challenge_response() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+
+        let challenge = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(challenge.cmd, Cmd::Ack);
+        assert_eq!(challenge.payload.len(), super::BOOTLOADER_CHALLENGE_LEN);
+
+        let bad_auth = runtime.handle_packet(Packet::new(
+            Cmd::EnterBootloader,
+            vec![0x5A; super::BOOTLOADER_RESPONSE_LEN],
+        ));
+        assert_eq!(bad_auth.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&bad_auth.payload).unwrap();
+        assert!(reason.contains("auth"));
+
+        let without_auth =
+            runtime.handle_packet(Packet::new(Cmd::FlashBlock, vec![0, 0, 0, 0, 0xAA, 0xBB]));
+        assert_eq!(without_auth.cmd, Cmd::Nack);
+    }
+
+    #[test]
+    fn runtime_h743_bootloader_rejects_auth_without_challenge() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+        let auth = runtime.handle_packet(Packet::new(
+            Cmd::EnterBootloader,
+            vec![0x11; super::BOOTLOADER_RESPONSE_LEN],
+        ));
+        assert_eq!(auth.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&auth.payload).unwrap();
+        assert!(reason.contains("challenge"));
     }
 
     #[test]
