@@ -38,7 +38,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use crc::{Crc, CRC_32_ISO_HDLC};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Serialize;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
@@ -119,6 +119,9 @@ pub struct FirmwareRuntime {
     flash_signature_required: bool,
     bootloader_auth_pending_challenge: Option<[u8; BOOTLOADER_CHALLENGE_LEN]>,
     bootloader_auth_counter: u64,
+    bootloader_auth_last_attempt_at: Option<Instant>,
+    bootloader_auth_failed_attempts: u8,
+    bootloader_auth_lockout_until: Option<Instant>,
     flash_session_active: bool,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
@@ -243,6 +246,9 @@ const FLASH_SIGNATURE_DOMAIN: &[u8] = b"ST-FLASH-SIGN-V1";
 const BOOTLOADER_AUTH_DOMAIN: &[u8] = b"ST-BOOT-AUTH-V1";
 const BOOTLOADER_CHALLENGE_LEN: usize = 16;
 const BOOTLOADER_RESPONSE_LEN: usize = 16;
+const BOOTLOADER_AUTH_RETRY_INTERVAL_MS: u64 = 5_000;
+const BOOTLOADER_AUTH_LOCKOUT_AFTER_FAILURES: u8 = 3;
+const BOOTLOADER_AUTH_LOCKOUT_MS: u64 = 60_000;
 const PAGE_CRYPTO_KEY_DOMAIN: &[u8] = b"ST-PAGE-CRYPTO-V1";
 const PAGE_CRYPTO_ECU_DOMAIN: &[u8] = b"ST-PAGE-ECU-ID-V1";
 const PAGE_CRYPTO_NONCE_PERSIST_STRIDE: u64 = 1024;
@@ -1203,6 +1209,9 @@ impl FirmwareRuntime {
             flash_signature_required,
             bootloader_auth_pending_challenge: None,
             bootloader_auth_counter: 0,
+            bootloader_auth_last_attempt_at: None,
+            bootloader_auth_failed_attempts: 0,
+            bootloader_auth_lockout_until: None,
             flash_session_active: false,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
@@ -1365,7 +1374,55 @@ impl FirmwareRuntime {
         challenge
     }
 
+    fn refresh_bootloader_auth_window(&mut self, now: Instant) {
+        if let Some(until) = self.bootloader_auth_lockout_until {
+            if now >= until {
+                self.bootloader_auth_lockout_until = None;
+                self.bootloader_auth_failed_attempts = 0;
+                self.bootloader_auth_last_attempt_at = None;
+            }
+        }
+    }
+
+    fn bootloader_auth_is_locked(&self, now: Instant) -> bool {
+        matches!(self.bootloader_auth_lockout_until, Some(until) if now < until)
+    }
+
+    fn bootloader_auth_is_rate_limited(&self, now: Instant) -> bool {
+        if let Some(last) = self.bootloader_auth_last_attempt_at {
+            now.saturating_duration_since(last)
+                < Duration::from_millis(BOOTLOADER_AUTH_RETRY_INTERVAL_MS)
+        } else {
+            false
+        }
+    }
+
+    fn bootloader_auth_lockout_remaining_ms(&self, now: Instant) -> u64 {
+        self.bootloader_auth_lockout_until
+            .and_then(|until| until.checked_duration_since(now))
+            .map(|remaining| remaining.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn bootloader_auth_record_failure(&mut self, now: Instant) {
+        self.bootloader_auth_last_attempt_at = Some(now);
+        self.bootloader_auth_failed_attempts = self.bootloader_auth_failed_attempts.saturating_add(1);
+        if self.bootloader_auth_failed_attempts >= BOOTLOADER_AUTH_LOCKOUT_AFTER_FAILURES {
+            self.bootloader_auth_lockout_until =
+                Some(now + Duration::from_millis(BOOTLOADER_AUTH_LOCKOUT_MS));
+            self.bootloader_auth_pending_challenge = None;
+        }
+    }
+
+    fn bootloader_auth_record_success(&mut self) {
+        self.bootloader_auth_last_attempt_at = None;
+        self.bootloader_auth_failed_attempts = 0;
+        self.bootloader_auth_lockout_until = None;
+        self.bootloader_auth_pending_challenge = None;
+    }
+
     fn begin_flash_session(&mut self) {
+        self.bootloader_auth_record_success();
         self.reset_flash_transfer_state();
         self.flash_session_active = true;
         self.update_state = FirmwareUpdateState::Receiving;
@@ -2227,12 +2284,33 @@ impl FirmwareRuntime {
                     return Packet::new(Cmd::Ack, vec![]);
                 }
 
+                let now = Instant::now();
+                self.refresh_bootloader_auth_window(now);
+                if self.bootloader_auth_is_locked(now) {
+                    let remaining_ms = self.bootloader_auth_lockout_remaining_ms(now);
+                    return nack(
+                        RuntimeNackCode::UnsafeState,
+                        &format!(
+                            "bootloader auth locked after failed attempts; retry in {} ms",
+                            remaining_ms
+                        ),
+                    );
+                }
+
                 if packet.payload.is_empty() {
                     let challenge = self.issue_bootloader_challenge();
                     return Packet::new(Cmd::Ack, challenge.to_vec());
                 }
 
+                if self.bootloader_auth_is_rate_limited(now) {
+                    return nack(
+                        RuntimeNackCode::UnsafeState,
+                        "bootloader auth rate limited; wait 5s between attempts",
+                    );
+                }
+
                 if packet.payload.len() != BOOTLOADER_RESPONSE_LEN {
+                    self.bootloader_auth_record_failure(now);
                     return nack(
                         RuntimeNackCode::MalformedPayload,
                         "bad bootloader auth payload",
@@ -2240,6 +2318,7 @@ impl FirmwareRuntime {
                 }
 
                 let Some(challenge) = self.bootloader_auth_pending_challenge.take() else {
+                    self.bootloader_auth_record_failure(now);
                     return nack(
                         RuntimeNackCode::MalformedPayload,
                         "bootloader challenge required",
@@ -2247,12 +2326,14 @@ impl FirmwareRuntime {
                 };
                 let Some(expected_tag) = compute_bootloader_auth_tag(&self.identity, &challenge)
                 else {
+                    self.bootloader_auth_record_failure(now);
                     return nack(
                         RuntimeNackCode::StorageFailure,
                         "bootloader auth unavailable",
                     );
                 };
                 if expected_tag.as_slice() != packet.payload.as_slice() {
+                    self.bootloader_auth_record_failure(now);
                     return nack(
                         RuntimeNackCode::MalformedPayload,
                         "bootloader auth mismatch",
@@ -3174,6 +3255,65 @@ mod tests {
         assert_eq!(auth.cmd, Cmd::Nack);
         let (_, reason) = decode_nack_payload(&auth.payload).unwrap();
         assert!(reason.contains("challenge"));
+    }
+
+    #[test]
+    fn runtime_h743_bootloader_rate_limits_auth_attempts() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+        let challenge = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(challenge.cmd, Cmd::Ack);
+
+        let bad_auth = runtime.handle_packet(Packet::new(
+            Cmd::EnterBootloader,
+            vec![0x5A; super::BOOTLOADER_RESPONSE_LEN],
+        ));
+        assert_eq!(bad_auth.cmd, Cmd::Nack);
+        let (_, bad_reason) = decode_nack_payload(&bad_auth.payload).unwrap();
+        assert!(bad_reason.contains("mismatch"));
+
+        let rate_limited = runtime.handle_packet(Packet::new(
+            Cmd::EnterBootloader,
+            vec![0x5A; super::BOOTLOADER_RESPONSE_LEN],
+        ));
+        assert_eq!(rate_limited.cmd, Cmd::Nack);
+        let (code, reason) = decode_nack_payload(&rate_limited.payload).unwrap();
+        assert_eq!(code, super::RuntimeNackCode::UnsafeState as u8);
+        assert!(reason.contains("rate limited"));
+    }
+
+    #[test]
+    fn runtime_h743_bootloader_locks_after_repeated_failures() {
+        let mut runtime = FirmwareRuntime::new(h743_identity(), false);
+
+        for attempt in 0..super::BOOTLOADER_AUTH_LOCKOUT_AFTER_FAILURES {
+            let challenge = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+            assert_eq!(challenge.cmd, Cmd::Ack);
+
+            let bad_auth = runtime.handle_packet(Packet::new(
+                Cmd::EnterBootloader,
+                vec![0x5A; super::BOOTLOADER_RESPONSE_LEN],
+            ));
+            assert_eq!(bad_auth.cmd, Cmd::Nack);
+            let (_, reason) = decode_nack_payload(&bad_auth.payload).unwrap();
+            assert!(reason.contains("mismatch"));
+
+            if attempt + 1 < super::BOOTLOADER_AUTH_LOCKOUT_AFTER_FAILURES {
+                runtime.bootloader_auth_last_attempt_at = Instant::now().checked_sub(
+                    Duration::from_millis(super::BOOTLOADER_AUTH_RETRY_INTERVAL_MS + 50),
+                );
+            }
+        }
+
+        let locked = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(locked.cmd, Cmd::Nack);
+        let (code, reason) = decode_nack_payload(&locked.payload).unwrap();
+        assert_eq!(code, super::RuntimeNackCode::UnsafeState as u8);
+        assert!(reason.contains("locked"));
+
+        runtime.bootloader_auth_lockout_until =
+            Instant::now().checked_sub(Duration::from_millis(50));
+        let unlocked = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
+        assert_eq!(unlocked.cmd, Cmd::Ack);
     }
 
     #[test]
