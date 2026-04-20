@@ -70,7 +70,15 @@ pub enum RuntimeNackCode {
     MalformedPayload = 2,
     InvalidPage = 3,
     StorageFailure = 4,
+    LockActive = 5,
+    BadSequence = 6,
+    RangeOverflow = 7,
+    CryptoFail = 8,
+    BadSignature = 9,
+    RateLimitExceeded = 10,
+    NotAuthenticated = 11,
     UnsafeState = 12,
+    SessionExpired = 13,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2397,7 +2405,7 @@ impl FirmwareRuntime {
                 if self.bootloader_auth_is_locked(now) {
                     let remaining_ms = self.bootloader_auth_lockout_remaining_ms(now);
                     return nack(
-                        RuntimeNackCode::UnsafeState,
+                        RuntimeNackCode::LockActive,
                         &format!(
                             "bootloader auth locked after failed attempts; retry in {} ms",
                             remaining_ms
@@ -2412,7 +2420,7 @@ impl FirmwareRuntime {
 
                 if self.bootloader_auth_is_rate_limited(now) {
                     return nack(
-                        RuntimeNackCode::UnsafeState,
+                        RuntimeNackCode::RateLimitExceeded,
                         "bootloader auth rate limited; wait 5s between attempts",
                     );
                 }
@@ -2428,7 +2436,7 @@ impl FirmwareRuntime {
                 let Some(challenge) = self.bootloader_auth_pending_challenge.take() else {
                     self.bootloader_auth_record_failure(now);
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::NotAuthenticated,
                         "bootloader challenge required",
                     );
                 };
@@ -2436,14 +2444,14 @@ impl FirmwareRuntime {
                 else {
                     self.bootloader_auth_record_failure(now);
                     return nack(
-                        RuntimeNackCode::StorageFailure,
+                        RuntimeNackCode::CryptoFail,
                         "bootloader auth unavailable",
                     );
                 };
                 if expected_tag.as_slice() != packet.payload.as_slice() {
                     self.bootloader_auth_record_failure(now);
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::NotAuthenticated,
                         "bootloader auth mismatch",
                     );
                 }
@@ -2454,7 +2462,7 @@ impl FirmwareRuntime {
             Cmd::FlashResume => {
                 if !self.flash_session_active {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::BadSequence,
                         "flash session not started",
                     );
                 }
@@ -2477,7 +2485,7 @@ impl FirmwareRuntime {
                         ),
                     ),
                     Err(RuntimeNackCode::MalformedPayload) => nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::BadSequence,
                         "flash resume session mismatch",
                     ),
                     Err(RuntimeNackCode::StorageFailure) => nack(
@@ -2490,7 +2498,7 @@ impl FirmwareRuntime {
             Cmd::FlashBlock => {
                 if !self.flash_session_active {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::BadSequence,
                         "flash session not started",
                     );
                 }
@@ -2498,7 +2506,7 @@ impl FirmwareRuntime {
                     return nack(RuntimeNackCode::MalformedPayload, "bad flash-block payload");
                 }
                 if packet.payload.len() > FLASH_BLOCK_HEADER_LEN + FLASH_BLOCK_MAX_BYTES {
-                    return nack(RuntimeNackCode::MalformedPayload, "flash block too large");
+                    return nack(RuntimeNackCode::RangeOverflow, "flash block too large");
                 }
                 let block_index = u32::from_be_bytes([
                     packet.payload[0],
@@ -2508,13 +2516,13 @@ impl FirmwareRuntime {
                 ]);
                 if block_index != self.flash_next_block {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::BadSequence,
                         "unexpected flash block index",
                     );
                 }
                 let payload = &packet.payload[FLASH_BLOCK_HEADER_LEN..];
                 if self.flash_buffer.len().saturating_add(payload.len()) > FLASH_BUFFER_MAX_BYTES {
-                    return nack(RuntimeNackCode::MalformedPayload, "flash image too large");
+                    return nack(RuntimeNackCode::RangeOverflow, "flash image too large");
                 }
                 self.flash_buffer.extend_from_slice(payload);
                 self.flash_next_block = self.flash_next_block.saturating_add(1);
@@ -2589,23 +2597,23 @@ impl FirmwareRuntime {
                     let Some(actual_tag) =
                         compute_flash_auth_tag(&self.identity, &self.flash_buffer, actual_crc)
                     else {
-                        return nack(RuntimeNackCode::StorageFailure, "flash auth unavailable");
+                        return nack(RuntimeNackCode::CryptoFail, "flash auth unavailable");
                     };
                     if actual_tag != expected_tag {
-                        return nack(RuntimeNackCode::MalformedPayload, "flash auth mismatch");
+                        return nack(RuntimeNackCode::CryptoFail, "flash auth mismatch");
                     }
                 }
 
                 if self.flash_signature_required && signature_field.is_none() {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::BadSignature,
                         "flash signature required",
                     );
                 }
                 if let Some(signature_field) = signature_field {
                     if !verify_flash_signature(&self.flash_buffer, actual_crc, signature_field) {
                         return nack(
-                            RuntimeNackCode::MalformedPayload,
+                            RuntimeNackCode::BadSignature,
                             "flash signature mismatch",
                         );
                     }
@@ -2620,7 +2628,7 @@ impl FirmwareRuntime {
             Cmd::FlashComplete => {
                 if !self.flash_session_active {
                     return nack(
-                        RuntimeNackCode::MalformedPayload,
+                        RuntimeNackCode::BadSequence,
                         "flash session not started",
                     );
                 }
@@ -3456,7 +3464,7 @@ mod tests {
         ));
         assert_eq!(rate_limited.cmd, Cmd::Nack);
         let (code, reason) = decode_nack_payload(&rate_limited.payload).unwrap();
-        assert_eq!(code, super::RuntimeNackCode::UnsafeState as u8);
+        assert_eq!(code, super::RuntimeNackCode::RateLimitExceeded as u8);
         assert!(reason.contains("rate limited"));
     }
 
@@ -3486,7 +3494,7 @@ mod tests {
         let locked = runtime.handle_packet(Packet::new(Cmd::EnterBootloader, vec![]));
         assert_eq!(locked.cmd, Cmd::Nack);
         let (code, reason) = decode_nack_payload(&locked.payload).unwrap();
-        assert_eq!(code, super::RuntimeNackCode::UnsafeState as u8);
+        assert_eq!(code, super::RuntimeNackCode::LockActive as u8);
         assert!(reason.contains("locked"));
 
         runtime.bootloader_auth_lockout_until =
