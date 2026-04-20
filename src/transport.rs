@@ -106,6 +106,7 @@ pub struct FirmwareRuntime {
     page_crypto_next_persist_counter: u64,
     dtc_entries: Vec<RuntimeDtcEntry>,
     live_sample_counter: u32,
+    last_reported_rpm: f32,
     sync_loss_counter: u8,
     trigger_runtime: TriggerRuntime,
     tcu_runtime: ExternalTcuRuntime,
@@ -1189,6 +1190,7 @@ impl FirmwareRuntime {
             page_crypto_next_persist_counter,
             dtc_entries: default_dtc_entries(),
             live_sample_counter: 0,
+            last_reported_rpm: 0.0,
             sync_loss_counter: 0,
             trigger_runtime,
             tcu_runtime: ExternalTcuRuntime::default(),
@@ -1817,6 +1819,7 @@ impl FirmwareRuntime {
         frame.transmission_state_code = tcu.state_code;
         frame.transmission_request_age_cs = tcu.request_age_cs;
         frame.transmission_ack_counter = tcu.ack_counter;
+        self.last_reported_rpm = frame.rpm;
         self.append_log_sample(&frame);
         frame
     }
@@ -2089,6 +2092,13 @@ impl FirmwareRuntime {
                     return nack(
                         RuntimeNackCode::MalformedPayload,
                         "output-test blocked by active protection",
+                    );
+                }
+                let force_unsafe = packet.payload.get(4).copied().unwrap_or(0) != 0;
+                if self.last_reported_rpm > 100.0 && !force_unsafe {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "output test blocked while engine running",
                     );
                 }
                 let channel = packet.payload[0];
@@ -3056,6 +3066,32 @@ mod tests {
         assert_eq!(bad.cmd, Cmd::Nack);
         assert_eq!(code, 2);
         assert!(reason.contains("channel"));
+    }
+
+    #[test]
+    fn runtime_output_test_blocks_when_engine_running_without_force() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let live = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        assert_eq!(live.cmd, Cmd::LiveData);
+
+        let blocked =
+            runtime.handle_packet(Packet::new(Cmd::RunOutputTest, vec![25, 0x01, 0x00, 0x00]));
+        assert_eq!(blocked.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&blocked.payload).unwrap();
+        assert!(reason.contains("engine running"));
+    }
+
+    #[test]
+    fn runtime_output_test_force_unsafe_allows_test_with_engine_running() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        let live = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        assert_eq!(live.cmd, Cmd::LiveData);
+
+        let forced = runtime.handle_packet(Packet::new(
+            Cmd::RunOutputTest,
+            vec![25, 0x01, 0x00, 0x00, 0x01],
+        ));
+        assert_eq!(forced.cmd, Cmd::Ack);
     }
 
     #[test]
