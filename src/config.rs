@@ -143,6 +143,14 @@ struct StoredPageImage {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashResumeScratch {
+    pub session_id: u32,
+    pub next_block: u32,
+    pub rolling_crc: u32,
+    pub image: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct FlashPageSlot {
     raw_image: Vec<u8>,
@@ -173,6 +181,7 @@ impl FlashPageSlot {
 pub struct ConfigStore {
     ram_pages: Vec<Vec<u8>>,
     flash_slots: Vec<FlashPageSlot>,
+    flash_resume_scratch: Option<FlashResumeScratch>,
 }
 
 impl ConfigStore {
@@ -188,6 +197,7 @@ impl ConfigStore {
         Self {
             ram_pages,
             flash_slots,
+            flash_resume_scratch: None,
         }
     }
 
@@ -419,6 +429,18 @@ impl ConfigStore {
             .collect()
     }
 
+    pub fn read_flash_resume_scratch(&self) -> Option<&FlashResumeScratch> {
+        self.flash_resume_scratch.as_ref()
+    }
+
+    pub fn write_flash_resume_scratch(&mut self, scratch: FlashResumeScratch) {
+        self.flash_resume_scratch = Some(scratch);
+    }
+
+    pub fn clear_flash_resume_scratch(&mut self) {
+        self.flash_resume_scratch = None;
+    }
+
     #[cfg(test)]
     fn replace_flash_raw_image(
         &mut self,
@@ -576,12 +598,57 @@ fn decode_stored_page_image(raw_image: &[u8]) -> Result<StoredPageImage, ConfigI
 type SchemaMigrator = fn(u8, &[u8]) -> Result<Vec<u8>, ConfigMigrationError>;
 type FormatMigrator = fn(u8, &[u8]) -> Result<Vec<u8>, ConfigMigrationError>;
 
-fn schema_migrate_v0_to_v1(_page_id: u8, payload: &[u8]) -> Result<Vec<u8>, ConfigMigrationError> {
-    Ok(payload.to_vec())
+const PAGE0_MAGIC_V0: [u8; 4] = *b"STC1";
+const PAGE0_MAGIC_V1: [u8; 4] = *b"STC2";
+const PAGE0_VERSION_OFFSET: usize = 4;
+const PAGE0_VERSION_V1: u8 = 1;
+
+const PIN_ASSIGNMENT_MAGIC_V0: [u8; 4] = *b"STP3";
+const PIN_ASSIGNMENT_MAGIC_V1: [u8; 4] = *b"STIO";
+const PIN_ASSIGNMENT_VERSION_OFFSET: usize = 4;
+const PIN_ASSIGNMENT_VERSION_V1: u8 = 1;
+
+fn schema_migrate_v0_to_v1(page_id: u8, payload: &[u8]) -> Result<Vec<u8>, ConfigMigrationError> {
+    let mut migrated = payload.to_vec();
+
+    if page_id == ConfigPage::BaseEngineFuelComm as u8 && migrated.len() > PAGE0_VERSION_OFFSET {
+        let legacy_magic = migrated
+            .get(0..4)
+            .map(|magic| magic == PAGE0_MAGIC_V0)
+            .unwrap_or(false);
+        let current_magic = migrated
+            .get(0..4)
+            .map(|magic| magic == PAGE0_MAGIC_V1)
+            .unwrap_or(false);
+        if legacy_magic || !current_magic {
+            migrated[0..4].copy_from_slice(&PAGE0_MAGIC_V1);
+        }
+        if migrated[PAGE0_VERSION_OFFSET] < PAGE0_VERSION_V1 {
+            migrated[PAGE0_VERSION_OFFSET] = PAGE0_VERSION_V1;
+        }
+    }
+
+    Ok(migrated)
 }
 
-fn format_migrate_v0_to_v1(_page_id: u8, payload: &[u8]) -> Result<Vec<u8>, ConfigMigrationError> {
-    Ok(payload.to_vec())
+fn format_migrate_v0_to_v1(page_id: u8, payload: &[u8]) -> Result<Vec<u8>, ConfigMigrationError> {
+    let mut migrated = payload.to_vec();
+
+    if page_id == ConfigPage::PinAssignment as u8 && migrated.len() > PIN_ASSIGNMENT_VERSION_OFFSET
+    {
+        if migrated
+            .get(0..4)
+            .map(|magic| magic == PIN_ASSIGNMENT_MAGIC_V0)
+            .unwrap_or(false)
+        {
+            migrated[0..4].copy_from_slice(&PIN_ASSIGNMENT_MAGIC_V1);
+        }
+        if migrated[PIN_ASSIGNMENT_VERSION_OFFSET] < PIN_ASSIGNMENT_VERSION_V1 {
+            migrated[PIN_ASSIGNMENT_VERSION_OFFSET] = PIN_ASSIGNMENT_VERSION_V1;
+        }
+    }
+
+    Ok(migrated)
 }
 
 fn schema_migrator_for(from_version: u16) -> Option<SchemaMigrator> {
@@ -916,6 +983,47 @@ mod tests {
         assert!(report.migrated);
         assert_eq!(store.read_page(page_id).unwrap(), payload.as_slice());
         assert_eq!(store.read_flash_page(page_id).unwrap(), payload.as_slice());
+    }
+
+    #[test]
+    fn schema_migration_upgrades_page0_magic_and_version() {
+        let mut store = ConfigStore::new_zeroed();
+        let page_id = ConfigPage::BaseEngineFuelComm as u8;
+        let mut payload = vec![0x00; store.page_length(page_id).unwrap()];
+        payload[0..4].copy_from_slice(b"STC1");
+        payload[4] = 0;
+        let raw_image =
+            encode_stored_page_image_with_versions(page_id, 1, 0, CONFIG_FORMAT_VERSION, &payload);
+
+        let report = store
+            .import_persisted_page_image(page_id, &raw_image)
+            .expect("legacy page0 schema should migrate");
+        let migrated = store.read_page(page_id).unwrap();
+
+        assert_eq!(report.schema_steps, 1);
+        assert_eq!(&migrated[0..4], b"STC2");
+        assert_eq!(migrated[4], 1);
+    }
+
+    #[test]
+    fn format_migration_upgrades_pin_assignment_magic() {
+        let mut store = ConfigStore::new_zeroed();
+        let page_id = ConfigPage::PinAssignment as u8;
+        let mut payload = vec![0x00; store.page_length(page_id).unwrap()];
+        payload[0..4].copy_from_slice(b"STP3");
+        payload[4] = 0;
+        payload[5] = 0; // zero assignments
+        let raw_image =
+            encode_stored_page_image_with_versions(page_id, 2, crate::SCHEMA_VERSION, 0, &payload);
+
+        let report = store
+            .import_persisted_page_image(page_id, &raw_image)
+            .expect("legacy pin-assignment format should migrate");
+        let migrated = store.read_page(page_id).unwrap();
+
+        assert_eq!(report.format_steps, 1);
+        assert_eq!(&migrated[0..4], b"STIO");
+        assert_eq!(migrated[4], 1);
     }
 
     #[test]

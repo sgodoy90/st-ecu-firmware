@@ -1,4 +1,4 @@
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, FlashResumeScratch};
 use crate::contract::{base_capabilities, Capability, FirmwareIdentity, TABLE_DIRECTORY};
 use crate::crypto::TuneEncryption;
 use crate::diagnostics::SAMPLE_FREEZE_FRAMES;
@@ -11,21 +11,21 @@ use crate::live_data::{error, protect, status, LiveDataFrame};
 use crate::network::{headless_network_profile, NetworkProfile};
 use crate::protection::{ProtectionAction, ProtectionConfig, ProtectionManager, ProtectionState};
 use crate::protocol::{
-    decode_page_payload, decode_page_request, decode_pin_assignments_payload,
-    decode_raw_table_payload, decode_sync_rtc_payload, encode_ack_payload,
-    encode_can_signal_directory_payload, encode_can_template_directory_payload,
+    decode_flash_resume_request_payload, decode_page_payload, decode_page_request,
+    decode_pin_assignments_payload, decode_raw_table_payload, decode_sync_rtc_payload,
+    encode_ack_payload, encode_can_signal_directory_payload, encode_can_template_directory_payload,
     encode_capabilities_payload, encode_firmware_update_status_payload,
-    encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
-    encode_log_status_payload, encode_logbook_summary_payload, encode_nack_payload,
-    encode_network_profile_payload, encode_output_test_directory_payload,
+    encode_flash_resume_payload, encode_freeze_frames_payload, encode_identity_payload,
+    encode_log_block_payload, encode_log_status_payload, encode_logbook_summary_payload,
+    encode_nack_payload, encode_network_profile_payload, encode_output_test_directory_payload,
     encode_page_directory_payload, encode_page_payload, encode_page_statuses_payload,
     encode_pin_assignments_payload, encode_pin_directory_payload,
     encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_table_directory_payload,
     encode_table_metadata_payload, encode_trigger_capture_payload,
     encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload,
     CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, FirmwareUpdateStatusPayload,
-    LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry, Packet, RawTablePayload,
-    SensorRawDirectoryEntry,
+    FlashResumeRequestPayload, LogStatusPayload, LogbookSummaryPayload, OutputTestDirectoryEntry,
+    Packet, RawTablePayload, SensorRawDirectoryEntry,
 };
 use crate::rotational_idle::RotationalIdleRuntime;
 use crate::tcu::ExternalTcuRuntime;
@@ -123,6 +123,8 @@ pub struct FirmwareRuntime {
     bootloader_auth_failed_attempts: u8,
     bootloader_auth_lockout_until: Option<Instant>,
     flash_session_active: bool,
+    flash_session_id: u32,
+    flash_session_counter: u32,
     flash_next_block: u32,
     flash_buffer: Vec<u8>,
     flash_verified: bool,
@@ -234,6 +236,7 @@ const OUTPUT_TEST_DIRECTORY: [OutputTestDirectoryEntry; 10] = [
 const FLASH_BLOCK_HEADER_LEN: usize = 4;
 const FLASH_BLOCK_MAX_BYTES: usize = 1024;
 const FLASH_BUFFER_MAX_BYTES: usize = 2 * 1024 * 1024;
+const FLASH_RESUME_PERSIST_STRIDE_BLOCKS: u32 = 8;
 const FLASH_VERIFY_CRC_LEN: usize = 4;
 const FLASH_VERIFY_AUTH_TAG_LEN: usize = 16;
 const FLASH_VERIFY_CRC_AND_TAG_LEN: usize = FLASH_VERIFY_CRC_LEN + FLASH_VERIFY_AUTH_TAG_LEN;
@@ -1220,6 +1223,10 @@ impl FirmwareRuntime {
         if let Some(page0) = store.read_page(ConfigPage::BaseEngineFuelComm as u8) {
             trigger_runtime.apply_page0_payload(page0);
         }
+        let flash_session_counter = store
+            .read_flash_resume_scratch()
+            .map(|scratch| scratch.session_id)
+            .unwrap_or(0);
         Self {
             identity,
             transport: TransportCapabilities::default(),
@@ -1249,6 +1256,8 @@ impl FirmwareRuntime {
             bootloader_auth_failed_attempts: 0,
             bootloader_auth_lockout_until: None,
             flash_session_active: false,
+            flash_session_id: 0,
+            flash_session_counter,
             flash_next_block: 0,
             flash_buffer: Vec::new(),
             flash_verified: false,
@@ -1442,7 +1451,8 @@ impl FirmwareRuntime {
 
     fn bootloader_auth_record_failure(&mut self, now: Instant) {
         self.bootloader_auth_last_attempt_at = Some(now);
-        self.bootloader_auth_failed_attempts = self.bootloader_auth_failed_attempts.saturating_add(1);
+        self.bootloader_auth_failed_attempts =
+            self.bootloader_auth_failed_attempts.saturating_add(1);
         if self.bootloader_auth_failed_attempts >= BOOTLOADER_AUTH_LOCKOUT_AFTER_FAILURES {
             self.bootloader_auth_lockout_until =
                 Some(now + Duration::from_millis(BOOTLOADER_AUTH_LOCKOUT_MS));
@@ -1457,10 +1467,70 @@ impl FirmwareRuntime {
         self.bootloader_auth_pending_challenge = None;
     }
 
+    fn allocate_flash_session_id(&mut self) -> u32 {
+        self.flash_session_counter = self.flash_session_counter.wrapping_add(1);
+        if self.flash_session_counter == 0 {
+            self.flash_session_counter = 1;
+        }
+        self.flash_session_counter
+    }
+
+    fn flash_resume_rolling_crc(&self) -> u32 {
+        FLASH_CRC32.checksum(&self.flash_buffer)
+    }
+
+    fn persist_flash_resume_scratch(&mut self) {
+        if !self.flash_session_active {
+            return;
+        }
+        let scratch = FlashResumeScratch {
+            session_id: self.flash_session_id,
+            next_block: self.flash_next_block,
+            rolling_crc: self.flash_resume_rolling_crc(),
+            image: self.flash_buffer.clone(),
+        };
+        self.store.write_flash_resume_scratch(scratch);
+    }
+
+    fn maybe_persist_flash_resume_scratch(&mut self) {
+        if self.flash_next_block == 1
+            || self.flash_next_block % FLASH_RESUME_PERSIST_STRIDE_BLOCKS == 0
+        {
+            self.persist_flash_resume_scratch();
+        }
+    }
+
+    fn try_restore_flash_resume_scratch(
+        &mut self,
+        request: FlashResumeRequestPayload,
+    ) -> Result<bool, RuntimeNackCode> {
+        let Some(scratch) = self.store.read_flash_resume_scratch().cloned() else {
+            return Ok(false);
+        };
+        if scratch.image.len() > FLASH_BUFFER_MAX_BYTES {
+            return Err(RuntimeNackCode::StorageFailure);
+        }
+        if let Some(requested_session_id) = request.session_id {
+            if requested_session_id != 0 && requested_session_id != scratch.session_id {
+                return Err(RuntimeNackCode::MalformedPayload);
+            }
+        }
+        self.flash_session_active = true;
+        self.flash_session_id = scratch.session_id;
+        self.flash_next_block = scratch.next_block;
+        self.flash_buffer = scratch.image;
+        self.flash_verified = false;
+        self.flash_verified_crc = None;
+        self.flash_verified_len = 0;
+        self.update_state = FirmwareUpdateState::Receiving;
+        Ok(true)
+    }
+
     fn begin_flash_session(&mut self) {
         self.bootloader_auth_record_success();
         self.reset_flash_transfer_state();
         self.flash_session_active = true;
+        self.flash_session_id = self.allocate_flash_session_id();
         self.update_state = FirmwareUpdateState::Receiving;
         self.update_pending_bank = None;
         self.update_candidate_crc = None;
@@ -1473,6 +1543,7 @@ impl FirmwareRuntime {
     fn reset_flash_transfer_state(&mut self) {
         self.flash_session_active = false;
         self.bootloader_auth_pending_challenge = None;
+        self.flash_session_id = 0;
         self.flash_next_block = 0;
         self.flash_buffer.clear();
         self.flash_verified = false;
@@ -2380,6 +2451,42 @@ impl FirmwareRuntime {
                 self.begin_flash_session();
                 Packet::new(Cmd::Ack, vec![])
             }
+            Cmd::FlashResume => {
+                if !self.flash_session_active {
+                    return nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash session not started",
+                    );
+                }
+                let request = match decode_flash_resume_request_payload(&packet.payload) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return nack(
+                            RuntimeNackCode::MalformedPayload,
+                            "bad flash-resume payload",
+                        );
+                    }
+                };
+                match self.try_restore_flash_resume_scratch(request) {
+                    Ok(_) => Packet::new(
+                        Cmd::Ack,
+                        encode_flash_resume_payload(
+                            self.flash_session_id,
+                            self.flash_next_block,
+                            self.flash_resume_rolling_crc(),
+                        ),
+                    ),
+                    Err(RuntimeNackCode::MalformedPayload) => nack(
+                        RuntimeNackCode::MalformedPayload,
+                        "flash resume session mismatch",
+                    ),
+                    Err(RuntimeNackCode::StorageFailure) => nack(
+                        RuntimeNackCode::StorageFailure,
+                        "flash resume scratch invalid",
+                    ),
+                    Err(code) => nack(code, "flash resume unavailable"),
+                }
+            }
             Cmd::FlashBlock => {
                 if !self.flash_session_active {
                     return nack(
@@ -2415,6 +2522,7 @@ impl FirmwareRuntime {
                 self.flash_verified_crc = None;
                 self.flash_verified_len = 0;
                 self.update_state = FirmwareUpdateState::Receiving;
+                self.maybe_persist_flash_resume_scratch();
                 Packet::new(Cmd::Ack, vec![])
             }
             Cmd::FlashVerify => {
@@ -2536,6 +2644,7 @@ impl FirmwareRuntime {
                     );
                 }
                 self.begin_update_health_window(final_crc, self.flash_buffer.len());
+                self.store.clear_flash_resume_scratch();
                 self.reset_flash_transfer_state();
                 Packet::new(Cmd::Ack, vec![])
             }
@@ -2579,12 +2688,12 @@ mod tests {
     use crate::protocol::{
         decode_ack_payload, decode_can_signal_directory_payload,
         decode_can_template_directory_payload, decode_capabilities_payload,
-        decode_firmware_update_status_payload, decode_freeze_frames_payload,
-        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
-        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
-        decode_output_test_directory_payload, decode_page_payload, decode_page_statuses_payload,
-        decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
-        decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
+        decode_firmware_update_status_payload, decode_flash_resume_payload,
+        decode_freeze_frames_payload, decode_identity_payload, decode_log_block_payload,
+        decode_log_status_payload, decode_logbook_summary_payload, decode_nack_payload,
+        decode_network_profile_payload, decode_output_test_directory_payload, decode_page_payload,
+        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
+        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
         decode_trigger_capture_payload, decode_trigger_decoder_directory_payload,
         decode_trigger_tooth_log_payload, encode_page_payload, encode_page_request,
         encode_pin_assignments_payload, encode_sync_rtc_payload, Cmd, Packet,
@@ -2635,8 +2744,7 @@ mod tests {
 
     #[test]
     fn parse_hex_32_bytes_validates_shape() {
-        let valid_pubkey_hex =
-            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let valid_pubkey_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
         assert_eq!(
             parse_hex_32_bytes(valid_pubkey_hex),
             Some(FLASH_DEV_SIGNING_PUBKEY)
@@ -3415,6 +3523,104 @@ mod tests {
         assert_eq!(verify.cmd, Cmd::Ack);
         let complete = runtime.handle_packet(Packet::new(Cmd::FlashComplete, vec![]));
         assert_eq!(complete.cmd, Cmd::Ack);
+    }
+
+    #[test]
+    fn runtime_flash_resume_restores_session_after_reboot() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0xAA, 0xBB, 0xCC],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 1, 0xDD, 0xEE, 0xFF],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+
+        let store = runtime.store.clone();
+        let mut rebooted = FirmwareRuntime::new_with_store(FirmwareIdentity::ecu_v1(), true, store);
+        assert_eq!(
+            rebooted
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+
+        let resume = rebooted.handle_packet(Packet::new(Cmd::FlashResume, vec![]));
+        assert_eq!(resume.cmd, Cmd::Ack);
+        let (session_id, next_block, rolling_crc) =
+            decode_flash_resume_payload(&resume.payload).expect("valid resume payload");
+        assert!(session_id != 0);
+        assert_eq!(next_block, 1);
+        assert_eq!(rolling_crc, FLASH_CRC32.checksum(&[0xAA, 0xBB, 0xCC]));
+
+        assert_eq!(
+            rebooted
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 1, 0xDD, 0xEE, 0xFF],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            rebooted
+                .handle_packet(Packet::new(Cmd::FlashVerify, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            rebooted
+                .handle_packet(Packet::new(Cmd::FlashComplete, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+    }
+
+    #[test]
+    fn runtime_flash_resume_rejects_mismatched_session_request() {
+        let mut runtime = FirmwareRuntime::new_ecu_v1();
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(Cmd::EnterBootloader, vec![]))
+                .cmd,
+            Cmd::Ack
+        );
+        assert_eq!(
+            runtime
+                .handle_packet(Packet::new(
+                    Cmd::FlashBlock,
+                    vec![0, 0, 0, 0, 0x10, 0x20, 0x30],
+                ))
+                .cmd,
+            Cmd::Ack
+        );
+        let resume = runtime.handle_packet(Packet::new(Cmd::FlashResume, vec![]));
+        let (session_id, _, _) = decode_flash_resume_payload(&resume.payload).unwrap();
+
+        let mismatch = runtime.handle_packet(Packet::new(
+            Cmd::FlashResume,
+            session_id.wrapping_add(1).to_be_bytes().to_vec(),
+        ));
+        assert_eq!(mismatch.cmd, Cmd::Nack);
+        let (_, reason) = decode_nack_payload(&mismatch.payload).unwrap();
+        assert!(reason.contains("mismatch"));
     }
 
     #[test]

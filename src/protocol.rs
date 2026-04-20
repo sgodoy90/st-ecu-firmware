@@ -72,6 +72,7 @@ pub enum Cmd {
     GetUpdateStatus = 0x55,
     UpdateStatus = 0x56,
     ConfirmBootHealthy = 0x57,
+    FlashResume = 0x58,
     LogStart = 0x60,
     LogStop = 0x61,
     LogStatus = 0x62,
@@ -156,6 +157,7 @@ impl TryFrom<u8> for Cmd {
             0x55 => Ok(Self::GetUpdateStatus),
             0x56 => Ok(Self::UpdateStatus),
             0x57 => Ok(Self::ConfirmBootHealthy),
+            0x58 => Ok(Self::FlashResume),
             0x60 => Ok(Self::LogStart),
             0x61 => Ok(Self::LogStop),
             0x62 => Ok(Self::LogStatus),
@@ -1706,6 +1708,41 @@ pub fn decode_firmware_update_status_payload(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashResumeRequestPayload {
+    pub session_id: Option<u32>,
+}
+
+pub fn encode_flash_resume_payload(session_id: u32, next_block: u32, rolling_crc: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out.extend_from_slice(&next_block.to_be_bytes());
+    out.extend_from_slice(&rolling_crc.to_be_bytes());
+    out
+}
+
+pub fn decode_flash_resume_payload(payload: &[u8]) -> Result<(u32, u32, u32), ProtocolError> {
+    if payload.len() != 12 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let session_id = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+    let next_block = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+    let rolling_crc = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+    Ok((session_id, next_block, rolling_crc))
+}
+
+pub fn decode_flash_resume_request_payload(
+    payload: &[u8],
+) -> Result<FlashResumeRequestPayload, ProtocolError> {
+    match payload.len() {
+        0 => Ok(FlashResumeRequestPayload { session_id: None }),
+        4 => Ok(FlashResumeRequestPayload {
+            session_id: Some(u32::from_be_bytes(payload.try_into().unwrap())),
+        }),
+        _ => Err(ProtocolError::MalformedPayload),
+    }
+}
+
 pub fn encode_network_profile_payload(profile: &NetworkProfile) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(profile.product_track.code());
@@ -2106,27 +2143,28 @@ mod tests {
     use super::{
         decode_ack_payload, decode_can_signal_directory_payload,
         decode_can_template_directory_payload, decode_capabilities_payload,
-        decode_firmware_update_status_payload, decode_freeze_frames_payload,
-        decode_identity_payload, decode_log_block_payload, decode_log_status_payload,
-        decode_logbook_summary_payload, decode_nack_payload, decode_network_profile_payload,
-        decode_output_test_directory_payload, decode_page_payload, decode_page_request,
-        decode_page_statuses_payload, decode_pin_assignments_payload, decode_pin_directory_payload,
-        decode_raw_table_payload, decode_sensor_raw_directory_payload, decode_sensor_raw_payload,
-        decode_sync_rtc_payload, decode_table_metadata_payload, decode_trigger_capture_payload,
+        decode_firmware_update_status_payload, decode_flash_resume_payload,
+        decode_flash_resume_request_payload, decode_freeze_frames_payload, decode_identity_payload,
+        decode_log_block_payload, decode_log_status_payload, decode_logbook_summary_payload,
+        decode_nack_payload, decode_network_profile_payload, decode_output_test_directory_payload,
+        decode_page_payload, decode_page_request, decode_page_statuses_payload,
+        decode_pin_assignments_payload, decode_pin_directory_payload, decode_raw_table_payload,
+        decode_sensor_raw_directory_payload, decode_sensor_raw_payload, decode_sync_rtc_payload,
+        decode_table_metadata_payload, decode_trigger_capture_payload,
         decode_trigger_decoder_directory_payload, decode_trigger_tooth_log_payload,
         encode_ack_payload, encode_can_signal_directory_payload,
         encode_can_template_directory_payload, encode_capabilities_payload,
-        encode_firmware_update_status_payload, encode_freeze_frames_payload,
-        encode_identity_payload, encode_log_block_payload, encode_log_status_payload,
-        encode_logbook_summary_payload, encode_nack_payload, encode_network_profile_payload,
-        encode_output_test_directory_payload, encode_page_directory_payload, encode_page_payload,
-        encode_page_request, encode_page_statuses_payload, encode_pin_assignments_payload,
-        encode_pin_directory_payload, encode_sensor_raw_directory_payload,
-        encode_sensor_raw_payload, encode_sync_rtc_payload, encode_table_directory_payload,
-        encode_table_metadata_payload, encode_trigger_capture_payload,
-        encode_trigger_decoder_directory_payload, encode_trigger_tooth_log_payload,
-        CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd, DecodedPinAssignment,
-        FirmwareUpdateStatusPayload, LogStatusPayload, LogbookSummaryPayload,
+        encode_firmware_update_status_payload, encode_flash_resume_payload,
+        encode_freeze_frames_payload, encode_identity_payload, encode_log_block_payload,
+        encode_log_status_payload, encode_logbook_summary_payload, encode_nack_payload,
+        encode_network_profile_payload, encode_output_test_directory_payload,
+        encode_page_directory_payload, encode_page_payload, encode_page_request,
+        encode_page_statuses_payload, encode_pin_assignments_payload, encode_pin_directory_payload,
+        encode_sensor_raw_directory_payload, encode_sensor_raw_payload, encode_sync_rtc_payload,
+        encode_table_directory_payload, encode_table_metadata_payload,
+        encode_trigger_capture_payload, encode_trigger_decoder_directory_payload,
+        encode_trigger_tooth_log_payload, CanSignalDirectoryEntry, CanTemplateDirectoryEntry, Cmd,
+        DecodedPinAssignment, FirmwareUpdateStatusPayload, LogStatusPayload, LogbookSummaryPayload,
         OutputTestDirectoryEntry, Packet, ProtocolError, RawTablePayload, SensorRawDirectoryEntry,
     };
     use proptest::prelude::*;
@@ -2328,6 +2366,24 @@ mod tests {
         assert_eq!(decoded.candidate_size, 182_144);
         assert_eq!(decoded.candidate_crc, 0x12AB34CD);
         assert_eq!(decoded.health_window_remaining_ms, 28_500);
+    }
+
+    #[test]
+    fn flash_resume_payload_roundtrip() {
+        let payload = encode_flash_resume_payload(0x0102_0304, 7, 0xAABB_CCDD);
+        let decoded = decode_flash_resume_payload(&payload).unwrap();
+        assert_eq!(decoded, (0x0102_0304, 7, 0xAABB_CCDD));
+    }
+
+    #[test]
+    fn flash_resume_request_payload_accepts_empty_or_session_id() {
+        let empty = decode_flash_resume_request_payload(&[]).unwrap();
+        assert_eq!(empty.session_id, None);
+
+        let session = decode_flash_resume_request_payload(&0x0BAD_F00Du32.to_be_bytes()).unwrap();
+        assert_eq!(session.session_id, Some(0x0BAD_F00D));
+
+        assert!(decode_flash_resume_request_payload(&[0xAA]).is_err());
     }
 
     #[test]
@@ -2820,6 +2876,7 @@ mod tests {
         assert_eq!(Cmd::GetUpdateStatus as u8, 0x55);
         assert_eq!(Cmd::UpdateStatus as u8, 0x56);
         assert_eq!(Cmd::ConfirmBootHealthy as u8, 0x57);
+        assert_eq!(Cmd::FlashResume as u8, 0x58);
 
         assert_eq!(Cmd::LogStart as u8, 0x60);
         assert_eq!(Cmd::LogStop as u8, 0x61);
