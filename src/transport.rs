@@ -1693,6 +1693,7 @@ impl FirmwareRuntime {
 
         let mut frame = LiveDataFrame::default();
         frame.timestamp_ms = self.current_runtime_ms();
+        frame.live_frame_seq = (self.live_sample_counter & 0xFF) as u8;
         let tcu = self.tcu_runtime.tick(self.live_sample_counter);
         let shift_in_progress = self.tcu_runtime.shift_in_progress();
         let actuator_config = self
@@ -2841,6 +2842,21 @@ mod tests {
             saw_timeout_fault_code,
             "expected to observe timeout fault code 2"
         );
+    }
+
+    #[test]
+    fn runtime_live_data_sequence_counter_increments_per_frame() {
+        let mut runtime = FirmwareRuntime::new_simulator();
+        let first = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        let second = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+        let third = runtime.handle_packet(Packet::new(Cmd::GetLiveData, vec![]));
+
+        let seq1 = decode_live_frame(&first.payload).live_frame_seq;
+        let seq2 = decode_live_frame(&second.payload).live_frame_seq;
+        let seq3 = decode_live_frame(&third.payload).live_frame_seq;
+
+        assert_eq!(seq2, seq1.wrapping_add(1));
+        assert_eq!(seq3, seq2.wrapping_add(1));
     }
 
     #[test]

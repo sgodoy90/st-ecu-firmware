@@ -65,7 +65,7 @@
 /// 96  u32  status_flags
 /// 100 u8   protect_flags
 /// 101 u16  error_flags
-/// 103 u8   [pad]
+/// 103 u8   live_frame_seq
 /// 104 u16  revolution_counter
 /// 106 u16  loops_per_sec
 /// 108 u8   free_heap_pct
@@ -175,6 +175,7 @@ pub struct LiveDataFrame {
     pub status_flags: u32,
     pub protect_flags: u8,
     pub error_flags: u16,
+    pub live_frame_seq: u8,
 
     // Health counters
     pub revolution_counter: u16,
@@ -393,8 +394,8 @@ impl LiveDataFrame {
         w8u!(self.protect_flags);
         // 101: error_flags  u16
         w16u!(self.error_flags);
-        // 103: pad
-        pad!();
+        // 103: live_frame_seq  u8
+        w8u!(self.live_frame_seq);
         // 104: revolution_counter  u16
         w16u!(self.revolution_counter);
         // 106: loops_per_sec  u16
@@ -542,7 +543,7 @@ impl LiveDataFrame {
         let status_flags = r32u!();
         let protect_flags = r8u!();
         let error_flags = r16u!();
-        skip!(1);
+        let live_frame_seq = r8u!();
         let revolution_counter = r16u!();
         let loops_per_sec = r16u!();
         let free_heap_pct = r8u!();
@@ -621,6 +622,7 @@ impl LiveDataFrame {
             status_flags,
             protect_flags,
             error_flags,
+            live_frame_seq,
             revolution_counter,
             loops_per_sec,
             free_heap_pct,
@@ -752,6 +754,7 @@ mod tests {
             | status::CAN_ACTIVE
             | status::ROTATIONAL_IDLE_ACTIVE
             | status::ROTATIONAL_IDLE_ARMED;
+        frame.live_frame_seq = 173;
         let enc = frame.encode();
         let dec = LiveDataFrame::decode(&enc);
         assert_eq!(
@@ -762,6 +765,7 @@ mod tests {
                 | status::ROTATIONAL_IDLE_ACTIVE
                 | status::ROTATIONAL_IDLE_ARMED
         );
+        assert_eq!(dec.live_frame_seq, 173);
     }
 
     #[test]
